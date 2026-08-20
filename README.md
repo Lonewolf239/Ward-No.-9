@@ -1,134 +1,67 @@
-# ПРИЮТ №9
+# 🏥 WARD NO. 9 
 
-Хоррор от первого лица на Python: настоящий 3D-рендер (OpenGL через
-moderngl) в PS1-стиле - низкое внутреннее разрешение с апскейлом без
-сглаживания, снэппинг вершин ("вобблинг" геометрии как на PSX), упорядоченный
-дизеринг и квантование цвета вместо гладких градиентов, реальный depth-buffer
-и настоящий прожектор-фонарик вместо экранных трюков. Никаких внешних картинок
-или 3D-моделей - лабиринт, мебель, монстр и весь звук генерируются кодом при
-запуске; каждый объект в мире (от шкафчика до батарейки) - настоящий 3D-бокс
-с перспективой и освещением, а не спрайт.
+![Version](https://img.shields.io/badge/version-ALPHA__1-orange.svg)
+![Python](https://img.shields.io/badge/Made_with-Python_%26_Pygame-blue.svg)
+![Status](https://img.shields.io/badge/status-In%20Development-success.svg)
 
-Ты очнулся в заброшенном психиатрическом корпусе. Свет обесточен: чтобы
-вызвать лифт в подвал, нужно найти 3 предохранителя и запитать щиток в
-техническом помещении. В подвале - та же схема с вентилями, а за люком на
-поверхность - конец игры. По коридорам бродит существо: увидит тебя -
-погонится, поймает - мгновенный (доли секунды) джампскейр и смерть. Есть
-рассудок (sanity): темнота и близость монстра давят на психику, на нуле -
-альтернативная смерть без укуса. Есть стамина - бесконечно бежать не выйдет.
+**WARD NO. 9** is a hardcore first-person indie survival horror with stealth elements, procedural audio, and deep AI. The player must escape an abandoned psychiatric hospital, evading a creature that reacts not only to in-game actions but also to sounds from the real world.
 
-## Запуск
+Created by: **Lonewolf239**
 
-```bash
-cd ward9
-python3 -m venv .venv          # если ещё не создано
-./.venv/bin/pip install -r requirements.txt
-./.venv/bin/python main.py
-```
+---
 
-Нужны настоящий дисплей с OpenGL 3.3+ (окно pygame) и звуковое устройство - в
-headless-среде без X/Wayland или без GPU-драйвера игра не запустится.
+## 🌟 Features
 
-## Управление
+Unlike simple walking simulators, Ward No. 9 features complex survival mechanics:
 
-| Клавиша      | Действие              |
-|--------------|------------------------|
-| WASD         | движение               |
-| Мышь         | осмотр, включая вертикальный наклон камеры (захватывается при старте) |
-| Shift        | бежать - тратит стамину, шумно (монстр услышит дальше) |
-| F            | фонарик (свет = видно дальше, но и монстр видит тебя дальше) |
-| E            | поднять / установить в щиток / открыть люк / спрятаться в шкаф |
-| Esc          | пауза |
-| Enter        | подтвердить в меню, начать заново после смерти/победы |
-| ЛКМ          | клик по кнопкам меню/паузы/настроек |
+- **Microphone as a Gameplay Element (MicListener):** The game analyzes input from your real-life microphone. Any loud noise in reality will draw the monster to your hiding spot.
+- **Multi-level Creature AI:** The monster features `Patrol`, `Investigate`, `Stalk`, and `Hunt` states. It can break down doors, spot your flashlight beam from afar, and methodically search lockers if it senses you are nearby.
+- **Sanity and Stamina System:** Darkness and the enemy's presence drain your sanity, triggering panic effects like a racing heartbeat. Sprinting saves your life, but your stamina is strictly limited.
+- **Procedural Audio:** Most of the terrifying sounds, ambient drones, heartbeats, and footsteps are procedurally generated using mathematical waves (sine waves, white noise, filters), creating a unique and oppressive sound design.
+- **Diverse Levels:** The game includes 3 stages: The Upper Floor (gathering fuses), The Blood Basement (finding valves), and The Courtyard (finding bolt cutters).
 
-Главное меню и пауза - с настоящими кнопками мышью. В «Настройках»
-(доступны из меню и с паузы): громкость, чувствительность мыши (слайдеры,
-клик по полосе), полноэкранный режим и лимит FPS (30/60/75/120/144/без
-ограничений).
+---
 
-## Механики
+## 🚀 Installation & Launch
 
-- **Два этажа** (`game/settings.py:FLOOR_SPECS`), каждый - свежесгенерированный
-  лабиринт со своей темой (жилой корпус / подвал), набором мебели и уровнем
-  сложности монстра. Переход между ними - через лифт/люк, сюжетно обставленный
-  (не просто "прошёл дверь - выиграл").
-- **Цель на каждом этаже** - двухшаговая: найти 3 предохранителя/вентиля,
-  разбросанных по карте -> принести и установить их в щиток (техническая
-  комната, видна заранее) -> дойти до запитанного лифта/люка и уйти. Это
-  заменяет банальный "собери 3 ключа, открой дверь".
-- **Лабиринт**: recursive backtracker (гарантированная связность) + случайные
-  "петли" через оставшиеся стены (несколько маршрутов, а не единственный
-  путь) + 5-7 крупных тематических комнат (палата/кабинет/морг/столовая/
-  техническая) с мебелью и своей текстурой стен.
-- **Настоящие 3D-объекты**: каждый предмет/мебель - `Prop` (`game/props.py`)
-  с реальными шириной/глубиной/высотой, превращается в настоящий бокс-меш
-  (`game/renderer3d.py:build_box_mesh`) с нормалями, текстурой (дерево у
-  мебели, металл у техники и шкафов) и текстурными координатами - шкаф
-  выглядит как шкаф с гранями и объёмом, освещается прожектором-фонариком
-  под правильным углом и не бывает "невидимым" за углом, потому что
-  видимость считает настоящий GPU depth-buffer, а не ручная эвристика.
-  Настенные объекты (щитки, шкафы, лифт) физически выступают из стены, а не
-  прячутся внутри неё; расстановка мебели проверяет связность лабиринта, так
-  что она не может перегородить единственный проход.
-- **ИИ монстра**: патруль -> проверка шума -> преследование, с BFS-поиском
-  пути и настоящим line-of-sight (не видит сквозь стены). На старте каждого
-  этажа есть период "неприкосновенности" (не может поймать, только бродит) -
-  время осмотреться. На втором этаже быстрее и глазастее первого. Модель
-  монстра - сутулая асимметричная бокс-фигура (согнутый торс, вытянутые
-  руки, склонённая голова) с циклом анимации ходьбы, а не блочный робот.
-- **Укрытия**: шкаф-Prop (E) - монстр обычно проходит мимо, но изредка
-  проверяет, если оказался рядом во время активного поиска.
-- **Рассудок и стамина**: рассудок падает во тьме и рядом с монстром,
-  восстанавливается в спокойной обстановке (на нуле - смерть без укуса);
-  стамина тратится на бег и требует передышки перед повторным рывком.
-- **Скримеры**: поимка монстром - это мгновенный (~0.7 сек) слэм в лицо
-  (процедурная перекошенная морда, хромная аберрация, надрывный стерео-стингер
-  с сабовым ударом), без медленных наездов камеры. Плюс случайные скриптовые
-  пугалки (шёпот, дальний удар, тряска экрана) - чаще к концу игры.
-- **Звук**: всё - эмбиент-дрон, сердцебиение (темп зависит от рассудка), шаги,
-  рык монстра с панорамированием по стороне, скример-стингер - синтезировано
-  на numpy при старте (`game/audio.py`), без единого аудиофайла.
+The project is built using an automatic builder. You do not need to install Python or any dependencies manually if you just want to play.
 
-## Рендер (PS1-style 3D)
+1. Go to the [Releases](../../releases) section or the [itch.io](link_to_your_itch) page.
+2. Download the archive for your OS (`Windows`, `macOS`, or `Linux`).
+3. Extract the archive into any folder.
+4. Run the `ward9` executable.
 
-- Сцена рисуется в низкое внутреннее разрешение (480x270) во framebuffer,
-  апскейлится на весь экран без сглаживания (`GL_NEAREST`) - источник этой
-  "пиксельной" картинки.
-- Вершинный шейдер снэппит клип-координаты на грубую сетку перед делением на
-  w - классический "вобблинг" геометрии PS1 при движении камеры.
-- Фрагментный шейдер: настоящий прожектор от игрока (конус + затухание по
-  расстоянию + N·L), туман, зерно, виньетка, упорядоченный дизеринг 4x4 и
-  квантование цвета до ~30 уровней на канал - плоские "ступеньки" вместо
-  гладких градиентов.
-- HUD/меню/джампскейр по-прежнему рисуются обычным pygame (весь текст и
-  интерфейс не меняли) на отдельной поверхности, которая каждый кадр
-  загружается как текстура и накладывается поверх 3D-сцены с альфа-блендингом.
-- Мир остаётся 2D-симуляцией (сетка лабиринта, x/y-координаты, коллизии) -
-  меняется только то, как это превращается в треугольники; вся игровая логика
-  (ИИ, инвентарь, звук) не знает о существовании OpenGL.
+> **For Developers:**
+> If you want to run the game from the source code, make sure you have Python 3.8+ installed along with the dependencies from `requirements.txt` (including `pygame`, `numpy`, `sounddevice`).
 
-## Структура проекта
+---
 
-```
-main.py              точка входа
-game/settings.py      константы/баланс, спецификации этажей, типы комнат
-game/maze.py           генерация лабиринта (петли, тематические комнаты), BFS, line-of-sight
-game/props.py          Prop (3D-объекты) + расстановка по уровню
-game/entities.py       Player (питч, стамина), Monster (ИИ)
-game/gl_math.py         матрицы (perspective/view/transform) для камеры без внешних зависимостей
-game/renderer3d.py      OpenGL-рендерер: меши стен/пола/потолка/боксов, шейдеры, HUD-композитинг
-game/fx.py             тряска камеры, полноэкранный джампскейр (2D, поверх 3D-сцены)
-game/audio.py          процедурный звуковой движок (numpy -> pygame.mixer)
-game/app.py            игровой цикл, состояния, этажи, HUD, взаимодействие
-```
+## 🎮 Controls
 
-## Известные ограничения
+| Key | Action |
+| :--- | :--- |
+| **W, A, S, D** | Movement |
+| **Shift** | Sprint (consumes stamina, highly audible) |
+| **Ctrl** | Crouch (silent movement, allows hiding behind cover) |
+| **F** | Toggle flashlight (drains battery, attracts AI) |
+| **E** | Interact (open doors, hide in lockers, pick up items) |
+| **Mouse** | Look (Pitch & Yaw) |
 
-- Сохранений нет - каждый запуск начинается с нуля (настройки из меню живут
-  до перезапуска игры, не персистентны на диске).
-- Два этажа, не полноценная многоэтажность с вертикальной геометрией внутри
-  одного уровня - переход между этажами это смена сцены, а не лестница в
-  открытом 3D-пространстве.
-- Нужны реальный GPU/драйвер с OpenGL 3.3+ и аудио-бэкенд (проверено на
-  moderngl 5.x / pygame 2.6 / Mesa под X11).
+---
+
+## 🛠 Development Status
+
+Current version: **ALPHA_1**
+
+**Implemented:**
+- [x] Basic player controller (walking, sprinting, stealth).
+- [x] Monster AI (sight, hearing, memory, breaking doors).
+- [x] Microphone integration (`pactl` / `sounddevice`).
+- [x] 3 unique stages with different objectives and visual styles.
+- [x] Custom procedural sound engine.
+
+---
+
+## 📜 License
+
+© 2026 Lonewolf239. All rights reserved.

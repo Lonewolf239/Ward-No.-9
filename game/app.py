@@ -905,8 +905,8 @@ class App:
         ]
 
     def _feedback_button(self):
-        w, h = 230, 44
-        rect = (S.SCREEN_W - w - 20, S.SCREEN_H - h - 60, w, h)
+        w, h = 340, 44
+        rect = (S.SCREEN_W - w - 20, S.SCREEN_H - h - 40, w, h)
         return self._button(rect, i18n.t("menu.feedback"), lambda: webbrowser.open(FEEDBACK_URL), theme="gold")
 
     def _open_credits(self):
