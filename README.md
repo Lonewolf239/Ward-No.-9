@@ -26,7 +26,7 @@ Unlike simple walking simulators, Ward No. 9 features complex survival mechanics
 
 The project is built using an automatic builder. You do not need to install Python or any dependencies manually if you just want to play.
 
-1. Go to the [Releases](../../releases) section or the [itch.io](link_to_your_itch) page.
+1. Go to the [Releases](../../releases) section or the [itch.io]([link_to_your_itch](https://lonewolf239.itch.io/ward-no-9)) page.
 2. Download the archive for your OS (`Windows`, `macOS`, or `Linux`).
 3. Extract the archive into any folder.
 4. Run the `ward9` executable.
