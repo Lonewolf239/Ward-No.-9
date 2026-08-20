@@ -1,0 +1,72 @@
+{
+  "schema_version": 3,
+  "id": "vent_basement_03",
+  "kind": "vent",
+  "floor": "basement",
+  "w": 5,
+  "h": 5,
+  "weight": 0.4,
+  "required": false,
+  "cells": [
+    [
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      1,
+      1,
+      1,
+      1,
+      1
+    ]
+  ],
+  "doors": {
+    "W": {
+      "cell": [
+        0,
+        2
+      ],
+      "kind": "passage"
+    },
+    "E": {
+      "cell": [
+        4,
+        2
+      ],
+      "kind": "passage"
+    }
+  },
+  "interior_doors": [],
+  "furniture": [
+    [
+      "wall_sconce",
+      1,
+      1,
+      0.0
+    ]
+  ]
+}

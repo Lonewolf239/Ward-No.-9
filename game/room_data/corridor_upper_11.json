@@ -1,0 +1,68 @@
+{
+  "schema_version": 3,
+  "id": "corridor_upper_11",
+  "kind": "corridor",
+  "floor": "upper",
+  "w": 6,
+  "h": 4,
+  "weight": 1.0,
+  "required": false,
+  "cells": [
+    [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      1,
+      1,
+      1,
+      0,
+      1,
+      1
+    ]
+  ],
+  "doors": {
+    "S": {
+      "cell": [
+        3,
+        3
+      ],
+      "kind": "passage"
+    }
+  },
+  "interior_doors": [],
+  "furniture": [
+    [
+      "locker",
+      1,
+      2,
+      0.0
+    ],
+    [
+      "locker",
+      1,
+      1,
+      0.0
+    ]
+  ]
+}

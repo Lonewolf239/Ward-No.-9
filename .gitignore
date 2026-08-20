@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+/publish/
+/build/
+/packaging/_version_info.txt

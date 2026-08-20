@@ -1,0 +1,78 @@
+{
+  "schema_version": 3,
+  "id": "stairwell_basement_01",
+  "kind": "stairwell",
+  "floor": "basement",
+  "w": 6,
+  "h": 6,
+  "weight": 1.0,
+  "required": true,
+  "cells": [
+    [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ]
+  ],
+  "doors": {
+    "W": {
+      "cell": [
+        0,
+        3
+      ],
+      "kind": "random"
+    }
+  },
+  "interior_doors": [],
+  "furniture": [
+    [
+      "wall_sconce",
+      1,
+      1,
+      0.0
+    ]
+  ]
+}

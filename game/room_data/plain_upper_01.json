@@ -1,0 +1,71 @@
+{
+  "schema_version": 3,
+  "id": "plain_upper_01",
+  "kind": "plain",
+  "floor": "upper",
+  "w": 5,
+  "h": 5,
+  "weight": 0.8,
+  "required": false,
+  "cells": [
+    [
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      1,
+      1,
+      1,
+      1,
+      1
+    ]
+  ],
+  "doors": {
+    "W": {
+      "cell": [
+        0,
+        2
+      ],
+      "kind": "random"
+    }
+  },
+  "interior_doors": [],
+  "furniture": [
+    [
+      "shelf",
+      3,
+      2,
+      3.141592653589793
+    ],
+    [
+      "wall_sconce",
+      1,
+      1,
+      0.0
+    ]
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "schema_version": 3,
+  "id": "tech_corridor_basement_08",
+  "kind": "tech_corridor",
+  "floor": "basement",
+  "w": 6,
+  "h": 3,
+  "weight": 0.35,
+  "required": false,
+  "cells": [
+    [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ]
+  ],
+  "doors": {
+    "W": {
+      "cell": [
+        0,
+        1
+      ],
+      "kind": "passage"
+    },
+    "E": {
+      "cell": [
+        5,
+        1
+      ],
+      "kind": "passage"
+    }
+  },
+  "interior_doors": [],
+  "furniture": [
+    [
+      "wall_sconce",
+      1,
+      1,
+      1.5707963267948966
+    ]
+  ]
+}
