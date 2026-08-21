@@ -38,14 +38,6 @@ SETTINGS_PATH = _default_settings_path()
 _LEGACY_SETTINGS_PATH = Path.home() / ".priyut9_settings.json"
 
 
-def _pick_font(size, bold=False):
-    for name in ("dejavusans", "notosans", "arial", "liberationsans", "freesans", "verdana"):
-        path = pygame.font.match_font(name, bold=bold)
-        if path:
-            return pygame.font.Font(path, size)
-    return pygame.font.Font(None, size)
-
-
 PICKUP_LABEL_KEYS = {"battery": "pickup.battery", "fuse": "pickup.fuse", "valve_key": "pickup.valve_key"}
 PORTAL_LABEL_KEYS = {0: "portal.floor0", 1: "portal.floor1", 2: "portal.floor2", "hub": "portal.hub"}
 DEBUG_HUD_OPTIONS = ("fps", "coords", "monster", "seed", "scares")
@@ -204,10 +196,12 @@ class App:
         self.mic_vu_level = 0.0
         self._apply_mic_setting()
 
-        self.font_title = _pick_font(60, bold=True)
-        self.font_lg = _pick_font(32, bold=True)
-        self.font_md = _pick_font(21)
-        self.font_sm = _pick_font(16)
+        vcr_font_path = os.path.join("game", "assets", "font.ttf")
+
+        self.font_title = pygame.font.Font(vcr_font_path, 72)        
+        self.font_lg = pygame.font.Font(vcr_font_path, 42)        
+        self.font_md = pygame.font.Font(vcr_font_path, 24)        
+        self.font_sm = pygame.font.Font(vcr_font_path, 18)
 
         self.static_overlay = self._make_static_overlay()
         self.hide_vignette = self._make_hide_vignette()
