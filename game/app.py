@@ -68,6 +68,10 @@ STEPPED_SLIDERS = {
     "quality_preset": S.QUALITY_PRESET_ORDER,
 }
 
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+FONT_PATH = os.path.join(_ASSETS_DIR, "font.ttf")
+NOTE_FONT_PATH = os.path.join(_ASSETS_DIR, "note_font.ttf")
+
 
 class _DemoMonster:
     def __init__(self, start, target, has_locker, speed=1.1):
@@ -196,12 +200,10 @@ class App:
         self.mic_vu_level = 0.0
         self._apply_mic_setting()
 
-        vcr_font_path = os.path.join("game", "assets", "font.ttf")
-
-        self.font_title = pygame.font.Font(vcr_font_path, 72)        
-        self.font_lg = pygame.font.Font(vcr_font_path, 42)        
-        self.font_md = pygame.font.Font(vcr_font_path, 24)        
-        self.font_sm = pygame.font.Font(vcr_font_path, 18)
+        self.font_title = pygame.font.Font(FONT_PATH, 72)        
+        self.font_lg = pygame.font.Font(FONT_PATH, 42)        
+        self.font_md = pygame.font.Font(FONT_PATH, 24)        
+        self.font_sm = pygame.font.Font(FONT_PATH, 18)
 
         self.static_overlay = self._make_static_overlay()
         self.hide_vignette = self._make_hide_vignette()
