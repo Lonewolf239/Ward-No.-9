@@ -8,7 +8,15 @@ from game.app import App
 
 
 def main():
-    App().run()
+    mode = "app"
+    while mode == "app":
+        result = App().run()
+        if result == "editor":
+            from tools.room_editor.editor import Editor
+            Editor(mode="user").run()
+            mode = "app"
+        else:
+            mode = "quit"
 
 
 if __name__ == "__main__":

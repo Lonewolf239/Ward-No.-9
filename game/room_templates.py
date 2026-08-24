@@ -127,6 +127,11 @@ class _GenFailed(Exception):
     pass
 
 
+def _prefer_non_repeat(cands, parent_id):
+    non_repeat = [c for c in cands if c.id != parent_id]
+    return non_repeat if non_repeat else cands
+
+
 def _attempt(rng, floor_key, target_rooms):
     templates = TEMPLATE_SETS[floor_key]()
     structural = STRUCTURAL_KINDS[floor_key]
@@ -175,7 +180,7 @@ def _attempt(rng, floor_key, target_rooms):
             opp = _OPPOSITE[side]
             cands = [c for c in templates if opp in c.doors and _compatible(t.kind, c.kind, structural)
                      and not (c.required and c.kind in kinds_spawned)]
-            cands = _weighted_order(rng, cands)
+            cands = _weighted_order(rng, _prefer_non_repeat(cands, t.id))
             placed_ok = False
             for cand in cands:
                 clx, cly = cand.door_local(opp)
@@ -207,7 +212,7 @@ def _attempt(rng, floor_key, target_rooms):
         ridx, side, world_cell = dead_end
         opp = _OPPOSITE[side]
         parent_t = rooms[ridx]["template"]
-        for cand in cand_pool:
+        for cand in _prefer_non_repeat(cand_pool, parent_t.id):
             if opp not in cand.doors or not _compatible(parent_t.kind, cand.kind, structural):
                 continue
             clx, cly = cand.door_local(opp)
@@ -397,6 +402,8 @@ def _connect_touching_rooms(rooms, resolved_doors, doors_made, extra_open, struc
 
             cand_a = candidate_from(a_idx, t_a, o_a, side_a, b_idx, t_b, o_b, side_b)
             cand_b = candidate_from(b_idx, t_b, o_b, side_b, a_idx, t_a, o_a, side_a)
+            if (cand_a is not None or cand_b is not None) and rng.random() >= S.ROOM_TOUCH_CONNECT_CHANCE:
+                continue
             if cand_a is not None and cand_b is not None and cand_a["world_along"] == cand_b["world_along"]:
                 cand_a["kind"] = _merge_door_kind(cand_a["kind"], cand_b["kind"])
                 cand_b = None
@@ -454,7 +461,7 @@ def generate(rng, floor_key, target_rooms):
                 wx, wy = ox + lx, oy + ly
                 if grid[wy][wx] == S.FLOOR:
                     continue
-                if (lx, ly) in extra_here and (lx, ly) not in door_local_cells:
+                if (lx, ly) in extra_here:
                     grid[wy][wx] = S.WALL_WINDOW if extra_here[(lx, ly)] == "window" else S.FLOOR
                 elif (lx, ly) in unresolved_local_cells:
                     grid[wy][wx] = S.WALL_CONCRETE

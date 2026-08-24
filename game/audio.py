@@ -112,7 +112,6 @@ class SoundBank:
         self.denied = self._make_denied()
         self.ui_beep = self._make_ui_beep()
         self.stinger = self._make_stinger(rng)
-        self.riser = self._make_riser()
         self.locker_in = self._make_locker(rng)
         self.door_creak = self._make_door_creak(rng)
         self.alert_sting = self._make_alert_sting(rng)
@@ -125,15 +124,15 @@ class SoundBank:
         self.hunt_pulse = self._make_hunt_pulse()
 
         pygame.mixer.set_num_channels(24)
-        pygame.mixer.set_reserved(8)
+        pygame.mixer.set_reserved(10)
         self.ch_ambient = pygame.mixer.Channel(0)
         self.ch_growl = pygame.mixer.Channel(1)
         self.ch_heart = pygame.mixer.Channel(2)
         self.ch_step = pygame.mixer.Channel(3)
-        self.ch_riser = pygame.mixer.Channel(4)
         self.ch_voice = pygame.mixer.Channel(5)
         self.ch_pulse = pygame.mixer.Channel(6)
         self.ch_door = pygame.mixer.Channel(7)
+        self.ch_hallu_pool = [pygame.mixer.Channel(4), pygame.mixer.Channel(8), pygame.mixer.Channel(9)]
 
         self._heart_timer = 0.0
         self._master = 1.0
@@ -232,15 +231,6 @@ class SoundBank:
         sig = np.tanh(sig * 1.7)
 
         return to_sound(normalize(sig, 1.0))
-
-    def _make_riser(self):
-        dur = 1.4
-        t = _t(dur)
-        f0, f1 = 90, 520
-        freq = np.linspace(f0, f1, len(t))
-        phase = 2 * np.pi * np.cumsum(freq) / SR
-        sig = np.sin(phase) * np.linspace(0.05, 1.0, len(t)) ** 1.5
-        return to_sound(normalize(sig, 0.85))
 
     def _make_alert_sting(self, rng):
         dur = 0.4
@@ -391,12 +381,24 @@ class SoundBank:
         self.ch_voice.set_volume(self._master * self._sfx_vol)
         self.ch_voice.play(self.stinger)
 
-    def play_riser(self):
-        self.riser.set_volume(self._master * self._sfx_vol * 0.9)
-        self.ch_riser.play(self.riser)
+    def _hallu_channel(self):
+        for ch in self.ch_hallu_pool:
+            if not ch.get_busy():
+                return ch
+        return self.ch_hallu_pool[0]
 
-    def stop_riser(self):
-        self.ch_riser.fadeout(120)
+    def play_hallu_alert(self):
+        ch = self._hallu_channel()
+        ch.set_volume(self._master * self._sfx_vol * 0.8)
+        ch.play(self.alert_sting)
+        return ch
+
+    def play_hallu_bang(self, pan=0.0, vol=1.0):
+        ch = self._hallu_channel()
+        base = self._master * self._sfx_vol * 0.75 * vol
+        ch.play(self.bang)
+        ch.set_volume(max(0.0, base * min(1.0, 1.0 - pan)), max(0.0, base * min(1.0, 1.0 + pan)))
+        return ch
 
     def play_scare(self, pan=0.0, vol=1.0, dist=0.0, rng=None):
         idx = (rng or random).randrange(len(self.scare_sounds))

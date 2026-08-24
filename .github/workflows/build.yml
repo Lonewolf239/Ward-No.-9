@@ -2,6 +2,11 @@ name: Build release executables
 
 on:
   workflow_dispatch: {}
+  push:
+    tags:
+      - "ALPHA_*"
+      - "BETA_*"
+      - "v*"
 
 jobs:
   build:
@@ -30,9 +35,38 @@ jobs:
           pip install pyinstaller
 
       - name: Build
+        env:
+          WARD9_UPLOAD_URL: ${{ secrets.WARD9_UPLOAD_URL }}
+          WARD9_UPLOAD_KEY: ${{ secrets.WARD9_UPLOAD_KEY }}
         run: python packaging/build.py
 
       - uses: actions/upload-artifact@v4
         with:
           name: ward9-${{ matrix.platform }}
           path: publish/${{ matrix.platform }}/*
+
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Zip each platform's build
+        run: |
+          cd dist
+          for d in */; do
+            platform="${d%/}"
+            (cd "$platform" && zip -r "../${platform}.zip" .)
+          done
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

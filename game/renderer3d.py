@@ -12,6 +12,7 @@ EYE_HEIGHT = 0.62
 FOV_DEGREES = 88.0
 MAX_POINT_LIGHTS = 12
 MAX_DOOR_SEGS = 16
+MAX_WINDOW_SEGS = 24
 
 VERTEX_SHADER = """
 #version 330
@@ -72,6 +73,7 @@ uniform float no_fog;
 uniform float flat_shade;
 uniform float qa_mode;
 uniform float u_alpha;
+uniform float glass_dim;
 
 #define MAX_POINT_LIGHTS 12
 uniform vec3 light_pos[MAX_POINT_LIGHTS];
@@ -97,6 +99,20 @@ uniform vec2 maze_size;
 #define MAX_DOOR_SEGS 16
 uniform vec2 door_seg_a[MAX_DOOR_SEGS];
 uniform vec2 door_seg_b[MAX_DOOR_SEGS];
+
+// Windows get the exact same segment treatment as closed doors, for the
+// exact same reason (see the comment above): a per-cell wall_mask entry
+// can't tell "this fragment IS the window's own glass/frame, being lit
+// from its own side" from "this fragment is just past it in the same
+// texel" - marking a window cell solid in wall_mask self-blocked a lamp
+// in the SAME room as the window from lighting the window itself (and
+// the wall right next to it), a visible dark seam right at the window's
+// texel. Static for a level's lifetime (windows don't open/close), so
+// this is uploaded once in Renderer3D.build_level rather than per frame
+// like the door segments.
+#define MAX_WINDOW_SEGS 24
+uniform vec2 window_seg_a[MAX_WINDOW_SEGS];
+uniform vec2 window_seg_b[MAX_WINDOW_SEGS];
 
 in vec3 v_world_pos;
 in vec3 v_normal;
@@ -172,6 +188,11 @@ float wall_occlusion(vec2 a, vec2 b) {
     }
     for (int j = 0; j < MAX_DOOR_SEGS; j++) {
         if (segment_crosses(a, b, door_seg_a[j], door_seg_b[j])) {
+            blocked += 2;
+        }
+    }
+    for (int j = 0; j < MAX_WINDOW_SEGS; j++) {
+        if (segment_crosses(a, b, window_seg_a[j], window_seg_b[j])) {
             blocked += 2;
         }
     }
@@ -294,6 +315,18 @@ void main() {
             lighting += light_color[i] * atten;
         }
         lighting = clamp(lighting, 0.0, 1.45);
+        // Window glass: capped separately from every other surface's 1.45
+        // ceiling above, regardless of how lit the room actually is (ambient,
+        // moon, nearby lamps, or a flashlight aimed straight at it) - without
+        // this, glass's own pale vertex colour picks up the same full
+        // lighting term as an opaque wall, then gets alpha-blended over an
+        // already-correctly-exposed room on the far side, reading as a
+        // brightening wash rather than a tinted pane. A flat colour/alpha
+        // tweak alone can't fix that (it'd still blow out under a flashlight
+        // aimed at the glass); capping the term glass responds with does.
+        if (glass_dim > 0.5) {
+            lighting = clamp(lighting, 0.0, 0.55);
+        }
 
         vec3 tex_col = vec3(1.0);
         if (use_tex > 0.5) {
@@ -498,6 +531,49 @@ def build_door_mesh():
     return np.array(v, dtype="f4")
 
 
+_DOOR_BREAK_LEAN = 0.14
+
+
+def build_broken_door_mesh():
+    v = []
+    x0, x1, y0, y1, z0, z1 = -0.5, 0.5, -0.5, 0.5, 0.0, 1.0
+    w = (1, 1, 1)
+    dark = (0.5, 0.44, 0.35)
+
+    def sh(p):
+        return (p[0], p[1] + _DOOR_BREAK_LEAN * p[2], p[2])
+
+    def sq(p0, p1, p2, p3, normal, col, **kw):
+        _quad(v, sh(p0), sh(p1), sh(p2), sh(p3), normal, col, **kw)
+
+    sq((x1, y1, z0), (x0, y1, z0), (x0, y1, z1), (x1, y1, z1), (0, 1, 0), w)
+    sq((x0, y0, z0), (x1, y0, z0), (x1, y0, z1), (x0, y0, z1), (0, -1, 0), w)
+    sq((x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1), (0, 0, 1), w)
+
+    def panel_face(fx, order):
+        def q(ya, yb, za, zb, col):
+            uv_sc = (yb - ya, zb - za)
+            if order > 0:
+                uv_off = (ya - y0, za - z0)
+                sq((fx, ya, za), (fx, yb, za), (fx, yb, zb), (fx, ya, zb), (order, 0, 0), col,
+                   uv_scale=uv_sc, uv_offset=uv_off)
+            else:
+                uv_off = (y1 - yb, za - z0)
+                sq((fx, yb, za), (fx, ya, za), (fx, ya, zb), (fx, yb, zb), (order, 0, 0), col,
+                   uv_scale=uv_sc, uv_offset=uv_off)
+        q(y0, y1, z0, 0.07, w)
+        q(y0, y1, 0.93, z1, w)
+        q(y0, y0 + 0.06, 0.07, 0.93, w)
+        q(y1 - 0.06, y1, 0.07, 0.93, w)
+        q(y0 + 0.06, y1 - 0.06, 0.47, 0.53, w)
+        q(y0 + 0.06, y1 - 0.06, 0.07, 0.47, dark)
+        q(y0 + 0.06, y1 - 0.06, 0.53, 0.93, dark)
+
+    panel_face(x1, 1)
+    panel_face(x0, -1)
+    return np.array(v, dtype="f4")
+
+
 def build_tree_mesh():
     v = []
     trunk_col = (0.40, 0.27, 0.16)
@@ -515,6 +591,8 @@ def build_tree_mesh():
     _quad(v, (cx1, cy1, cz0), (cx0, cy1, cz0), (cx0, cy1, cz1), (cx1, cy1, cz1), (0, 1, 0), canopy_col)
     _quad(v, (cx0, cy0, cz0), (cx1, cy0, cz0), (cx1, cy0, cz1), (cx0, cy0, cz1), (0, -1, 0), canopy_col)
     _quad(v, (cx0, cy0, cz1), (cx1, cy0, cz1), (cx1, cy1, cz1), (cx0, cy1, cz1), (0, 0, 1), canopy_col)
+    sz = 0.44
+    _quad(v, (cx0, cy0, sz), (cx1, cy0, sz), (cx1, cy1, sz), (cx0, cy1, sz), (0, 0, -1), canopy_col)
     return np.array(v, dtype="f4")
 
 
@@ -998,6 +1076,30 @@ def build_fuse_mesh():
     return np.array(v, dtype="f4")
 
 
+def build_sanity_pill_mesh():
+    v = []
+    body = (0.82, 0.76, 0.93)
+    rim = (0.60, 0.52, 0.78)
+    score = (0.44, 0.38, 0.58)
+    n = 8
+    r = 0.34
+    hz = 0.15
+    pts = [(r * math.cos(math.tau * i / n), r * math.sin(math.tau * i / n)) for i in range(n)]
+    for i in range(n):
+        xa, ya = pts[i]
+        xb, yb = pts[(i + 1) % n]
+        nx, ny = (xa + xb) / 2, (ya + yb) / 2
+        _quad(v, (xb, yb, 0.0), (xa, ya, 0.0), (xa, ya, hz), (xb, yb, hz), (nx, ny, 0), rim)
+    for i in range(n):
+        xa, ya = pts[i]
+        xb, yb = pts[(i + 1) % n]
+        _quad(v, (xa, ya, hz), (xb, yb, hz), (0.0, 0.0, hz), (0.0, 0.0, hz), (0, 0, 1), body)
+        _quad(v, (xb, yb, 0.0), (xa, ya, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0, 0, -1), body)
+    _quad(v, (-r, -0.025, hz + 0.002), (r, -0.025, hz + 0.002),
+          (r, 0.025, hz + 0.002), (-r, 0.025, hz + 0.002), (0, 0, 1), score)
+    return np.array(v, dtype="f4")
+
+
 def build_valve_key_mesh():
     v = []
     metal = (0.70, 0.75, 0.78)
@@ -1127,19 +1229,17 @@ def build_monitor_mesh():
 
 def build_bush_mesh():
     v = []
-    low = (0.16, 0.30, 0.13)
-    high = (0.20, 0.38, 0.16)
-    x0, x1, y0, y1 = -0.5, 0.5, -0.5, 0.5
-    _quad(v, (x1, y0, 0), (x1, y1, 0), (x1, y1, 0.6), (x1, y0, 0.6), (1, 0, 0), low)
-    _quad(v, (x0, y1, 0), (x0, y0, 0), (x0, y0, 0.6), (x0, y1, 0.6), (-1, 0, 0), low)
-    _quad(v, (x1, y1, 0), (x0, y1, 0), (x0, y1, 0.6), (x1, y1, 0.6), (0, 1, 0), low)
-    _quad(v, (x0, y0, 0), (x1, y0, 0), (x1, y0, 0.6), (x0, y0, 0.6), (0, -1, 0), low)
-    tx0, tx1, ty0, ty1 = -0.34, 0.34, -0.34, 0.34
-    _quad(v, (tx1, ty0, 0.35), (tx1, ty1, 0.35), (tx1, ty1, 1.0), (tx1, ty0, 1.0), (1, 0, 0), high)
-    _quad(v, (tx0, ty1, 0.35), (tx0, ty0, 0.35), (tx0, ty0, 1.0), (tx0, ty1, 1.0), (-1, 0, 0), high)
-    _quad(v, (tx1, ty1, 0.35), (tx0, ty1, 0.35), (tx0, ty1, 1.0), (tx1, ty1, 1.0), (0, 1, 0), high)
-    _quad(v, (tx0, ty0, 0.35), (tx1, ty0, 0.35), (tx1, ty0, 1.0), (tx0, ty0, 1.0), (0, -1, 0), high)
-    _quad(v, (tx0, ty0, 1.0), (tx1, ty0, 1.0), (tx1, ty1, 1.0), (tx0, ty1, 1.0), (0, 0, 1), high)
+    low = (0.15, 0.29, 0.12)
+    mid = (0.18, 0.34, 0.15)
+    high = (0.22, 0.39, 0.17)
+    clumps = (
+        (0.0, 0.02, 0.30, 0.44, 0.42, 0.30, low),
+        (0.20, -0.16, 0.52, 0.30, 0.32, 0.26, mid),
+        (-0.22, 0.14, 0.58, 0.27, 0.29, 0.25, mid),
+        (-0.02, -0.06, 0.80, 0.20, 0.21, 0.18, high),
+    )
+    for cx, cy, cz, sx, sy, sz, color in clumps:
+        _mini_box(v, cx, cy, cz, sx, sy, sz, color, skip_bottom=True)
     return np.array(v, dtype="f4")
 
 
@@ -1222,30 +1322,45 @@ def build_sky_dome_mesh(w, h, radius=90.0, rings=10, segments=28, horizon_drop=0
 
 WINDOW_GLASS_KEY = "window_glass"
 
+_WINDOW_HALF_DEPTH = 0.07
+
 
 def _build_window_cell(v_frame, v_glass, x, y, h, maze):
     cx, cy = x + 0.5, y + 0.5
     ew = maze.is_walkable_cell(x + 1, y) and maze.is_walkable_cell(x - 1, y)
     frame = tuple(c / 255.0 for c in S.WALL_BASE_COLORS[S.WALL_WINDOW])
-    glass = (0.55, 0.74, 0.80)
+    glass = (0.46, 0.60, 0.66)
     sill, lintel = h * 0.39, h * 0.87
     margin = 0.07
+    hd = _WINDOW_HALF_DEPTH
     if ew:
-        px = cx
         a0, a1 = y + margin, y + 1 - margin
-        _quad(v_frame, (px, y, 0), (px, y + 1, 0), (px, y + 1, sill), (px, y, sill), (1, 0, 0), frame)
-        _quad(v_frame, (px, y, lintel), (px, y + 1, lintel), (px, y + 1, h), (px, y, h), (1, 0, 0), frame)
-        _quad(v_frame, (px, y, sill), (px, a0, sill), (px, a0, lintel), (px, y, lintel), (1, 0, 0), frame)
-        _quad(v_frame, (px, a1, sill), (px, y + 1, sill), (px, y + 1, lintel), (px, a1, lintel), (1, 0, 0), frame)
-        _quad(v_glass, (px, a0, sill), (px, a1, sill), (px, a1, lintel), (px, a0, lintel), (1, 0, 0), glass)
+        for px, nx in ((cx - hd, -1), (cx + hd, 1)):
+            n = (nx, 0, 0)
+            _quad(v_frame, (px, y, 0), (px, y + 1, 0), (px, y + 1, sill), (px, y, sill), n, frame)
+            _quad(v_frame, (px, y, lintel), (px, y + 1, lintel), (px, y + 1, h), (px, y, h), n, frame)
+            _quad(v_frame, (px, y, sill), (px, a0, sill), (px, a0, lintel), (px, y, lintel), n, frame)
+            _quad(v_frame, (px, a1, sill), (px, y + 1, sill), (px, y + 1, lintel), (px, a1, lintel), n, frame)
+            _quad(v_glass, (px, a0, sill), (px, a1, sill), (px, a1, lintel), (px, a0, lintel), n, glass)
+        pxa, pxb = cx - hd, cx + hd
+        _quad(v_frame, (pxa, a0, lintel), (pxb, a0, lintel), (pxb, a1, lintel), (pxa, a1, lintel), (0, 0, -1), frame)
+        _quad(v_frame, (pxa, a0, sill), (pxa, a1, sill), (pxb, a1, sill), (pxb, a0, sill), (0, 0, 1), frame)
+        _quad(v_frame, (pxa, a0, sill), (pxa, a0, lintel), (pxb, a0, lintel), (pxb, a0, sill), (0, 1, 0), frame)
+        _quad(v_frame, (pxa, a1, lintel), (pxa, a1, sill), (pxb, a1, sill), (pxb, a1, lintel), (0, -1, 0), frame)
     else:
-        py = cy
         a0, a1 = x + margin, x + 1 - margin
-        _quad(v_frame, (x, py, 0), (x + 1, py, 0), (x + 1, py, sill), (x, py, sill), (0, 1, 0), frame)
-        _quad(v_frame, (x, py, lintel), (x + 1, py, lintel), (x + 1, py, h), (x, py, h), (0, 1, 0), frame)
-        _quad(v_frame, (x, py, sill), (a0, py, sill), (a0, py, lintel), (x, py, lintel), (0, 1, 0), frame)
-        _quad(v_frame, (a1, py, sill), (x + 1, py, sill), (x + 1, py, lintel), (a1, py, lintel), (0, 1, 0), frame)
-        _quad(v_glass, (a0, py, sill), (a1, py, sill), (a1, py, lintel), (a0, py, lintel), (0, 1, 0), glass)
+        for py, ny in ((cy - hd, -1), (cy + hd, 1)):
+            n = (0, ny, 0)
+            _quad(v_frame, (x, py, 0), (x + 1, py, 0), (x + 1, py, sill), (x, py, sill), n, frame)
+            _quad(v_frame, (x, py, lintel), (x + 1, py, lintel), (x + 1, py, h), (x, py, h), n, frame)
+            _quad(v_frame, (x, py, sill), (a0, py, sill), (a0, py, lintel), (x, py, lintel), n, frame)
+            _quad(v_frame, (a1, py, sill), (x + 1, py, sill), (x + 1, py, lintel), (a1, py, lintel), n, frame)
+            _quad(v_glass, (a0, py, sill), (a1, py, sill), (a1, py, lintel), (a0, py, lintel), n, glass)
+        pya, pyb = cy - hd, cy + hd
+        _quad(v_frame, (a0, pya, lintel), (a1, pya, lintel), (a1, pyb, lintel), (a0, pyb, lintel), (0, 0, -1), frame)
+        _quad(v_frame, (a0, pya, sill), (a0, pyb, sill), (a1, pyb, sill), (a1, pya, sill), (0, 0, 1), frame)
+        _quad(v_frame, (a0, pya, sill), (a0, pya, lintel), (a0, pyb, lintel), (a0, pyb, sill), (1, 0, 0), frame)
+        _quad(v_frame, (a1, pya, lintel), (a1, pya, sill), (a1, pyb, sill), (a1, pyb, lintel), (-1, 0, 0), frame)
 
 
 def build_maze_walls_by_type(maze):
@@ -1284,6 +1399,24 @@ def build_wall_mask(maze):
             if row[x] == S.FLOOR or row[x] == S.WALL_WINDOW:
                 mask[y, x] = 0
     return mask
+
+
+_NO_WINDOW_SEG = (-9999.0, -9999.0)
+
+
+def build_window_segments(maze):
+    segs = []
+    for y in range(maze.h):
+        row = maze.grid[y]
+        for x in range(maze.w):
+            if row[x] != S.WALL_WINDOW:
+                continue
+            ew = maze.is_walkable_cell(x + 1, y) and maze.is_walkable_cell(x - 1, y)
+            if ew:
+                segs.append(((x + 0.5, y), (x + 0.5, y + 1)))
+            else:
+                segs.append(((x, y + 0.5), (x + 1, y + 0.5)))
+    return segs
 
 
 def build_floor_mesh(maze):
@@ -1571,6 +1704,8 @@ class Renderer3D:
         self.quad_prog = ctx.program(vertex_shader=QUAD_VERTEX_SHADER, fragment_shader=QUAD_FRAGMENT_SHADER)
         self.prog["door_seg_a"].value = [self._NO_DOOR_SEG] * MAX_DOOR_SEGS
         self.prog["door_seg_b"].value = [self._NO_DOOR_SEG] * MAX_DOOR_SEGS
+        self.prog["window_seg_a"].value = [_NO_WINDOW_SEG] * MAX_WINDOW_SEGS
+        self.prog["window_seg_b"].value = [_NO_WINDOW_SEG] * MAX_WINDOW_SEGS
 
         box_data = build_box_mesh()
         self.box_vbo = ctx.buffer(box_data.tobytes())
@@ -1596,6 +1731,12 @@ class Renderer3D:
             self.prog, [(self.door_vbo, "3f 3f 2f 3f", "in_pos", "in_normal", "in_uv", "in_color")]
         )
 
+        broken_door_data = build_broken_door_mesh()
+        self.broken_door_vbo = ctx.buffer(broken_door_data.tobytes())
+        self.broken_door_vao = ctx.vertex_array(
+            self.prog, [(self.broken_door_vbo, "3f 3f 2f 3f", "in_pos", "in_normal", "in_uv", "in_color")]
+        )
+
         tree_data = build_tree_mesh()
         self.tree_vbo = ctx.buffer(tree_data.tobytes())
         self.tree_vao = ctx.vertex_array(
@@ -1614,6 +1755,7 @@ class Renderer3D:
             "shed_lock": build_shed_lock_mesh, "elevator": build_elevator_mesh, "hatch": build_hatch_mesh,
             "fence_gap": build_fence_gap_mesh, "battery": build_battery_mesh, "fuse": build_fuse_mesh,
             "valve_key": build_valve_key_mesh, "key": build_key_mesh, "cutters": build_cutters_mesh,
+            "sanity_pill": build_sanity_pill_mesh,
             "bush": build_bush_mesh, "rock": build_rock_mesh, "portal": build_portal_mesh,
             "clutter_papers": build_clutter_papers_mesh, "clutter_bottle": build_clutter_bottle_mesh,
             "clutter_junk": build_clutter_junk_mesh,
@@ -1796,6 +1938,15 @@ class Renderer3D:
         self.wall_mask_tex.repeat_y = False
         self.maze_size = (float(maze.w), float(maze.h))
 
+        window_segs = build_window_segments(maze)[:MAX_WINDOW_SEGS]
+        segs_a = [p0 for p0, _p1 in window_segs]
+        segs_b = [p1 for _p0, p1 in window_segs]
+        while len(segs_a) < MAX_WINDOW_SEGS:
+            segs_a.append(_NO_WINDOW_SEG)
+            segs_b.append(_NO_WINDOW_SEG)
+        self.prog["window_seg_a"].value = segs_a
+        self.prog["window_seg_b"].value = segs_b
+
         if self.sky_dome_vao is not None:
             self.sky_dome_vao.release()
             self.sky_dome_vbo.release()
@@ -1916,7 +2067,7 @@ class Renderer3D:
             elif p.kind == "tree":
                 vao = self.tree_vao
             elif p.kind == "door":
-                vao = self.box_vao if getattr(p, "is_broken", False) else self.door_vao
+                vao = self.broken_door_vao if getattr(p, "is_broken", False) else self.door_vao
             elif p.kind == "pipes" and (getattr(p, "pipe_open_neg", False) or getattr(p, "pipe_open_pos", False)):
                 variant = "pipes_open_both" if p.pipe_open_neg and p.pipe_open_pos else (
                     "pipes_open_neg" if p.pipe_open_neg else "pipes_open_pos")
@@ -2233,6 +2384,7 @@ class Renderer3D:
         prog["no_fog"].value = 0.0
         prog["flat_shade"].value = 0.0
         prog["u_alpha"].value = 1.0
+        prog["glass_dim"].value = 0.0
         _t_lights0 = time.perf_counter()
         active_lights = self._set_point_lights(props, eye, t)
         _t_lights1 = time.perf_counter()
@@ -2275,7 +2427,8 @@ class Renderer3D:
             if tile_type != WINDOW_GLASS_KEY:
                 continue
             prog["use_tex"].value = 0.0
-            prog["u_alpha"].value = 0.35
+            prog["u_alpha"].value = 0.30
+            prog["glass_dim"].value = 1.0
             self.ctx.enable(moderngl.BLEND)
             self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
             self.fbo.depth_mask = False
@@ -2283,6 +2436,7 @@ class Renderer3D:
             self.fbo.depth_mask = True
             self.ctx.disable(moderngl.BLEND)
             prog["u_alpha"].value = 1.0
+            prog["glass_dim"].value = 0.0
             prog["use_tex"].value = 1.0
 
         _t_walls1 = time.perf_counter()

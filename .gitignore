@@ -4,3 +4,5 @@ __pycache__/
 /publish/
 /build/
 /packaging/_version_info.txt
+/incoming_uploads/
+/game/_upload_config.py

@@ -5,6 +5,7 @@ import os
 import re
 
 from game import settings as S
+from game import i18n
 from game.props import PROP_DEFS, SURFACE_KINDS
 
 SURFACE_ITEM_KINDS = {"monitor", "lamp_desk"}
@@ -262,7 +263,7 @@ class RoomModel:
 
     def connectivity_errors(self):
         if not self.doors:
-            return ["нет ни одной двери"]
+            return [i18n.t("editor.err.no_doors")]
         floor_cells = {(x, y) for y in range(self.h) for x in range(self.w)
                        if self.cells[y][x] == S.FLOOR}
         floor_cells |= {(f[1], f[2]) for f in self.furniture}
@@ -279,10 +280,10 @@ class RoomModel:
         errors = []
         unreachable = floor_cells - seen
         if unreachable:
-            errors.append(f"{len(unreachable)} клеток пола недостижимы от двери")
+            errors.append(i18n.t("editor.err.unreachable_floor", n=len(unreachable)))
         for side, info in self.doors.items():
             if info["cell"] not in seen:
-                errors.append(f"дверь {side} не связана с остальным полом")
+                errors.append(i18n.t("editor.err.door_disconnected", side=side))
         return errors
 
     def content_errors(self):
@@ -291,9 +292,9 @@ class RoomModel:
         if required:
             count = sum(1 for f in self.furniture if f[0] == required)
             if count == 0:
-                errors.append(f"комната вида '{self.kind}' должна содержать 1x '{required}'")
+                errors.append(i18n.t("editor.err.missing_required", kind=self.kind, req=required))
             elif count > 1:
-                errors.append(f"в комнате вида '{self.kind}' больше одного '{required}' ({count})")
+                errors.append(i18n.t("editor.err.too_many_required", kind=self.kind, req=required, count=count))
         return errors
 
     def all_errors(self):

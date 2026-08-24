@@ -25,6 +25,8 @@ PROP_DEFS = {
                          texture="metal", interactable="pickup", emissive=True),
     "valve_key":   dict(hw=0.09, hd=0.09, height=0.18, color=(90, 195, 195),  solid=False, wall_mounted=False,
                          texture="metal", interactable="pickup", emissive=True),
+    "sanity_pill": dict(hw=0.07, hd=0.07, height=0.10, color=(196, 176, 224), solid=False, wall_mounted=False,
+                         texture="metal", interactable="pickup", emissive=True),
     "fuse_box":    dict(hw=0.28, hd=0.16, height=0.58, color=(120, 96, 30),   solid=True,  wall_mounted=True,  texture="metal",
                          interactable="panel"),
     "valve_panel": dict(hw=0.30, hd=0.18, height=0.62, color=(122, 66, 40),   solid=True,  wall_mounted=True,  texture="metal",
@@ -87,7 +89,7 @@ def _surface_top_z0(surf, rng=None):
 HAND_FURNITURE_KINDS = {
     "bed", "desk", "table", "shelf", "gurney", "crate", "barrel", "pipes",
     "chair", "cabinet", "sink", "trash_can", "vending", "locker",
-    "lamp_desk", "wall_sconce", "sign_exit", "monitor",
+    "lamp_desk", "wall_sconce", "sign_exit", "monitor", "tree", "bush", "rock",
 }
 
 HAND_FURNITURE_BY_KIND = {
@@ -106,6 +108,15 @@ HAND_FURNITURE_BY_KIND = {
     "tech_corridor": {"pipes", "wall_sconce", "locker"},
     "vent": {"wall_sconce", "locker"},
     "entrance": {"shelf", "chair", "trash_can", "locker", "wall_sconce"},
+}
+
+ZONE_HAND_FURNITURE_BY_KIND = {
+    "open": {"tree", "bush", "rock", "crate", "barrel"},
+    "shed": {"crate", "barrel", "wall_sconce"},
+    "tool_shed": {"crate", "barrel", "shelf", "wall_sconce"},
+    "storage": {"crate", "barrel", "shelf", "locker", "wall_sconce"},
+    "forest": {"tree", "bush", "rock"},
+    "alley": {"tree", "bush"},
 }
 
 
@@ -212,13 +223,13 @@ class Door:
 
     @property
     def x(self):
-        angle = self.swing * (math.pi / 2)
+        angle = self.swing * (math.pi / 2) + self.break_askew
         ca, sa = math.cos(angle), math.sin(angle)
         return self._hinge_x + (self._vx0 * ca - self._vy0 * sa)
 
     @property
     def y(self):
-        angle = self.swing * (math.pi / 2)
+        angle = self.swing * (math.pi / 2) + self.break_askew
         ca, sa = math.cos(angle), math.sin(angle)
         return self._hinge_y + (self._vx0 * sa + self._vy0 * ca)
 
@@ -258,8 +269,9 @@ class Door:
     def break_open(self):
         self.is_open = True
         self.is_broken = True
+        self.swing = 1.0
         self._swing_target = 1.0
-        self.break_askew = 0.3
+        self.break_askew = 0.0
         self.base_color = (46, 32, 26)
 
     def update(self, dt):
@@ -386,6 +398,24 @@ def _circle_hits_prop(x, y, r, p):
     closest_f = max(-p.collide_hd, min(p.collide_hd, local_f))
     dr, df = local_r - closest_r, local_f - closest_f
     return dr * dr + df * df < r * r
+
+
+def _pick_monster_spawn(maze, far, ranked, props, rng):
+    solid_candidates = [p for p in props if p.solid and (not p.wall_mounted or p.kind == "locker")]
+
+    def clear(cell):
+        cx, cy = cell[0] + 0.5, cell[1] + 0.5
+        if maze.circle_hits_wall(cx, cy, S.MONSTER_RADIUS):
+            return False
+        return not any(_circle_hits_prop(cx, cy, S.MONSTER_RADIUS, p) for p in solid_candidates)
+
+    far_clear = [c for c in far if clear(c)]
+    if far_clear:
+        return rng.choice(far_clear)
+    any_clear = [c for c in ranked if clear(c)]
+    if any_clear:
+        return rng.choice(any_clear)
+    return rng.choice(far)
 
 
 def _edge_physically_clear(maze, props_list, ax, ay, bx, by, radius=None):
@@ -755,6 +785,11 @@ def populate_level(maze, spec, rng):
         used.add(cell)
         props.append(_place_pickup("battery", cell, surfaces, rng, surface_occupied, on_surface_chance=0.82))
 
+    pill_cells = _spread_pick(open_cells, spec.get("n_sanity_pills", 0), used, rng, min_gap=6)
+    for cell in pill_cells:
+        used.add(cell)
+        props.append(_place_pickup("sanity_pill", cell, surfaces, rng, surface_occupied, on_surface_chance=0.6))
+
     note_cells = _spread_pick(open_cells, spec.get("n_notes", S.TOTAL_NOTES), used, rng, min_gap=3)
     note_pool = NOTE_POOL[spec["key"]]
     note_texts = rng.sample(note_pool, k=min(len(note_cells), len(note_pool)))
@@ -802,8 +837,7 @@ def populate_level(maze, spec, rng):
 
     ranked = sorted(dist.keys(), key=lambda c: dist[c])
     far = ranked[-max(1, len(ranked) // 4):]
-    far_clear = [c for c in far if c not in blocked_solid] or far
-    monster_cell = rng.choice(far_clear)
+    monster_cell = _pick_monster_spawn(maze, far, ranked, props, rng)
 
     props = _finalize_physical_safety(maze, props, dist)
     link_adjacent_pipes(props)
@@ -815,14 +849,14 @@ def populate_yard(maze, spec, rng):
     sx, sy = int(maze.start[0]), int(maze.start[1])
     spawn = (sx, sy)
     dist = maze.bfs_distances(sx, sy)
-    sx0, sy0, sx1, sy1 = maze.shed_rect
+    shed_zone = next(z for z in maze.zones if z["kind"] == "shed")
+    sx0, sy0, sx1, sy1 = shed_zone["rect"]
 
     def in_shed(c):
         return sx0 <= c[0] < sx1 and sy0 <= c[1] < sy1
 
     all_floor = maze.floor_cells()
-    door_cell = maze.shed_door_cell
-    shed_interior_cells = [c for c in all_floor if in_shed(c) and c != door_cell]
+    door_cell = shed_zone["interior_doors"][0][:2]
     yard_cells = [c for c in all_floor if not in_shed(c)]
 
     props = []
@@ -844,90 +878,42 @@ def populate_yard(maze, spec, rng):
     blocked_solid.add(door_cell)
     dist = maze.bfs_distances(sx, sy, blocked=blocked_solid)
 
+    shed_interior_cells = [c for c in all_floor if in_shed(c) and c not in used]
     if shed_interior_cells:
         ccell = shed_interior_cells[0]
         props.append(make_prop("cutters", ccell, facing=rng.uniform(0, math.tau)))
         used.add(ccell)
 
     yard_doors = []
-    for building in maze.yard_buildings:
-        dcell = building["door_cell"]
-        d = Door(dcell[0] + 0.5, dcell[1] + 0.5, building["door_facing"])
-        yard_doors.append(d)
-        used.add(dcell)
-        blocked_solid.add(dcell)
-        if building["interior_door"] is not None:
-            icell, ifacing = building["interior_door"]
-            idoor = Door(icell[0] + 0.5, icell[1] + 0.5, ifacing)
-            yard_doors.append(idoor)
-            used.add(icell)
-            blocked_solid.add(icell)
+    for zone in maze.zones:
+        if zone["kind"] == "shed":
+            continue
+        for wx, wy, dfacing, dkind in zone["interior_doors"]:
+            cell = (wx, wy)
+            d = Door(wx + 0.5, wy + 0.5, dfacing)
+            if dkind == "broken":
+                d.break_open()
+            yard_doors.append(d)
+            used.add(cell)
+            blocked_solid.add(cell)
     dist = maze.bfs_distances(sx, sy, blocked=blocked_solid)
 
-    yard_building_furniture = {
-        "tool_shed": ["crate", "barrel"],
-        "storage": ["crate", "crate", "barrel", "locker"],
-    }
-    for building in maze.yard_buildings:
-        kinds = yard_building_furniture.get(building["kind"], ["crate"])
-        rooms = building["interior_rects"]
-        for i, kind in enumerate(kinds):
-            rx0, ry0, rx1, ry1 = rooms[i % len(rooms)]
-            room_cells = [(x, y) for y in range(ry0, ry1) for x in range(rx0, rx1)
-                          if (x, y) not in used and maze.grid[y][x] == S.FLOOR]
-            rng.shuffle(room_cells)
-            if kind == "locker":
-                for cell in room_cells:
-                    prop = _wall_prop(maze, cell, "locker", rng, spawn=spawn, all_reachable=dist,
-                                       blocked_solid=blocked_solid, props_list=props, used=used)
-                    if prop is not None:
-                        props.append(prop)
-                        break
+    for zone in maze.zones:
+        for kind, wx, wy, ffacing in zone["furniture"]:
+            cell = (wx, wy)
+            if cell in used:
                 continue
-            for cell in room_cells:
-                if not _is_safe_to_block(maze, spawn, dist, blocked_solid, cell):
-                    continue
-                trial = make_prop(kind, cell, facing=rng.uniform(0, math.tau))
-                if not _region_physically_clear(maze, props + [trial], cell):
-                    continue
-                used.add(cell)
+            x, y, z0, forced_facing = _authored_prop_position(cell, kind, ffacing, maze)
+            if forced_facing is not None:
+                ffacing = forced_facing
+            prop = Prop(kind, x, y, facing=ffacing)
+            prop.z0 = z0
+            prop.interact_cell = cell
+            props.append(prop)
+            used.add(cell)
+            if PROP_DEFS[kind]["solid"]:
                 blocked_solid.add(cell)
-                props.append(trial)
-                break
-
-    def _try_plant(cell, kind):
-        if cell in used or not maze.is_walkable_cell(*cell):
-            return False
-        if not _is_safe_to_block(maze, spawn, dist, blocked_solid, cell):
-            return False
-        trial = make_prop(kind, cell, facing=rng.uniform(0, math.tau))
-        if not _region_physically_clear(maze, props + [trial], cell):
-            return False
-        used.add(cell)
-        blocked_solid.add(cell)
-        props.append(trial)
-        return True
-
-    if maze.yard_forest_rect is not None:
-        fx0, fy0, fx1, fy1 = maze.yard_forest_rect
-        forest_cells = [(x, y) for y in range(fy0, fy1) for x in range(fx0, fx1)]
-        rng.shuffle(forest_cells)
-        for cell in forest_cells:
-            if rng.random() > 0.6:
-                continue
-            _try_plant(cell, "tree" if rng.random() < 0.75 else "bush")
-
-    if maze.yard_alley_line is not None:
-        (ax0, ay0), (ax1, ay1) = maze.yard_alley_line
-        dx, dy = ax1 - ax0, ay1 - ay0
-        steps = max(abs(dx), abs(dy))
-        if steps > 0:
-            stepx, stepy = dx / steps, dy / steps
-            perp_x, perp_y = (0, 1) if dx else (1, 0)
-            for i in range(0, steps + 1, 2):
-                lx, ly = round(ax0 + stepx * i), round(ay0 + stepy * i)
-                _try_plant((lx + perp_x, ly + perp_y), "tree")
-                _try_plant((lx - perp_x, ly - perp_y), "tree")
+    dist = maze.bfs_distances(sx, sy, blocked=blocked_solid)
 
     open_yard = [c for c in yard_cells if c not in used and dist.get(c, 0) >= 2]
     key_cells = _spread_pick(open_yard, spec["n_collectible"], used, rng, min_gap=5)
@@ -984,44 +970,6 @@ def populate_yard(maze, spec, rng):
                 props.append(sign)
                 break
 
-    exit_cell_for_forest = exit_prop.interact_cell if exit_prop is not None else None
-    boundary_cells = []
-    for x in range(2, maze.w - 2):
-        boundary_cells.append((x, 2))
-        boundary_cells.append((x, maze.h - 3))
-    for y in range(2, maze.h - 2):
-        boundary_cells.append((2, y))
-        boundary_cells.append((maze.w - 3, y))
-    rng.shuffle(boundary_cells)
-    for cell in boundary_cells:
-        if exit_cell_for_forest is not None and (
-                abs(cell[0] - exit_cell_for_forest[0]) + abs(cell[1] - exit_cell_for_forest[1]) <= 2):
-            continue
-        if rng.random() > 0.5:
-            continue
-        _try_plant(cell, "tree" if rng.random() < 0.8 else "bush")
-
-    remaining = [c for c in yard_cells if c not in used and dist.get(c, 0) >= 2]
-    rng.shuffle(remaining)
-    decor_kinds = ["tree"] * 8 + ["bush"] * 6 + ["rock"] * 5 + ["crate"] * 4 + ["barrel"] * 3
-    rng.shuffle(decor_kinds)
-    for kind in decor_kinds:
-        tries = 0
-        while remaining and tries < 25:
-            tries += 1
-            cell = remaining.pop()
-            if cell in used:
-                continue
-            if not _is_safe_to_block(maze, spawn, dist, blocked_solid, cell):
-                continue
-            trial = make_prop(kind, cell, facing=rng.uniform(0, math.tau))
-            if not _region_physically_clear(maze, props + [trial], cell):
-                continue
-            used.add(cell)
-            blocked_solid.add(cell)
-            props.append(trial)
-            break
-
     battery_cells = _spread_pick([c for c in yard_cells if c not in used], S.TOTAL_BATTERIES, used, rng, min_gap=3)
     for cell in battery_cells:
         used.add(cell)
@@ -1038,8 +986,7 @@ def populate_yard(maze, spec, rng):
 
     ranked = sorted((c for c in dist.keys() if not in_shed(c)), key=lambda c: dist[c])
     far = ranked[-max(1, len(ranked) // 4):]
-    far_clear = [c for c in far if c not in blocked_solid] or far
-    monster_cell = rng.choice(far_clear)
+    monster_cell = _pick_monster_spawn(maze, far, ranked, props, rng)
 
     props = _finalize_physical_safety(maze, props, dist)
     link_adjacent_pipes(props)
@@ -1080,7 +1027,6 @@ def populate_debug(maze, rng):
     d_open._swing_target = 1.0
     d_broken = Door(x0 + 4.1, door_row_y + 0.5, 0.0)
     d_broken.break_open()
-    d_broken.swing = 1.0
     doors = [d_closed, d_open, d_broken]
 
     portal_row_y = door_row_y + 2 * spacing

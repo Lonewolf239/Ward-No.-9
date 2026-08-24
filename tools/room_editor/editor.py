@@ -1,3 +1,4 @@
+import io
 import math
 import os
 import random
@@ -19,12 +20,28 @@ from game.renderer3d import Renderer3D, EYE_HEIGHT, FOV_DEGREES
 from game.room_templates import door_facing as _border_door_facing
 
 from tools.room_editor import room_model as rm
+from tools.room_editor import upload as up
+from tools.room_editor import zone_model as zm
 from tools.room_editor.camera import FreeCamera
 from tools.room_editor.grid_view import GridView
 from tools.room_editor.panel import Panel
 from tools.room_editor.raycast import ray_floor_cell
 
-i18n.set_language("ru")
+
+def _apply_saved_language():
+    import json
+    from game.app import SETTINGS_PATH, _LEGACY_SETTINGS_PATH
+    path = SETTINGS_PATH if SETTINGS_PATH.exists() else _LEGACY_SETTINGS_PATH
+    try:
+        with open(path, encoding="utf-8") as f:
+            lang = json.load(f).get("language")
+        if lang:
+            i18n.set_language(lang)
+    except (OSError, ValueError):
+        pass
+
+
+_apply_saved_language()
 
 PANEL_W = 380
 PAD = 3
@@ -32,9 +49,10 @@ MONSTER_PARK = (-2000.0, -2000.0)
 
 
 class Editor:
-    def __init__(self):
+    def __init__(self, mode="dev"):
+        self.mode = mode
         pygame.init()
-        pygame.display.set_caption("ПАЛАТА №9 - Редактор комнат")
+        pygame.display.set_caption(f"{S.TITLE} - {i18n.t('editor.ui.window_title_suffix')}")
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
@@ -53,6 +71,7 @@ class Editor:
         self.grid = GridView(pygame.Rect(0, 0, self.primary_w, self.window_h))
         self.view_mode = "camera"
 
+        self.editor_mode = "room"
         self.model = rm.RoomModel(id=rm.fresh_id("ward", "upper"), kind="ward", floor="upper")
         self.camera = FreeCamera()
         self._center_camera_on_room()
@@ -69,7 +88,6 @@ class Editor:
         self._rebuild_level()
 
         self.looking = False
-        self.renaming = False
         self.painting = False
         self.paint_value = S.WALL_CONCRETE
         self.natural_color = False
@@ -80,6 +98,9 @@ class Editor:
         self._test_spawn = (0.0, 0.0)
         self.dirty = False
         self.hover_cell = None
+        self.prompting_nickname = False
+        self._nickname_buffer = ""
+        self.uploading = False
         self.message = ""
         self.message_is_error = False
         self.message_time = 0.0
@@ -108,7 +129,8 @@ class Editor:
         gw, gh, grid, pad = self.model.to_maze_grid(pad=PAD)
         self._fake_maze.w, self._fake_maze.h = gw, gh
         self._fake_maze.grid = grid
-        self.renderer.build_level(self._fake_maze, theme=self.model.floor)
+        theme = self.model.floor if self.editor_mode == "room" else "yard"
+        self.renderer.build_level(self._fake_maze, theme=theme)
         self.dirty = False
 
     def _mark_dirty(self):
@@ -185,10 +207,10 @@ class Editor:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
-            elif event.type == pygame.TEXTINPUT and self.renaming:
+            elif event.type == pygame.TEXTINPUT and self.prompting_nickname:
                 ch = event.text
-                if ch.isalnum() or ch in "_-":
-                    self.model.id = (self.model.id + ch)[:48]
+                if ch.isprintable():
+                    self._nickname_buffer = (self._nickname_buffer + ch)[:32]
             elif event.type == pygame.KEYDOWN:
                 self._handle_keydown(event)
             elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -209,12 +231,21 @@ class Editor:
                     self._paint_at(*event.pos)
 
     def _handle_keydown(self, event):
-        if self.renaming:
-            if event.key in (pygame.K_RETURN, pygame.K_ESCAPE):
-                self.renaming = False
+        if self.prompting_nickname:
+            if event.key == pygame.K_RETURN:
+                nickname = self._nickname_buffer.strip()
+                if nickname:
+                    self.prompting_nickname = False
+                    pygame.key.stop_text_input()
+                    up.save_nickname(nickname)
+                    self._do_upload_save(nickname)
+                else:
+                    self._set_message(i18n.t("editor.msg.nickname_empty"), True)
+            elif event.key == pygame.K_ESCAPE:
+                self.prompting_nickname = False
                 pygame.key.stop_text_input()
             elif event.key == pygame.K_BACKSPACE:
-                self.model.id = self.model.id[:-1]
+                self._nickname_buffer = self._nickname_buffer[:-1]
             return
         if event.key == pygame.K_F1:
             self.show_help = not self.show_help
@@ -226,11 +257,6 @@ class Editor:
         if event.key == pygame.K_TAB:
             if self.testing_floor is None:
                 self._toggle_view()
-            return
-        if event.key == pygame.K_F2:
-            if self.testing_floor is None:
-                self.renaming = True
-                pygame.key.start_text_input()
             return
         if event.key == pygame.K_ESCAPE:
             if self.testing_floor is not None:
@@ -258,6 +284,17 @@ class Editor:
         self._mark_dirty()
 
     def _erase_cell(self, x, y):
+        if self.editor_mode == "zone":
+            if self.model.furniture_at(x, y) is not None:
+                self.model.remove_furniture(x, y)
+                return True
+            if self.model.interior_door_at(x, y) is not None:
+                self.model.click_interior_door(x, y)
+                return True
+            if self.model.cells[y][x] != S.FLOOR:
+                self.model.set_cell(x, y, S.FLOOR)
+                return True
+            return False
         if self.model.furniture_at(x, y) is not None:
             self.model.remove_furniture(x, y)
             return True
@@ -284,7 +321,8 @@ class Editor:
             return
         if mx >= self.primary_w:
             action = self.panel.handle_click(mx - self.primary_w, my, self.model, self.view_mode,
-                                              self.natural_color, self.testing_floor)
+                                              self.natural_color, self.testing_floor, self.editor_mode,
+                                              self.mode == "dev")
             self._handle_panel_action(action)
             return
         if self.testing_floor is not None:
@@ -295,7 +333,10 @@ class Editor:
         x, y = cell
         tool = self.panel.current_tool
         if tool == "wall":
-            self.paint_value = S.WALL_CONCRETE
+            if self.editor_mode == "zone" and self.model.on_border(x, y):
+                self._set_message(i18n.t("editor.msg.zone_border_fixed"), True)
+                return
+            self.paint_value = S.WALL_SHED if self.editor_mode == "zone" else S.WALL_CONCRETE
             self.painting = True
             self.model.set_cell(x, y, self.paint_value)
             self._mark_dirty()
@@ -304,7 +345,12 @@ class Editor:
             if self._erase_cell(x, y):
                 self._mark_dirty()
             else:
-                self._set_message("Здесь нечего стирать", True)
+                self._set_message(i18n.t("editor.msg.nothing_to_erase"), True)
+        elif tool == "door" and self.editor_mode == "zone":
+            if self.model.click_interior_door(x, y, kind=self.panel.current_door_kind):
+                self._mark_dirty()
+            else:
+                self._set_message(i18n.t("editor.msg.no_interior_door"), True)
         elif tool == "door":
             scope = self.panel.current_door_scope
             if self.model.click_door(x, y, kind=self.panel.current_door_kind, scope=scope):
@@ -312,21 +358,17 @@ class Editor:
             else:
                 side = self.model.side_of_border_cell(x, y)
                 if side is not None and scope == "link" and side in self.model.doors:
-                    self._set_message(
-                        "На этой стороне уже есть переход между комнатами - сотрите его "
-                        "или переключитесь на «Локальная»", True)
+                    self._set_message(i18n.t("editor.msg.door_side_taken"), True)
                 else:
-                    self._set_message(
-                        "Здесь нельзя поставить дверь - нужна граница комнаты "
-                        "или щель во внутренней стене", True)
+                    self._set_message(i18n.t("editor.msg.no_door_here"), True)
         elif tool == "furniture":
             ok = self.model.place_furniture(self.panel.current_furniture_kind, x, y)
             if ok:
                 self._mark_dirty()
             elif PROP_DEFS[self.panel.current_furniture_kind]["wall_mounted"]:
-                self._set_message("Этот предмет крепится только к стене - нужна клетка рядом со стеной", True)
+                self._set_message(i18n.t("editor.msg.wall_only_furniture"), True)
             else:
-                self._set_message("Нельзя ставить мебель на стену/дверь/вне комнаты", True)
+                self._set_message(i18n.t("editor.msg.cant_place_furniture"), True)
 
     def _handle_panel_action(self, action):
         if action is None:
@@ -348,33 +390,127 @@ class Editor:
         if action == "test_exit":
             self._exit_test_floor()
             return
-        if action == "new":
-            kind, floor = self.model.kind, self.model.floor
-            self.model = rm.RoomModel(id=rm.fresh_id(kind, floor), kind=kind, floor=floor)
+        if action == "toggle_editor_mode":
+            self.editor_mode = "zone" if self.editor_mode == "room" else "room"
+            if self.editor_mode == "zone":
+                self.model = zm.ZoneModel(id=zm.fresh_id("open"), kind="open")
+            else:
+                self.model = rm.RoomModel(id=rm.fresh_id("ward", "upper"), kind="ward", floor="upper")
+            self.panel.current_tool = "wall" if self.editor_mode == "zone" else "furniture"
             self._center_camera_on_room()
             self._mark_dirty()
-            self._set_message(f"Новая комната: {self.model.id}")
+            self._set_message(i18n.t("editor.msg.mode_zone" if self.editor_mode == "zone" else "editor.msg.mode_room"))
+            return
+        if action == "new":
+            if self.editor_mode == "zone":
+                kind = self.model.kind
+                self.model = zm.ZoneModel(id=zm.fresh_id(kind), kind=kind)
+            else:
+                kind, floor = self.model.kind, self.model.floor
+                self.model = rm.RoomModel(id=rm.fresh_id(kind, floor), kind=kind, floor=floor)
+            self._center_camera_on_room()
+            self._mark_dirty()
+            msg_key = "editor.msg.new_zone" if self.editor_mode == "zone" else "editor.msg.new_room"
+            self._set_message(i18n.t(msg_key, id=self.model.id))
+        elif action == "save" and self.mode == "user":
+            errors = self.model.all_errors()
+            if errors:
+                self._set_message(i18n.t("editor.msg.cant_save", errors="; ".join(errors)), True)
+                return
+            nickname = up.get_saved_nickname()
+            if not nickname:
+                self.prompting_nickname = True
+                self._nickname_buffer = ""
+                pygame.key.start_text_input()
+                return
+            self._do_upload_save(nickname)
         elif action == "save":
             errors = self.model.all_errors()
             if errors:
-                self._set_message("Нельзя сохранить: " + "; ".join(errors), True)
+                self._set_message(i18n.t("editor.msg.cant_save", errors="; ".join(errors)), True)
                 return
             if not self.model.id or not self.model.id.replace("_", "").replace("-", "").isalnum():
-                self._set_message("Некорректный id комнаты (F2, чтобы переименовать)", True)
+                self._set_message(i18n.t("editor.msg.bad_id"), True)
                 return
             path = self.model.save()
-            self._set_message(f"Сохранено: {os.path.basename(path)}")
+            self._set_message(i18n.t("editor.msg.saved", filename=os.path.basename(path)))
         elif action == "validate":
             errors = self.model.all_errors()
-            self._set_message("Комната готова, ошибок нет" if not errors else "; ".join(errors), bool(errors))
+            ok_key = "editor.msg.zone_ok" if self.editor_mode == "zone" else "editor.msg.room_ok"
+            self._set_message(i18n.t(ok_key) if not errors else "; ".join(errors), bool(errors))
         elif action.startswith("load:"):
             self._load(action.split(":", 1)[1])
+        elif action.startswith("import:"):
+            self._do_import(action.split(":", 1)[1])
 
-    def _load(self, room_id):
-        self.model = rm.load(room_id)
+    def _do_import(self, zip_name):
+        zip_path = os.path.join(up.INCOMING_DIR, zip_name)
+        try:
+            with open(zip_path, "rb") as f:
+                blob = f.read()
+            parsed = up.unpack_upload_zip(blob)
+            data = parsed["model_json"]
+            if not isinstance(data, dict):
+                raise ValueError("no room/zone json in the archive")
+
+            is_zone = "floor" not in data
+            if is_zone:
+                kind = data.get("kind")
+                if kind not in zm.ZONE_KINDS:
+                    kind = "open"
+                data["kind"] = kind
+                existing = {k: v for k, v in data.items() if k != "id"}
+                for eid in zm.list_saved_ids():
+                    other = zm.load(eid)
+                    if {k: v for k, v in other.to_json_dict().items() if k != "id"} == existing:
+                        self._set_message(i18n.t("editor.msg.import_duplicate", id=eid))
+                        return
+                data["id"] = zm.fresh_id(kind)
+                model = zm.ZoneModel.from_json_dict(data)
+            else:
+                floor = data.get("floor")
+                if floor not in rm.KINDS_BY_FLOOR:
+                    floor = "upper"
+                kind = data.get("kind")
+                if kind not in rm.KINDS_BY_FLOOR[floor]:
+                    kind = rm.KINDS_BY_FLOOR[floor][0]
+                data["floor"], data["kind"] = floor, kind
+                existing = {k: v for k, v in data.items() if k != "id"}
+                for eid in rm.list_saved_ids():
+                    other = rm.load(eid)
+                    if {k: v for k, v in other.to_json_dict().items() if k != "id"} == existing:
+                        self._set_message(i18n.t("editor.msg.import_duplicate", id=eid))
+                        return
+                data["id"] = rm.fresh_id(kind, floor)
+                model = rm.RoomModel.from_json_dict(data)
+            path = model.save()
+        except Exception as e:
+            self._set_message(i18n.t("editor.msg.import_failed", error=str(e)), True)
+            return
+        nickname = parsed.get("nickname") or "?"
+        self._set_message(i18n.t("editor.msg.imported", filename=os.path.basename(path), nickname=nickname))
+
+    def _load(self, item_id):
+        self.model = zm.load(item_id) if self.editor_mode == "zone" else rm.load(item_id)
         self._center_camera_on_room()
         self._mark_dirty()
-        self._set_message(f"Загружено: {room_id}")
+        self._set_message(i18n.t("editor.msg.loaded", id=item_id))
+
+    def _do_upload_save(self, nickname):
+        self.uploading = True
+        self._set_message(i18n.t("editor.msg.uploading"))
+        self._draw()
+        kind = "zone" if self.editor_mode == "zone" else "room"
+        jpegs = self._capture_prerenders(3)
+        model_json = self.model.to_json_dict()
+        filename = f"{self.model.id}.json"
+        blob = up.build_upload_zip(model_json, filename, nickname, jpegs)
+        ok, err = up.upload(blob, kind, self.model.id)
+        self.uploading = False
+        if ok:
+            self._set_message(i18n.t("editor.msg.upload_ok"))
+        else:
+            self._set_message(i18n.t("editor.msg.upload_failed", error=err or "?"), True)
 
     def _enter_test_floor(self, index):
         already_testing = self.testing_floor is not None
@@ -404,8 +540,7 @@ class Editor:
         self.camera.x, self.camera.y, self.camera.z = sx, sy, 2.4
         self.camera.yaw = math.pi / 4
         self.camera.pitch = -0.4
-        self._set_message(f"Тестовая генерация: {i18n.t(spec['title'])} "
-                           "(учитывает только уже сохранённые комнаты)")
+        self._set_message(i18n.t("editor.msg.test_floor", title=i18n.t(spec["title"])))
 
     def _exit_test_floor(self):
         self.testing_floor = None
@@ -414,14 +549,12 @@ class Editor:
         self._test_monster = None
         self._mark_dirty()
         self._center_camera_on_room()
-        self._set_message("Вернулись к редактированию комнаты")
+        self._set_message(i18n.t("editor.msg.back_to_editing"))
 
     def _look_center(self):
         return (self.primary_w // 2, self.window_h // 2)
 
     def _update_camera(self, dt):
-        if self.renaming:
-            return
         keys = pygame.key.get_pressed()
         move = {
             "forward": keys[pygame.K_w], "back": keys[pygame.K_s],
@@ -446,6 +579,8 @@ class Editor:
             return self._FLAT_PREVIEW
         if self.testing_floor is not None:
             spec = S.FLOOR_SPECS[self.testing_floor]
+        elif self.editor_mode == "zone":
+            spec = next((s for s in S.FLOOR_SPECS if s.get("layout") == "yard"), None)
         else:
             spec = next((s for s in S.FLOOR_SPECS if s.get("floor_theme") == self.model.floor), None)
         if spec is None:
@@ -454,6 +589,43 @@ class Editor:
             fog_color=spec["fog_color"], fog_dist=spec["fog_dist"], ambient=spec["ambient_level"],
             moon_strength=spec.get("moon_strength", 0.0), qa_mode=False,
         )
+
+    def _capture_prerenders(self, count=3):
+        saved = (self.camera.x, self.camera.y, self.camera.z, self.camera.yaw, self.camera.pitch)
+        cx, cy = self.model.w / 2 + PAD, self.model.h / 2 + PAD
+        margin = min(1.8, max(0.8, min(self.model.w, self.model.h) / 3))
+        corners = [
+            (PAD + margin, PAD + margin),
+            (PAD + self.model.w - margin, PAD + margin),
+            (PAD + margin, PAD + self.model.h - margin),
+            (PAD + self.model.w - margin, PAD + self.model.h - margin),
+        ]
+        jpegs = []
+        for i in range(count):
+            self.camera.x, self.camera.y = corners[i % len(corners)]
+            self.camera.z = 0.9
+            self.camera.yaw = math.atan2(cy - self.camera.y, cx - self.camera.x)
+            self.camera.pitch = -0.05
+            self._fake_player.x, self._fake_player.y = self.camera.x, self.camera.y
+            self._fake_player.angle = self.camera.yaw
+            self._fake_player.pitch = self.camera.pitch
+            self._fake_player.bob_phase = 0.0
+            self._fake_player.is_sprinting = False
+            self._fake_player.is_hiding = False
+            self._fake_player.crouch = (EYE_HEIGHT - self.camera.z) / S.CROUCH_EYE_DROP
+            self.renderer.render(
+                self._fake_maze, self._fake_player, self._fake_monster, self._current_props(),
+                dread=0.0, t=0.0, fog_color=(30, 30, 34), fog_dist=80.0, ambient=0.85,
+                moon_strength=0.0, qa_mode=True,
+            )
+            data = self.renderer.color_tex.read()
+            img = pygame.image.frombuffer(data, self.renderer.color_tex.size, "RGB")
+            img = pygame.transform.flip(img, False, True)
+            buf = io.BytesIO()
+            pygame.image.save(img, buf, "shot.jpg")
+            jpegs.append(buf.getvalue())
+        self.camera.x, self.camera.y, self.camera.z, self.camera.yaw, self.camera.pitch = saved
+        return jpegs
 
     def _draw(self):
         self._fake_player.x, self._fake_player.y = self.camera.x, self.camera.y
@@ -492,77 +664,59 @@ class Editor:
             self.renderer._draw_box(model, color, emissive=1.0, vao=self.renderer.box_vao)
 
         panel_surf = pygame.Surface((self.panel.width, self.window_h), pygame.SRCALPHA)
-        self.panel.draw(panel_surf, self.model, self.view_mode, self.natural_color, self.testing_floor)
+        self.panel.draw(panel_surf, self.model, self.view_mode, self.natural_color, self.testing_floor,
+                         self.editor_mode, self.mode == "dev")
 
         hud_surf = pygame.Surface((self.window_w, self.window_h), pygame.SRCALPHA)
         if not testing and self.view_mode == "grid":
             grid_surf = pygame.Surface((self.primary_w, self.window_h), pygame.SRCALPHA)
-            required = rm.required_fixture_kind(self.model.kind, self.model.floor)
+            required = None if self.editor_mode == "zone" else rm.required_fixture_kind(
+                self.model.kind, self.model.floor)
             self.grid.draw(grid_surf, self.model, self.hover_cell, {required} if required else set())
             hud_surf.blit(grid_surf, (0, 0))
         hud_surf.blit(panel_surf, (self.primary_w, 0))
         self._draw_message(hud_surf)
         if not testing:
-            hint = "F1 - справка"
+            hint = i18n.t("editor.ui.f1_hint")
             hint_surf = self._msg_font.render(hint, True, (150, 145, 140))
             hud_surf.blit(hint_surf, (12, self.window_h - hint_surf.get_height() - 10))
         if self.show_help:
             self._draw_help(hud_surf)
+        if self.prompting_nickname:
+            self._draw_nickname_prompt(hud_surf)
 
         hud_bytes = pygame.image.tostring(hud_surf, "RGBA", True)
         self._composite(hud_bytes)
         pygame.display.flip()
 
-    HELP_SECTIONS = [
-        ("ВИДЫ", [
-            "Tab - переключает КАМЕРА <-> СЕТКА (плоский вид сверху).",
-            "Во время тестовой генерации этажа Tab недоступен.",
-        ]),
-        ("СВОБОДНАЯ КАМЕРА", [
-            "WASD - движение, SPACE - вверх, LEFT CTRL - вниз,",
-            "LEFT SHIFT - ускорение, ПКМ - осмотреться мышью.",
-        ]),
-        ("ИНСТРУМЕНТЫ (панель справа)", [
-            "Мебель - клик ставит выбранный предмет под курсором;",
-            "R - повернуть мебель под курсором;",
-            "DEL/BACKSPACE - удалить мебель под курсором.",
-            "Стена / Ластик - можно тянуть зажатой ЛКМ, красят или",
-            "стирают клетки одну за другой.",
-            "Двери - клик по границе комнаты ставит/снимает дверь.",
-        ]),
-        ("ДВЕРИ: SCOPE И KIND", [
-            "scope 'link' - дверь стыкуется с соседней комнатой при",
-            "генерации этажа; 'local' - не стыкуется (для мини-",
-            "комнат у самого края карты).",
-            "kind: passage - проём без объекта, door - обычная дверь,",
-            "broken - взломанная, window - видно, но не пройти,",
-            "random - генератор сам выберет door/broken/passage.",
-        ]),
-        ("ВЕС И ОБЯЗАТЕЛЬНАЯ МЕБЕЛЬ", [
-            "Вес в генераторе - чем больше, тем чаще генератор выбирает",
-            "именно эту комнату среди комнат того же вида.",
-            "Комнаты вида exit/unlocker должны содержать ровно 1 предмет",
-            "нужного типа - он подсвечивается оранжевым.",
-        ]),
-        ("ФАЙЛ", [
-            "Новая комната / Открыть список / Сохранить (заблокировано",
-            "при ошибках) / Проверить - та же проверка без сохранения.",
-        ]),
-        ("ТЕСТОВАЯ ГЕНЕРАЦИЯ ЭТАЖА", [
-            "Собирает реальный этаж из УЖЕ СОХРАНЁННЫХ комнат -",
-            "несохранённые правки текущей комнаты не участвуют.",
-            "Генератор сам закрывает тупиковые коридоры ближайшей",
-            "подходящей комнатой и может состыковать соседние",
-            "комнаты даже без точного совпадения дверей, если у",
-            "обеих есть дверь на нужной стороне - иногда сразу",
-            "двумя проходами.",
-        ]),
-        ("ПРОЧЕЕ", [
-            "F2 - переименовать комнату.",
-            "ESC - выйти из тестовой генерации,",
-            "иначе закрыть редактор.",
-        ]),
-    ]
+    @staticmethod
+    def _help_sections():
+        return [
+            (i18n.t(f"editor.help.{n}.title"), i18n.t(f"editor.help.{n}.body").split("\n"))
+            for n in range(1, 9)
+        ]
+
+    def _draw_nickname_prompt(self, hud_surf):
+        overlay = pygame.Surface((self.window_w, self.window_h), pygame.SRCALPHA)
+        overlay.fill((4, 3, 4, 220))
+        hud_surf.blit(overlay, (0, 0))
+
+        cx, cy = self.window_w // 2, self.window_h // 2
+        box_w, box_h = 560, 160
+        box = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        box.fill((22, 20, 24, 245))
+        pygame.draw.rect(box, (90, 85, 80), box.get_rect(), 2)
+        title = self._msg_font.render(i18n.t("editor.ui.nickname_prompt_title"), True, (225, 210, 200))
+        box.blit(title, title.get_rect(center=(box_w // 2, 34)))
+        field = pygame.Rect(30, 66, box_w - 60, 40)
+        pygame.draw.rect(box, (40, 38, 42), field)
+        pygame.draw.rect(box, (140, 130, 120), field, 1)
+        text = self._nickname_buffer + ("_" if int(time.time() * 2) % 2 == 0 else "")
+        text_surf = self._msg_font.render(text, True, (230, 225, 220))
+        box.blit(text_surf, (field.x + 10, field.y + (field.h - text_surf.get_height()) // 2))
+        hint = self._help_font.render(i18n.t("editor.ui.nickname_prompt_hint"), True, (150, 145, 140))
+        box.blit(hint, hint.get_rect(center=(box_w // 2, box_h - 26)))
+        hud_surf.blit(box, (cx - box_w // 2, cy - box_h // 2))
 
     def _draw_help(self, hud_surf):
         overlay = pygame.Surface((self.window_w, self.window_h), pygame.SRCALPHA)
@@ -570,16 +724,16 @@ class Editor:
         hud_surf.blit(overlay, (0, 0))
 
         cx = self.window_w // 2
-        title = self._help_title_font.render("СПРАВКА ПО РЕДАКТОРУ", True, (225, 210, 200))
+        title = self._help_title_font.render(i18n.t("editor.ui.help_title"), True, (225, 210, 200))
         hud_surf.blit(title, title.get_rect(center=(cx, 46)))
-        sub = self._msg_font.render("клик или ESC - закрыть", True, (140, 135, 130))
+        sub = self._msg_font.render(i18n.t("editor.ui.help_close_hint"), True, (140, 135, 130))
         hud_surf.blit(sub, sub.get_rect(center=(cx, 78)))
 
         col_w = min(560, self.window_w // 2 - 60)
         col_x = (cx - col_w - 30, cx + 30)
         col_y = [104, 104]
         col = 0
-        for header, lines in self.HELP_SECTIONS:
+        for header, lines in self._help_sections():
             needed = 30 + len(lines) * 22 + 14
             if col_y[col] + needed > self.window_h - 20 and col == 0:
                 col = 1
@@ -646,4 +800,4 @@ class Editor:
 
 
 def main():
-    Editor().run()
+    Editor(mode="dev").run()

@@ -20,7 +20,6 @@ class Player:
         self.has_cutters = False
         self.is_hiding = False
         self.hidden_in = None
-        self.flashlight_before_hide = False
         self.flashlight_before_peek = False
         self.is_sprinting = False
         self.is_crouching = False
@@ -32,6 +31,11 @@ class Player:
         self.bumped_wall = False
         self.bob_phase = 0.0
         self.move_ease = 0.0
+        self.locker_use_count = 0
+        self.last_move_dx = 0.0
+        self.last_move_dy = 0.0
+        self.light_level = 0.0
+        self.is_lit = False
 
     @property
     def cell(self):
@@ -90,13 +94,20 @@ class Player:
         self.pitch -= mouse_dy * S.MOUSE_SENSITIVITY_Y
         self.pitch = max(-S.PITCH_LIMIT, min(S.PITCH_LIMIT, self.pitch))
 
-        self.is_crouching = bool(crouch_held) and not self.is_hiding
+        self.is_crouching = bool(crouch_held)
         target_crouch = 1.0 if self.is_crouching else 0.0
         self.crouch += (target_crouch - self.crouch) * min(1.0, dt * S.CROUCH_TRANSITION_RATE)
 
         if self.is_hiding:
             self.moved_this_frame = False
             self.noise_radius = 0.0
+            if infinite_stamina:
+                self.stamina = S.STAMINA_MAX
+                self.stamina_locked = False
+            else:
+                self.stamina = min(S.STAMINA_MAX, self.stamina + S.STAMINA_REGEN_STANDING * dt)
+                if self.stamina_locked and self.stamina >= S.STAMINA_EXHAUST_LOCKOUT:
+                    self.stamina_locked = False
             return
 
         fwd_x, fwd_y = math.cos(self.angle), math.sin(self.angle)
@@ -124,8 +135,10 @@ class Player:
         if moving:
             eff_speed = speed * self.move_ease
             length = math.hypot(mv_f, mv_s) or 1.0
-            dx = (fwd_x * mv_f + strafe_x * mv_s) / length * eff_speed * dt
-            dy = (fwd_y * mv_f + strafe_y * mv_s) / length * eff_speed * dt
+            self.last_move_dx = (fwd_x * mv_f + strafe_x * mv_s) / length
+            self.last_move_dy = (fwd_y * mv_f + strafe_y * mv_s) / length
+            dx = self.last_move_dx * eff_speed * dt
+            dy = self.last_move_dy * eff_speed * dt
             self.try_move(maze, props, dx, dy)
             self._step_accum += eff_speed * dt
             self.bob_phase += dt * self.move_ease * (8.0 if self.is_sprinting else (4.2 if self.is_crouching else 5.3))
@@ -243,6 +256,8 @@ class Monster:
         self._prev_hiding = False
         self._had_visual_last_frame = False
         self._stuck_time = 0.0
+        self._catch_stuck_time = 0.0
+        self._nav_stuck_time = 0.0
         self.checking_timer = 0.0
         self.checking_timer_total = S.MONSTER_LOCKER_CHECK_SECONDS
         self._sight_memory_t = 0.0
@@ -256,6 +271,12 @@ class Monster:
         self.recent_miss_cooldown = 0.0
         self._locker_target_watch = None
         self._locker_target_elapsed = 0.0
+        self._ignored_props = {}
+        self._temp_blocked_cells = {}
+        self._prop_stuck_time = 0.0
+        self._turn_probe_timer = 0.0
+        self._turn_probe_dir = 1.0
+        self.pending_reaction = None
 
     @property
     def cell(self):
@@ -290,29 +311,60 @@ class Monster:
     def _enter_patrol(self):
         self.state = Monster.PATROL
         self.target_cell = None
+        self.path = []
         self._patrol_wait = self.rng.uniform(0.5, 1.5)
+
+    def _abandon_target_and_patrol(self):
+        if self.locker_target is not None:
+            stuck_locker = self.locker_target
+            self.closing_locker = stuck_locker
+            self.closing_timer = S.MONSTER_LOCKER_CLOSE_SECONDS
+            self.recent_miss_locker = stuck_locker
+            self.recent_miss_cooldown = S.MONSTER_LOCKER_RECHECK_COOLDOWN
+            self.locker_target = None
+            self.locker_target_certain = False
+            self.stalk_origin = False
+            self.checking_timer = 0.0
+            self.stalk_timer = 0.0
+        self._turn_probe_timer = 0.0
+        self._enter_patrol()
 
     def _locker_in_notice_range(self, lk):
         return math.hypot(lk.x - self.x, lk.y - self.y) < 3.0
 
-    def _roll_locker_check(self, maze, lk):
+    def _roll_investigate_locker_event(self, maze, player):
         roll = self.rng.random()
-        if roll < S.LOCKER_CHECK_REAL_PROB:
-            self.state = Monster.INVESTIGATE
-            self.target_cell = self._locker_cell(lk)
-            self.locker_target = lk
-            self.locker_target_certain = True
-            self._replan(maze, self.target_cell)
-        elif roll < S.LOCKER_CHECK_REAL_PROB + S.LOCKER_CHECK_DECOY_PROB:
-            decoys = [o for o in self.lockers
-                      if o is not lk and math.hypot(o.x - lk.x, o.y - lk.y) < S.LOCKER_CHECK_DECOY_RADIUS]
-            if decoys:
-                decoy = min(decoys, key=lambda o: math.hypot(o.x - lk.x, o.y - lk.y))
-                self.state = Monster.INVESTIGATE
-                self.target_cell = self._locker_cell(decoy)
-                self.locker_target = decoy
+        lk = None
+        if roll < 0.25:
+            notice_range = (S.MONSTER_LOCKER_NOTICE_RANGE_CROUCH if player.is_crouching
+                             else S.MONSTER_LOCKER_NOTICE_RANGE_STAND)
+            if (player.is_hiding and player.hidden_in is not None
+                    and math.hypot(player.hidden_in.x - self.x, player.hidden_in.y - self.y) < notice_range):
+                lk = player.hidden_in
+                self.locker_target_certain = True
+        elif roll < 0.75:
+            nearby = [o for o in self.lockers if o is not self.recent_miss_locker
+                      and math.hypot(o.x - self.x, o.y - self.y) < S.INVESTIGATE_LOCKER_EVENT_DECOY_RADIUS]
+            if nearby:
+                lk = self.rng.choice(nearby)
                 self.locker_target_certain = False
-                self._replan(maze, self.target_cell)
+        if lk is None:
+            return
+        self.locker_target = lk
+        self.target_cell = self._locker_cell(lk)
+        self._replan(maze, self.target_cell)
+
+    def _predict_target_cell(self, maze, player, origin_cell):
+        ox, oy = origin_cell[0] + 0.5, origin_cell[1] + 0.5
+        dx, dy = player.last_move_dx, player.last_move_dy
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return origin_cell
+        for frac in (1.0, 0.7, 0.5, 0.3):
+            tx = ox + dx * S.MONSTER_INTERCEPT_DISTANCE * frac
+            ty = oy + dy * S.MONSTER_INTERCEPT_DISTANCE * frac
+            if not maze.is_wall(tx, ty):
+                return (int(tx), int(ty))
+        return origin_cell
 
     def _nearby_open_cell(self, maze, cx, cy, max_manhattan=4):
         cands = [c for c in maze.floor_cells()
@@ -320,26 +372,52 @@ class Monster:
         cands.sort(key=lambda c: abs(c[0] - cx) + abs(c[1] - cy))
         return cands
 
-    def _replan(self, maze, target_cell):
+    def _replan(self, maze, target_cell, extra_blocked=None):
         sx, sy = self.cell
         tx, ty = target_cell
-        path = maze.bfs_path(sx, sy, tx, ty, blocked=self.blocked_cells)
+        blocked = self.blocked_cells | extra_blocked if extra_blocked else self.blocked_cells
+        path = maze.bfs_path(sx, sy, tx, ty, blocked=blocked)
         if not path:
             for cx, cy in self._nearby_open_cell(maze, tx, ty)[:6]:
-                path = maze.bfs_path(sx, sy, cx, cy, blocked=self.blocked_cells)
+                path = maze.bfs_path(sx, sy, cx, cy, blocked=blocked)
                 if path:
                     break
         if path and path[0] == (sx, sy):
             path.pop(0)
         self.path = path
 
-    def _move_toward(self, maze, nx, ny):
+    def _tick_temp_state(self, dt):
+        for pid in list(self._ignored_props):
+            self._ignored_props[pid] -= dt
+            if self._ignored_props[pid] <= 0:
+                del self._ignored_props[pid]
+        for cell in list(self._temp_blocked_cells):
+            self._temp_blocked_cells[cell] -= dt
+            if self._temp_blocked_cells[cell] <= 0:
+                del self._temp_blocked_cells[cell]
+
+    def _active_blocked_props(self):
+        return [p for p in self.blocked_prop_candidates
+                if p.solid and id(p) not in self._ignored_props]
+
+    def _move_toward(self, maze, nx, ny, blocked_props=()):
         r = S.MONSTER_RADIUS
-        if not maze.circle_hits_wall(nx, ny, r):
+
+        def blocked(x, y):
+            if maze.circle_hits_wall(x, y, r):
+                return True
+            for p in blocked_props:
+                if id(p) in self._ignored_props:
+                    continue
+                if _circle_hits_prop(x, y, r, p):
+                    return True
+            return False
+
+        if not blocked(nx, ny):
             self.x, self.y = nx, ny
-        elif not maze.circle_hits_wall(nx, self.y, r):
+        elif not blocked(nx, self.y):
             self.x = nx
-        elif not maze.circle_hits_wall(self.x, ny, r):
+        elif not blocked(self.x, ny):
             self.y = ny
 
     def _turn_toward(self, target_facing, dt, rate=9.0):
@@ -347,7 +425,7 @@ class Monster:
         max_turn = rate * dt
         self.facing = (self.facing + max(-max_turn, min(max_turn, diff))) % (2 * math.pi)
 
-    def _step_toward(self, maze, dt, speed, tx, ty, face=None):
+    def _step_toward(self, maze, dt, speed, tx, ty, face=None, blocked_props=()):
         dx, dy = tx - self.x, ty - self.y
         dist = math.hypot(dx, dy)
         if dist > 1e-6:
@@ -355,9 +433,9 @@ class Monster:
             self._turn_toward(math.atan2(fy, fx), dt)
         step = min(speed * dt, dist)
         if dist <= step or dist < 1e-6:
-            self._move_toward(maze, tx, ty)
+            self._move_toward(maze, tx, ty, blocked_props)
             return True
-        self._move_toward(maze, self.x + dx / dist * step, self.y + dy / dist * step)
+        self._move_toward(maze, self.x + dx / dist * step, self.y + dy / dist * step, blocked_props)
         return False
 
     def _has_clear_path(self, maze, x0, y0, x1, y1, blocked_props=(), step=0.1, wall_radius=0.0):
@@ -384,11 +462,22 @@ class Monster:
             if (int(sx), int(sy)) in self.blocked_cells:
                 return False
             for p in blocked_props:
-                if _circle_hits_prop(sx, sy, S.PLAYER_RADIUS, p):
+                if _circle_hits_prop(sx, sy, S.MONSTER_RADIUS, p):
                     return False
         return True
 
     def update(self, dt, maze, player, dread, props, grace=False):
+        self._tick_temp_state(dt)
+        if self.pending_reaction is not None:
+            self.pending_reaction["timer"] -= dt
+            if self.pending_reaction["timer"] <= 0.0:
+                pr = self.pending_reaction
+                self.pending_reaction = None
+                if self.state not in (Monster.HUNT, Monster.STALK):
+                    self.state = Monster.INVESTIGATE
+                    self.target_cell = pr["target_cell"]
+                    self._search_hops_left = pr["hops"]
+
         if self.closing_timer > 0.0:
             self.closing_timer = max(0.0, self.closing_timer - dt)
             if self.closing_timer <= 0.0:
@@ -404,17 +493,7 @@ class Monster:
                 self._locker_target_elapsed = 0.0
             self._locker_target_elapsed += dt
             if self._locker_target_elapsed > S.MONSTER_LOCKER_TARGET_TIMEOUT:
-                stuck_locker = self.locker_target
-                self.closing_locker = stuck_locker
-                self.closing_timer = S.MONSTER_LOCKER_CLOSE_SECONDS
-                self.recent_miss_locker = stuck_locker
-                self.recent_miss_cooldown = S.MONSTER_LOCKER_RECHECK_COOLDOWN
-                self.locker_target = None
-                self.locker_target_certain = False
-                self.stalk_origin = False
-                self.checking_timer = 0.0
-                self.stalk_timer = 0.0
-                self._enter_patrol()
+                self._abandon_target_and_patrol()
         else:
             self._locker_target_watch = None
             self._locker_target_elapsed = 0.0
@@ -433,12 +512,7 @@ class Monster:
             loud_and_close = False
             proximity_alert = False
         else:
-            player_lit = player.flashlight_on or any(
-                getattr(p, "light_radius", None) and not p.picked
-                and math.hypot(player.x - p.x, player.y - p.y) < p.light_radius
-                for p in props
-            )
-            vision = (S.MONSTER_VISION_RANGE_LIT if player_lit else S.MONSTER_VISION_RANGE)
+            vision = (S.MONSTER_VISION_RANGE_LIT if player.is_lit else S.MONSTER_VISION_RANGE)
             vision *= self.vision_mult * (1.0 + dread * 0.35)
             hearing = player.noise_radius * (1.0 + dread * 0.2)
             near_enough = dist < vision * 1.6
@@ -474,7 +548,7 @@ class Monster:
                 if math.hypot(hx - self.x, hy - self.y) < 2.6 and maze.has_line_of_sight(self.x, self.y, hx, hy):
                     beam_glow_cell = (int(hx), int(hy))
 
-            if dist < hearing:
+            if dist < hearing and not player.is_hiding:
                 hearing_has_los = maze.has_line_of_sight(self.x, self.y, player.x, player.y)
                 effective_hearing = hearing if hearing_has_los else hearing * S.MONSTER_HEARING_WALL_MUFFLE
                 hearing_hit = dist < effective_hearing and self.state in (Monster.PATROL, Monster.INVESTIGATE)
@@ -502,6 +576,25 @@ class Monster:
                 self.stalk_origin = True
                 self.target_cell = self._locker_stalk_cell(maze, lk)
                 self._replan(maze, self.target_cell)
+            else:
+                self.state = Monster.INVESTIGATE
+                self.pending_reaction = None
+                self._search_hops_left = 3
+                self.target_cell = maze.room_center_near((int(lk.x), int(lk.y)))
+                self._replan(maze, self.target_cell)
+
+        if (not grace and player.is_hiding and player.flashlight_on and player.hidden_in is not None
+                and self.state != Monster.STALK
+                and not (self.locker_target is player.hidden_in and self.locker_target_certain)):
+            lk = player.hidden_in
+            if (math.hypot(lk.x - self.x, lk.y - self.y) < S.MONSTER_LIT_LOCKER_DETECT_RANGE
+                    and maze.has_line_of_sight(self.x, self.y, lk.x, lk.y)):
+                self.locker_target = lk
+                self.locker_target_certain = True
+                self.target_cell = self._locker_cell(lk)
+                self.state = Monster.INVESTIGATE
+                self.pending_reaction = None
+                self._replan(maze, self.target_cell)
 
         self.just_noticed = False
         if (can_see or spotted_by_beam or loud_and_close or proximity_alert) and self.state != Monster.HUNT:
@@ -513,6 +606,7 @@ class Monster:
                 self.lose_interest_timer = S.MONSTER_LOSE_INTEREST_TIME
                 self._sight_memory_t = S.MONSTER_SIGHT_MEMORY_SECONDS
                 self.target_cell = player.cell
+                self.pending_reaction = None
                 if self.checking_timer > 0.0 and self.locker_target is not None:
                     self.closing_locker = self.locker_target
                     self.closing_timer = S.MONSTER_LOCKER_CLOSE_SECONDS
@@ -523,6 +617,7 @@ class Monster:
                 self.lose_interest_timer = S.MONSTER_LOSE_INTEREST_TIME * 0.6
                 self._sight_memory_t = S.MONSTER_SIGHT_MEMORY_SECONDS
                 self.target_cell = player.cell
+                self.pending_reaction = None
                 if self.checking_timer > 0.0 and self.locker_target is not None:
                     self.closing_locker = self.locker_target
                     self.closing_timer = S.MONSTER_LOCKER_CLOSE_SECONDS
@@ -537,31 +632,53 @@ class Monster:
                     self.state = Monster.INVESTIGATE
                     self._search_hops_left = 3
             elif hearing_hit:
-                self.state = Monster.INVESTIGATE
-                self.target_cell = player.cell
-                self._search_hops_left = 3
+                target = player.cell
+                if self.rng.random() < S.MONSTER_INTERCEPT_CHANCE:
+                    target = self._predict_target_cell(maze, player, player.cell)
+                if self.pending_reaction is None and self.rng.random() < S.MONSTER_REACTION_DELAY_CHANCE:
+                    self.pending_reaction = {
+                        "target_cell": target, "hops": 3,
+                        "timer": self.rng.uniform(S.MONSTER_REACTION_DELAY_MIN, S.MONSTER_REACTION_DELAY_MAX),
+                    }
+                else:
+                    self.state = Monster.INVESTIGATE
+                    self.target_cell = target
+                    self._search_hops_left = 3
             elif beam_glow_cell is not None:
-                self.state = Monster.INVESTIGATE
-                self.target_cell = beam_glow_cell
-                self._search_hops_left = 2
+                target = beam_glow_cell
+                if self.rng.random() < S.MONSTER_INTERCEPT_CHANCE:
+                    target = self._predict_target_cell(maze, player, beam_glow_cell)
+                if self.pending_reaction is None and self.rng.random() < S.MONSTER_REACTION_DELAY_CHANCE:
+                    self.pending_reaction = {
+                        "target_cell": target, "hops": 2,
+                        "timer": self.rng.uniform(S.MONSTER_REACTION_DELAY_MIN, S.MONSTER_REACTION_DELAY_MAX),
+                    }
+                else:
+                    self.state = Monster.INVESTIGATE
+                    self.target_cell = target
+                    self._search_hops_left = 2
 
-        if not grace and player.is_hiding and player.hidden_in is not None:
-            lk = player.hidden_in
-            already_certain = self.locker_target is lk and (self.locker_target_certain or self.stalk_origin)
-            loud = player.noise_radius > S.LOUD_HIDING_NOISE_THRESHOLD
-            d = math.hypot(lk.x - self.x, lk.y - self.y)
-            if already_certain:
-                pass
-            elif loud and d < player.noise_radius * (1.0 + dread * 0.2):
+        if (not grace and self.state == Monster.INVESTIGATE and self.checking_timer <= 0.0
+                and self.locker_target is None and self._search_hops_left <= 1):
+            overuse_frac = min(1.0, player.locker_use_count / S.STALK_RELEASE_OVERUSE_SATURATION)
+            chance_per_sec = (S.INVESTIGATE_LOCKER_EVENT_BASE_PROB
+                               + S.INVESTIGATE_LOCKER_EVENT_OVERUSE_BONUS * overuse_frac)
+            if self.rng.random() < chance_per_sec * dt:
+                self._roll_investigate_locker_event(maze, player)
+
+        if not grace and self.state == Monster.PATROL and self.checking_timer <= 0.0 and self.locker_target is None:
+            overuse_frac = min(1.0, player.locker_use_count / S.STALK_RELEASE_OVERUSE_SATURATION)
+            chance_per_sec = (S.MONSTER_PATROL_LOCKER_CHECK_BASE
+                               + S.MONSTER_PATROL_LOCKER_CHECK_OVERUSE_BONUS * overuse_frac)
+            near = [lk for lk in self.lockers if lk is not self.recent_miss_locker
+                    and math.hypot(lk.x - self.x, lk.y - self.y) < S.MONSTER_PATROL_LOCKER_NOTICE_RANGE]
+            if near and self.rng.random() < chance_per_sec * dt:
+                lk = min(near, key=lambda o: math.hypot(o.x - self.x, o.y - self.y))
                 self.state = Monster.INVESTIGATE
                 self.target_cell = self._locker_cell(lk)
                 self.locker_target = lk
-                self.locker_target_certain = True
+                self.locker_target_certain = False
                 self._replan(maze, self.target_cell)
-            elif (self.state != Monster.HUNT and lk is not self.recent_miss_locker
-                    and self._locker_in_notice_range(lk)
-                    and self.rng.random() < S.LOCKER_CHECK_CHANCE_PER_SEC * dt):
-                self._roll_locker_check(maze, lk)
 
         alert_target = 1.0 if self.state in (Monster.HUNT, Monster.STALK) else (0.4 if self.state == Monster.INVESTIGATE else 0.0)
         self.alert_level += (alert_target - self.alert_level) * min(1.0, dt * 2)
@@ -580,9 +697,9 @@ class Monster:
                 close_stand = self._locker_stand_point(self.locker_target)
                 d = math.hypot(close_stand[0] - self.x, close_stand[1] - self.y)
                 if d > 0.06:
+                    blocked_props = self._active_blocked_props()
                     self._step_toward(maze, dt, S.MONSTER_STALK_APPROACH_SPEED, close_stand[0], close_stand[1],
-                                       face=(self.locker_target.x, self.locker_target.y))
-                    blocked_props = [p for p in self.blocked_prop_candidates if p.solid]
+                                       face=(self.locker_target.x, self.locker_target.y), blocked_props=blocked_props)
                     self.x, self.y = _push_out_of_props(self.x, self.y, blocked_props)
                     self.walk_phase += dt * S.MONSTER_STALK_APPROACH_SPEED * 5.5
                     self.walk_amp += (1.0 - self.walk_amp) * min(1.0, dt * 8.0)
@@ -606,7 +723,13 @@ class Monster:
                     self.caught_player = True
                 elif (self.locker_target is not None and self.stalk_origin
                         and player.is_hiding and player.hidden_in is self.locker_target):
-                    if self.rng.random() < 0.5:
+                    sanity_frac = max(0.0, min(1.0, player.sanity / S.SANITY_MAX))
+                    overuse_frac = min(1.0, player.locker_use_count / S.STALK_RELEASE_OVERUSE_SATURATION)
+                    release_chance = (S.STALK_RELEASE_BASE
+                                       + S.STALK_RELEASE_SANITY_WEIGHT * (1.0 - sanity_frac)
+                                       - S.STALK_RELEASE_OVERUSE_WEIGHT * overuse_frac)
+                    release_chance = max(S.STALK_RELEASE_MIN, min(S.STALK_RELEASE_MAX, release_chance))
+                    if self.rng.random() >= release_chance:
                         self.caught_player = True
                 if not self.caught_player:
                     self.closing_locker = self.locker_target
@@ -666,13 +789,14 @@ class Monster:
         base = S.MONSTER_HUNT_SPEED if self.state == Monster.HUNT else S.MONSTER_BASE_SPEED
         speed = base * self.speed_mult * (1.0 + dread * 0.25)
         speed = min(speed, S.SPRINT_SPEED * S.MONSTER_HUNT_SPEED_CAP_RATIO)
-        blocked_props = [p for p in self.blocked_prop_candidates if p.solid]
+        blocked_props = self._active_blocked_props()
         close_direct_chase = (self.state == Monster.HUNT and not grace and dist < 1.3
                                and self._has_clear_path(maze, self.x, self.y, player.x, player.y, blocked_props))
         no_path_fallback = (
             not close_direct_chase and not self.path and self.target_cell is not None and not grace
             and self._has_clear_path(maze, self.x, self.y,
-                                      self.target_cell[0] + 0.5, self.target_cell[1] + 0.5, blocked_props)
+                                      self.target_cell[0] + 0.5, self.target_cell[1] + 0.5, blocked_props,
+                                      wall_radius=S.MONSTER_RADIUS)
         )
         locker_fine_approach = (
             self.locker_target is not None and self.checking_timer <= 0.0
@@ -688,16 +812,28 @@ class Monster:
                 if self.target_cell:
                     self._replan(maze, self.target_cell)
             moved = False
+        elif self._turn_probe_timer > 0.0:
+            self._turn_probe_timer -= dt
+            probe_facing = (self.facing + self._turn_probe_dir * S.MONSTER_TURN_PROBE_RATE * dt) % (2 * math.pi)
+            px = self.x + math.cos(probe_facing) * 0.8
+            py = self.y + math.sin(probe_facing) * 0.8
+            self.facing = probe_facing
+            if self._has_clear_path(maze, self.x, self.y, px, py, blocked_props, wall_radius=S.MONSTER_RADIUS):
+                self._turn_probe_timer = 0.0
+                if self.target_cell:
+                    self._replan(maze, self.target_cell)
+            moved = False
         elif close_direct_chase:
-            self._step_toward(maze, dt, speed, player.x, player.y)
+            self._step_toward(maze, dt, speed, player.x, player.y, blocked_props=blocked_props)
             self.path = []
             moved = True
         elif locker_fine_approach:
             self._step_toward(maze, dt, speed, locker_stand[0], locker_stand[1],
-                               face=(self.locker_target.x, self.locker_target.y))
+                               face=(self.locker_target.x, self.locker_target.y), blocked_props=blocked_props)
             moved = True
         elif no_path_fallback:
-            self._step_toward(maze, dt, speed, self.target_cell[0] + 0.5, self.target_cell[1] + 0.5)
+            self._step_toward(maze, dt, speed, self.target_cell[0] + 0.5, self.target_cell[1] + 0.5,
+                               blocked_props=blocked_props)
             moved = True
         else:
             moved = self._advance(dt, speed, maze, blocked_props)
@@ -709,18 +845,46 @@ class Monster:
         target_amp = 1.0 if moved else 0.0
         self.walk_amp += (target_amp - self.walk_amp) * min(1.0, dt * 8.0)
 
-        if moved and self.breaking_door is None and not close_direct_chase and not no_path_fallback:
+        touching_prop = None
+        if moved and self.breaking_door is None:
             actually_moved = math.hypot(self.x - prev_x, self.y - prev_y)
             if actually_moved < speed * dt * 0.2:
                 self._stuck_time += dt
+                touching_prop = next((p for p in blocked_props
+                                       if _circle_hits_prop(self.x, self.y, S.MONSTER_RADIUS + 0.15, p)), None)
+                self._prop_stuck_time = self._prop_stuck_time + dt if touching_prop else 0.0
                 if self._stuck_time > 0.35:
                     self._stuck_time = 0.0
                     if self.target_cell:
-                        self._replan(maze, self.target_cell)
+                        self._temp_blocked_cells[self.cell] = S.MONSTER_TEMP_BLOCK_DURATION
+                        self._replan(maze, self.target_cell, extra_blocked=set(self._temp_blocked_cells))
             else:
                 self._stuck_time = 0.0
+                self._prop_stuck_time = 0.0
         else:
             self._stuck_time = 0.0
+            self._prop_stuck_time = 0.0
+
+        if self.breaking_door is None and math.hypot(self.x - prev_x, self.y - prev_y) < speed * dt * 0.2:
+            self._catch_stuck_time += dt
+        else:
+            self._catch_stuck_time = 0.0
+
+        if self.breaking_door is None and math.hypot(self.x - prev_x, self.y - prev_y) < speed * dt * 0.2:
+            self._nav_stuck_time += dt
+        else:
+            self._nav_stuck_time = 0.0
+        if self._nav_stuck_time > S.MONSTER_NAV_STUCK_TIMEOUT:
+            self._nav_stuck_time = 0.0
+            self._abandon_target_and_patrol()
+
+        if touching_prop is not None and self._prop_stuck_time > S.MONSTER_PROP_STUCK_TRIGGER:
+            self._prop_stuck_time = 0.0
+            if dist >= S.MONSTER_STUCK_NEAR_PLAYER_DIST:
+                self._ignored_props[id(touching_prop)] = S.MONSTER_PROP_IGNORE_DURATION
+            else:
+                self._turn_probe_timer = S.MONSTER_TURN_PROBE_DURATION
+                self._turn_probe_dir = self.rng.choice((-1.0, 1.0))
 
         if (self.locker_target is not None and self.checking_timer <= 0.0 and self.state != Monster.STALK
                 and not self.path and near_locker_target is not None and near_locker_target <= 0.06):
@@ -733,7 +897,9 @@ class Monster:
                 self.checking_timer = S.MONSTER_LOCKER_CHECK_SECONDS
                 self.checking_timer_total = S.MONSTER_LOCKER_CHECK_SECONDS
 
-        if not grace and not player.is_hiding and dist < S.MONSTER_CATCH_RADIUS and self.state == Monster.HUNT:
+        if not grace and not player.is_hiding and self.state == Monster.HUNT and (
+                dist < S.MONSTER_CATCH_RADIUS
+                or (self._catch_stuck_time > S.MONSTER_STUCK_CATCH_TIME and dist < S.MONSTER_STUCK_CATCH_RADIUS)):
             self.caught_player = True
 
         arrived = (self.state in (Monster.HUNT, Monster.INVESTIGATE) and not self.path
@@ -770,6 +936,6 @@ class Monster:
             else:
                 break
         tx, ty = self.path[idx][0] + 0.5, self.path[idx][1] + 0.5
-        if self._step_toward(maze, dt, speed, tx, ty):
+        if self._step_toward(maze, dt, speed, tx, ty, blocked_props=blocked_props):
             del self.path[: idx + 1]
         return True

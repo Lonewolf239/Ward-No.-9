@@ -38,7 +38,8 @@ SETTINGS_PATH = _default_settings_path()
 _LEGACY_SETTINGS_PATH = Path.home() / ".priyut9_settings.json"
 
 
-PICKUP_LABEL_KEYS = {"battery": "pickup.battery", "fuse": "pickup.fuse", "valve_key": "pickup.valve_key"}
+PICKUP_LABEL_KEYS = {"battery": "pickup.battery", "fuse": "pickup.fuse", "valve_key": "pickup.valve_key",
+                      "sanity_pill": "pickup.sanity_pill"}
 PORTAL_LABEL_KEYS = {0: "portal.floor0", 1: "portal.floor1", 2: "portal.floor2", "hub": "portal.hub"}
 DEBUG_HUD_OPTIONS = ("fps", "coords", "monster", "seed", "scares")
 MENU_ONLY_DEBUG_HUD_OPTIONS = ("coords", "monster", "seed", "scares")
@@ -141,15 +142,6 @@ class App:
         pygame.init()
         pygame.display.set_caption(S.TITLE)
 
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
-        pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, 24)
-        pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
-        self.screen = pygame.display.set_mode((S.SCREEN_W, S.SCREEN_H), pygame.OPENGL | pygame.DOUBLEBUF)
-        self.clock = pygame.time.Clock()
-        self.window_size = (S.SCREEN_W, S.SCREEN_H)
-
         self.settings = {
             "fullscreen": False,
             "fps_limit": S.FPS,
@@ -164,6 +156,7 @@ class App:
             "view_distance": 1.0,
             "quality_preset": "medium",
             "upscale_smoothing": False,
+            "vsync": True,
             "language": "en",
             "debug_hud_fps": False,
             "debug_hud_coords": False,
@@ -172,9 +165,23 @@ class App:
             "debug_hud_scares": False,
             "warning_seen": False,
             "bindings": dict(S.DEFAULT_BINDINGS),
+            "last_seen_version": S.VERSION,
+            "pending_changelog": "",
         }
         self._load_settings()
         i18n.set_language(self.settings["language"])
+
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
+        pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, 24)
+        pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
+        self.screen = pygame.display.set_mode(
+            (S.SCREEN_W, S.SCREEN_H), pygame.OPENGL | pygame.DOUBLEBUF,
+            vsync=1 if self.settings["vsync"] else 0,
+        )
+        self.clock = pygame.time.Clock()
+        self.window_size = (S.SCREEN_W, S.SCREEN_H)
         self.awaiting_bind = None
         self.controls_msg = None
         self.controls_msg_timer = 0.0
@@ -200,10 +207,11 @@ class App:
         self.mic_vu_level = 0.0
         self._apply_mic_setting()
 
-        self.font_title = pygame.font.Font(FONT_PATH, 72)        
-        self.font_lg = pygame.font.Font(FONT_PATH, 42)        
-        self.font_md = pygame.font.Font(FONT_PATH, 24)        
+        self.font_title = pygame.font.Font(FONT_PATH, 72)
+        self.font_lg = pygame.font.Font(FONT_PATH, 42)
+        self.font_md = pygame.font.Font(FONT_PATH, 24)
         self.font_sm = pygame.font.Font(FONT_PATH, 18)
+        self.font_note = pygame.font.Font(NOTE_FONT_PATH, 30)
 
         self.static_overlay = self._make_static_overlay()
         self.hide_vignette = self._make_hide_vignette()
@@ -212,6 +220,26 @@ class App:
         self.pause_gradient = self._make_menu_gradient(max_alpha=125)
 
         self.running = True
+        self._next_mode = None
+        from game.updater import UpdateChecker
+        self._updater = UpdateChecker()
+        self._updater.start_check()
+        self._update_prompt_seen = False
+        self._update_apply_started = False
+        self._pending_changelog = self.settings.get("pending_changelog", "")
+        self._changelog_scroll_px = 0
+        self._changelog_max_scroll = 0
+        self._changelog_close_rect = pygame.Rect(0, 0, 0, 0)
+        if self.settings.get("last_seen_version") != S.VERSION:
+            self._show_changelog = True
+            self._changelog_scroll_px = 0
+            self.settings["last_seen_version"] = S.VERSION
+            self.settings["pending_changelog"] = ""
+            self._save_settings()
+            from game.updater import cleanup_backup
+            cleanup_backup()
+        else:
+            self._show_changelog = False
         self.new_game()
         if not self.settings.get("warning_seen"):
             self.state = "warning"
@@ -343,6 +371,11 @@ class App:
         self.scare_progress = 0.0
         self.scare_target = random.uniform(0.85, 1.15)
         self.scare_source = None
+        self.hallu_progress = 0.0
+        self.hallu_target = random.uniform(0.85, 1.15)
+        self.hallu_cooldown = 0.0
+        self.hallu_active = []
+        self.sanity_boost_timer = 0.0
         self.fx_shake = fx.ScreenShake()
         self.catch_timer = 0.0
         self.transition_timer = 0.0
@@ -391,7 +424,8 @@ class App:
         self.player.hidden_in = None
 
         monster_blocked = {
-            (int(p.x), int(p.y)) for p in self.props if p.solid and not p.wall_mounted
+            (int(p.x), int(p.y)) for p in self.props
+            if p.solid and (not p.wall_mounted or p.kind == "locker")
         }
         lockers = [p for p in self.props if p.kind == "locker"]
         self.monster = Monster(
@@ -488,6 +522,10 @@ class App:
     def _quit(self):
         self.running = False
 
+    def _open_room_editor(self):
+        self._next_mode = "editor"
+        self.running = False
+
     def _ask_quit(self, return_state):
         self.confirm_return = return_state
         self.state = "confirm_quit"
@@ -517,6 +555,63 @@ class App:
             self._button((cx - w - gap // 2, y0, w, h), i18n.t("ui.yes_quit"), self._quit),
             self._button((cx + gap // 2, y0, w, h), i18n.t("ui.no"), self._cancel_quit),
         ]
+
+    def _draw_changelog(self):
+        overlay = pygame.Surface((S.SCREEN_W, S.SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 255))
+        self.hud_surf.blit(overlay, (0, 0))
+        cx, cy = S.SCREEN_W // 2, S.SCREEN_H // 2
+        title = i18n.t("update.changelog_title", version=S.VERSION)
+        body = self._pending_changelog.strip() or i18n.t("update.changelog_empty")
+        wrap_w = min(760, S.SCREEN_W - 160)
+        line_h = 24
+        lines = []
+        for raw_line in body.split("\n"):
+            wrapped = self._wrap_text(raw_line, self.font_sm, wrap_w) if raw_line.strip() else [""]
+            lines.extend(wrapped)
+
+        header_h, footer_h = 78, 42
+        max_panel_h = min(560, S.SCREEN_H - 100)
+        content_h = len(lines) * line_h
+        panel_h = min(max_panel_h, header_h + content_h + footer_h)
+        panel_w = wrap_w + 80
+        rect = pygame.Rect(cx - panel_w // 2, cy - panel_h // 2, panel_w, panel_h)
+        self._draw_panel(rect)
+        self._text(self.font_lg, title, S.COL_TEXT, center=(cx, rect.top + 40))
+
+        viewport = pygame.Rect(rect.left + 40, rect.top + header_h,
+                                panel_w - 80, panel_h - header_h - footer_h)
+        self._changelog_max_scroll = max(0, content_h - viewport.h)
+        self._changelog_scroll_px = max(0, min(self._changelog_max_scroll, self._changelog_scroll_px))
+
+        prev_clip = self.hud_surf.get_clip()
+        self.hud_surf.set_clip(viewport)
+        y = viewport.top - self._changelog_scroll_px
+        for line in lines:
+            if y + line_h >= viewport.top and y <= viewport.bottom:
+                self._text(self.font_sm, line, S.COL_UI_DIM, topleft=(viewport.left, y), shadow=True)
+            y += line_h
+        self.hud_surf.set_clip(prev_clip)
+
+        if self._changelog_max_scroll > 0:
+            track = pygame.Rect(viewport.right + 14, viewport.top, 6, viewport.h)
+            pygame.draw.rect(self.hud_surf, (28, 26, 24), track, border_radius=3)
+            pygame.draw.rect(self.hud_surf, (70, 64, 58), track, width=1, border_radius=3)
+            thumb_h = max(28, int(viewport.h * viewport.h / content_h))
+            thumb_y = viewport.top + int(
+                (viewport.h - thumb_h) * (self._changelog_scroll_px / self._changelog_max_scroll))
+            thumb = pygame.Rect(track.x, thumb_y, track.w, thumb_h)
+            pygame.draw.rect(self.hud_surf, (110, 96, 62), thumb, border_radius=3)
+            pygame.draw.rect(self.hud_surf, (150, 130, 90), thumb, width=1, border_radius=3)
+
+        btn_w, btn_h = 160, 32
+        self._changelog_close_rect = pygame.Rect(cx - btn_w // 2, rect.bottom - btn_h - 12, btn_w, btn_h)
+        self._draw_button(self._button(self._changelog_close_rect, i18n.t("update.changelog_close_btn"),
+                                        self._close_changelog))
+
+    def _close_changelog(self):
+        self._show_changelog = False
+        self.sounds.play_ui()
 
     def _in_debug_preview(self):
         return bool(self.spec.get("no_threat")) and self.spec.get("key") != "debug"
@@ -608,6 +703,7 @@ class App:
     def _start_hide_transition(self, locker, entering):
         p = self.player
         if entering:
+            p.locker_use_count += 1
             end_x = locker.x - math.cos(locker.facing) * locker.hd * 0.35
             end_y = locker.y - math.sin(locker.facing) * locker.hd * 0.35
             end_angle = locker.facing
@@ -624,9 +720,6 @@ class App:
         p.moved_this_frame = False
         self.fx_shake.add(0.18)
         self.sounds.play_locker()
-        if entering:
-            p.flashlight_before_hide = p.flashlight_on
-            p.flashlight_on = False
 
     def _update_hide_transition(self, dt):
         ht = self.hide_transition
@@ -653,8 +746,6 @@ class App:
             else:
                 p.is_hiding = False
                 p.hidden_in = None
-                if p.flashlight_before_hide and p.battery > 0.5:
-                    p.flashlight_on = True
             self.hide_transition = None
 
     _BUTTON_THEMES = {
@@ -891,14 +982,128 @@ class App:
 
     def _menu_buttons(self, layout=None):
         left, w, _story_lines, _legend_lines, button_y0 = layout or self._menu_layout()
-        h, gap = 54, 10
-        return [
+        h, gap = 44, 7
+        buttons = [
             self._button((left, button_y0, w, h), i18n.t("menu.play"), self._begin_playing),
             self._button((left, button_y0 + (h + gap), w, h), i18n.t("menu.settings"), lambda: self._open_settings("menu")),
             self._button((left, button_y0 + 2 * (h + gap), w, h), i18n.t("menu.about"), self._open_credits),
-            self._button((left, button_y0 + 3 * (h + gap), w, h), i18n.t("menu.quit"), lambda: self._ask_quit("menu")),
+            self._button((left, button_y0 + 3 * (h + gap), w, h), i18n.t("menu.room_editor"), self._open_room_editor),
+            self._button((left, button_y0 + 4 * (h + gap), w, h), i18n.t("menu.quit"), lambda: self._ask_quit("menu")),
             self._feedback_button(),
         ]
+        update_btn = self._update_button()
+        if update_btn is not None:
+            buttons.append(update_btn)
+        return buttons
+
+    def _update_button(self):
+        snap = self._updater.snapshot()
+        state = snap["state"]
+        if state == "available":
+            label = i18n.t("update.available_short", version=snap["latest_tag"])
+            action = self._accept_update
+        else:
+            return None
+        w, h = 340, 44
+        rect = (S.SCREEN_W - w - 20, S.SCREEN_H - h - 92, w, h)
+        return self._button(rect, label, action, theme="gold")
+
+    def _update_prompt_buttons(self):
+        cx, cy = S.SCREEN_W // 2, S.SCREEN_H // 2
+        w, h, gap = 210, 54, 20
+        y0 = cy + 10
+        return [
+            self._button((cx - w - gap // 2, y0, w, h), i18n.t("update.yes_download"), self._accept_update),
+            self._button((cx + gap // 2, y0, w, h), i18n.t("ui.no"), self._decline_update),
+        ]
+
+    def _accept_update(self):
+        self._updater.start_download()
+        self.state = "update_downloading"
+        self._update_apply_started = False
+        self.sounds.play_ui()
+
+    def _decline_update(self):
+        self.state = "menu"
+        self.sounds.play_ui()
+
+    def _draw_update_prompt(self):
+        overlay = pygame.Surface((S.SCREEN_W, S.SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 255))
+        self.hud_surf.blit(overlay, (0, 0))
+        cx, cy = S.SCREEN_W // 2, S.SCREEN_H // 2
+        line1 = i18n.t("update.prompt_available", version=self._updater.snapshot()["latest_tag"] or "")
+        line2 = i18n.t("update.prompt_question")
+        panel_w = max(520, self.font_lg.size(line1)[0] + 80, self.font_lg.size(line2)[0] + 80)
+        panel_h = 240
+        self._draw_panel(pygame.Rect(cx - panel_w // 2, cy - panel_h // 2, panel_w, panel_h))
+        self._text(self.font_lg, line1, S.COL_TEXT, center=(cx, cy - 75))
+        self._text(self.font_lg, line2, S.COL_TEXT, center=(cx, cy - 38))
+        for btn in self._update_prompt_buttons():
+            self._draw_button(btn)
+
+    def _format_size_mb(self, n_bytes):
+        return f"{n_bytes / (1024 * 1024):.1f}"
+
+    def _format_eta(self, seconds):
+        seconds = max(0, int(seconds))
+        m, s = divmod(seconds, 60)
+        return f"{m:02d}:{s:02d}"
+
+    def _draw_update_downloading(self):
+        overlay = pygame.Surface((S.SCREEN_W, S.SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 255))
+        self.hud_surf.blit(overlay, (0, 0))
+        snap = self._updater.snapshot()
+        cx, cy = S.SCREEN_W // 2, S.SCREEN_H // 2
+        panel_w, panel_h = 620, 220
+        rect = pygame.Rect(cx - panel_w // 2, cy - panel_h // 2, panel_w, panel_h)
+        self._draw_panel(rect)
+        title = i18n.t("update.downloading_title", version=self._updater.snapshot()["latest_tag"] or "")
+        self._text(self.font_lg, title, S.COL_TEXT, center=(cx, rect.top + 42))
+
+        bar_x, bar_y = rect.left + 40, rect.top + 90
+        bar_w, bar_h = panel_w - 80, 22
+        frac = max(0.0, min(1.0, snap["progress"]))
+        pygame.draw.rect(self.hud_surf, (32, 29, 27), (bar_x, bar_y, bar_w, bar_h), border_radius=4)
+        pygame.draw.rect(self.hud_surf, (222, 178, 92), (bar_x, bar_y, int(bar_w * frac), bar_h), border_radius=4)
+        pygame.draw.rect(self.hud_surf, (110, 96, 62), (bar_x, bar_y, bar_w, bar_h), width=1, border_radius=4)
+        pct_text = f"{int(frac * 100)}%"
+        self._text(self.font_sm, pct_text, S.COL_TEXT, center=(cx, bar_y + bar_h // 2), shadow=True)
+
+        total = snap["total_bytes"]
+        done = snap["downloaded_bytes"]
+        if total:
+            size_text = i18n.t("update.downloading_size",
+                                done=self._format_size_mb(done), total=self._format_size_mb(total))
+        else:
+            size_text = i18n.t("update.downloading_size_unknown", done=self._format_size_mb(done))
+        speed = snap["speed_bps"]
+        speed_text = i18n.t("update.downloading_speed", speed=f"{speed / (1024 * 1024):.2f}")
+        remaining = (total - done) if total else None
+        if remaining is not None and speed > 1024:
+            eta_text = i18n.t("update.downloading_eta", eta=self._format_eta(remaining / speed))
+        else:
+            eta_text = i18n.t("update.downloading_eta_unknown")
+
+        info_y = bar_y + bar_h + 20
+        self._text(self.font_sm, size_text, S.COL_UI_DIM, topleft=(bar_x, info_y), shadow=False)
+        self._text(self.font_sm, speed_text, S.COL_UI_DIM, center=(cx, info_y + 10), shadow=False)
+        eta_w = self.font_sm.size(eta_text)[0]
+        self._text(self.font_sm, eta_text, S.COL_UI_DIM, topleft=(bar_x + bar_w - eta_w, info_y), shadow=False)
+
+    def _apply_update_now(self):
+        snap = self._updater.snapshot()
+        path = snap["downloaded_path"]
+        if not path:
+            return
+        self.settings["pending_changelog"] = snap["release_notes"] or ""
+        self._save_settings()
+        from game.updater import apply_update_and_restart
+        try:
+            apply_update_and_restart(path)
+        except Exception as e:
+            print(f"ward9: failed to apply update from {path}: {e}")
 
     def _feedback_button(self):
         w, h = 340, 44
@@ -1018,6 +1223,8 @@ class App:
             fs_rect = pygame.Rect(content.x, y, w, h)
             y += h + 12
             aa_rect = pygame.Rect(content.x, y, w, h)
+            y += h + 12
+            vs_rect = pygame.Rect(content.x, y, w, h)
             y += h + 34
             fps_rect = pygame.Rect(content.x, y, w - 170, 16)
             y += 16 + 34
@@ -1026,8 +1233,9 @@ class App:
             quality_rect = pygame.Rect(content.x, y, w - 170, 16)
             fs_btn = self._button(fs_rect, i18n.t("settings.fullscreen"), self._toggle_fullscreen)
             aa_btn = self._button(aa_rect, i18n.t("settings.upscale_smoothing"), self._toggle_upscale_smoothing)
+            vs_btn = self._button(vs_rect, i18n.t("settings.vsync"), self._toggle_vsync)
             return {"sliders": {"fps_limit": fps_rect, "view_distance": dist_rect, "quality_preset": quality_rect},
-                    "buttons": [fs_btn, aa_btn]}
+                    "buttons": [fs_btn, aa_btn, vs_btn]}
 
         if page == "sound":
             y = content.y + pad
@@ -1118,6 +1326,17 @@ class App:
     def _toggle_upscale_smoothing(self):
         self.settings["upscale_smoothing"] = not self.settings["upscale_smoothing"]
         self.renderer.set_upscale_smoothing(self.settings["upscale_smoothing"])
+        self._save_settings()
+        self.sounds.play_ui()
+
+    def _toggle_vsync(self):
+        self.settings["vsync"] = not self.settings["vsync"]
+        pygame.display.set_mode(
+            (S.SCREEN_W, S.SCREEN_H), pygame.OPENGL | pygame.DOUBLEBUF,
+            vsync=1 if self.settings["vsync"] else 0,
+        )
+        if self.settings["fullscreen"]:
+            pygame.display.toggle_fullscreen()
         self._save_settings()
         self.sounds.play_ui()
 
@@ -1327,6 +1546,10 @@ class App:
                 self.player.has_cutters = True
                 self.hint_text = i18n.t("hint.cutters_picked")
                 self.hint_timer = 3.0
+            elif obj.kind == "sanity_pill":
+                self.sanity_boost_timer = S.SANITY_PILL_DURATION
+                self.hint_text = i18n.t("hint.sanity_pill_used")
+                self.hint_timer = 3.0
             else:
                 self.player.carried += 1
             self.sounds.play_pickup()
@@ -1493,9 +1716,21 @@ class App:
             if self.controls_msg_timer > 0:
                 self.controls_msg_timer -= dt
             self._update_mic_level(dt)
+        elif self.state == "update_downloading":
+            snap = self._updater.snapshot()
+            if snap["state"] == "downloaded" and not self._update_apply_started:
+                self._update_apply_started = True
+                self._apply_update_now()
+            elif snap["state"] == "error":
+                self.state = "menu"
         self.fx_shake.update(dt)
 
-        want_menu_music = self.state in ("menu", "credits", "warning") or (
+        if self.state == "menu" and not self._update_prompt_seen:
+            if self._updater.snapshot()["state"] == "available":
+                self._update_prompt_seen = True
+                self.state = "update_prompt"
+
+        want_menu_music = self.state in ("menu", "credits", "warning", "update_prompt", "update_downloading") or (
             self.state == "settings" and self.settings_return == "menu") or (
             self.state == "confirm_quit" and self.confirm_return == "menu")
         if want_menu_music:
@@ -1540,6 +1775,7 @@ class App:
             self._update_peek_hold(dt, keys[b["interact"]])
         if not self.spec.get("no_threat"):
             self.player.update_flashlight(dt)
+        self._update_player_lit()
 
         fade_dir = 1.0 if self.player.is_hiding else -1.0
         self.hide_vignette_t = max(0.0, min(S.HIDE_VIGNETTE_FADE,
@@ -1592,6 +1828,7 @@ class App:
         self._update_sanity(dt)
         self._update_audio_3d(dt)
         self._update_scares(dt)
+        self._update_hallucinations(dt)
 
         if self.note_timer > 0:
             self.note_timer -= dt
@@ -1603,6 +1840,8 @@ class App:
             self.scare_flash_timer -= dt
         if self.interact_feedback_timer > 0:
             self.interact_feedback_timer -= dt
+        if self.sanity_boost_timer > 0:
+            self.sanity_boost_timer -= dt
 
         if self.monster.caught_player:
             self._start_catch_sequence()
@@ -1640,10 +1879,20 @@ class App:
             p.apply_sanity(-S.SANITY_MONSTER_DRAIN * proximity * dt)
         elif proximity_dread > 0:
             p.apply_sanity(-S.SANITY_MONSTER_DRAIN * 0.5 * proximity_dread * dt)
-        elif not p.flashlight_on and dist > S.MONSTER_HEARING_RANGE:
-            p.apply_sanity(-S.SANITY_DARK_DRAIN * dt)
-        elif dist > S.MONSTER_HEARING_RANGE * 1.5:
-            p.apply_sanity(S.SANITY_REGEN * dt)
+        elif p.is_hiding:
+            if p.flashlight_on:
+                p.apply_sanity(S.SANITY_HIDE_LIT_REGEN * dt)
+            else:
+                crouch_mult = S.SANITY_HIDE_CROUCH_MULT if p.is_crouching else 1.0
+                p.apply_sanity(-S.SANITY_HIDE_DRAIN * crouch_mult * dt)
+        else:
+            boosted = self.sanity_boost_timer > 0.0
+            if boosted or p.is_lit:
+                if dist > S.MONSTER_HEARING_RANGE * 1.5:
+                    regen_rate = S.SANITY_REGEN * (S.SANITY_PILL_REGEN_MULT if boosted else 1.0)
+                    p.apply_sanity(regen_rate * dt)
+            elif dist > S.MONSTER_HEARING_RANGE:
+                p.apply_sanity(-S.SANITY_DARK_DRAIN * dt)
 
     def _pan_vol_for(self, wx, wy, falloff=8.0):
         p = self.player
@@ -1654,13 +1903,26 @@ class App:
         vol = max(0.0, 1.0 - dist / falloff)
         return pan, vol
 
+    @staticmethod
+    def _growl_pan_vol(dist, rel_angle, alert_level):
+        pan = max(-1.0, min(1.0, math.sin(rel_angle)))
+        vol = max(0.0, 1.0 - dist / S.MONSTER_GROWL_FALLOFF) * (0.25 + 0.75 * alert_level) * 0.7
+        return pan, vol
+
     def _update_audio_3d(self, dt):
         p, m = self.player, self.monster
-        dist = math.hypot(m.x - p.x, m.y - p.y)
-        ang_to = math.atan2(m.y - p.y, m.x - p.x)
-        rel = (ang_to - p.angle + math.pi) % (2 * math.pi) - math.pi
-        pan = max(-1.0, min(1.0, math.sin(rel)))
-        vol = max(0.0, 1.0 - dist / 12.0) * (0.25 + 0.75 * m.alert_level) * 0.7
+        pulse = next((h for h in self.hallu_active if h["kind"] == "pulse"), None)
+        if pulse is not None:
+            progress = max(0.0, min(1.0, 1.0 - pulse["remaining"] / pulse["total"]))
+            dist = S.HALLUCINATION_PULSE_FAR_DIST + (
+                S.HALLUCINATION_PULSE_NEAR_DIST - S.HALLUCINATION_PULSE_FAR_DIST) * progress
+            rel = (pulse["angle"] - p.angle + math.pi) % (2 * math.pi) - math.pi
+            pan, vol = self._growl_pan_vol(dist, rel, 1.0)
+        else:
+            dist = math.hypot(m.x - p.x, m.y - p.y)
+            ang_to = math.atan2(m.y - p.y, m.x - p.x)
+            rel = (ang_to - p.angle + math.pi) % (2 * math.pi) - math.pi
+            pan, vol = self._growl_pan_vol(dist, rel, m.alert_level)
         self.sounds.set_growl(vol > 0.02, vol, pan)
         self.sounds.update_heartbeat(dt, p.sanity / S.SANITY_MAX)
         ambient_vol = 0.17 + 0.14 * (1 - p.sanity / S.SANITY_MAX) + 0.08 * self.dread
@@ -1686,7 +1948,6 @@ class App:
             tail = 1.0 - tt * tt * (3.0 - 2.0 * tt)
         return (1.0 - lt) * tail
 
-    _LIT_ATTEN_THRESHOLD = 0.15
     _FLASHLIGHT_USEFUL_RANGE = 8.0
 
     def _flashlight_lights_something(self):
@@ -1700,21 +1961,31 @@ class App:
                 return True
         return False
 
-    def _player_lit(self):
+    _IS_LIT_THRESHOLD = 0.12
+
+    def _update_player_lit(self):
         p = self.player
-        near_light = any(
-            getattr(obj, "light_radius", None) and not obj.picked
-            and self._point_light_atten(math.hypot(p.x - obj.x, p.y - obj.y), obj.light_radius)
-            > self._LIT_ATTEN_THRESHOLD
-            for obj in self.props)
-        return near_light or self._flashlight_lights_something()
+        level = self.spec.get("ambient_level", 0.0)
+        for obj in self.props:
+            radius = getattr(obj, "light_radius", None)
+            if not radius or obj.picked:
+                continue
+            if not self.maze.has_line_of_sight(p.x, p.y, obj.x, obj.y):
+                continue
+            if line_blocked_by_cover(self.doors, p.x, p.y, obj.x, obj.y, min_height=0.1):
+                continue
+            level += self._point_light_atten(math.hypot(p.x - obj.x, p.y - obj.y), radius)
+        if self._flashlight_lights_something():
+            level += 0.5
+        p.light_level = level
+        p.is_lit = level > self._IS_LIT_THRESHOLD
 
     def _update_scares(self, dt):
         if self.spec.get("no_threat"):
             return
         seconds_dark = 14.0 - 8.0 * self.dread
         seconds_lit = 34.0 - 10.0 * self.dread
-        self._scare_lit = self._player_lit()
+        self._scare_lit = self.player.is_lit
         seconds_to_fill = seconds_lit if self._scare_lit else seconds_dark
         self._scare_seconds_to_fill = seconds_to_fill
         self.scare_progress += dt / max(1.0, seconds_to_fill)
@@ -1722,6 +1993,71 @@ class App:
             self.scare_progress = 0.0
             self.scare_target = random.uniform(0.85, 1.15)
             self._trigger_random_scare()
+
+    def _update_hallucinations(self, dt):
+        if self.spec.get("no_threat"):
+            return
+        self._tick_active_hallucinations(dt)
+        if self.hallu_cooldown > 0:
+            self.hallu_cooldown -= dt
+        p = self.player
+        sanity_frac = p.sanity / S.SANITY_MAX
+        if sanity_frac >= S.HALLUCINATION_SANITY_THRESHOLD or p.is_hiding or self.monster.state == Monster.HUNT:
+            self.hallu_progress = 0.0
+            return
+        deficit = (S.HALLUCINATION_SANITY_THRESHOLD - sanity_frac) / S.HALLUCINATION_SANITY_THRESHOLD
+        seconds_to_fill = (S.HALLUCINATION_SECONDS_MAX
+                            - (S.HALLUCINATION_SECONDS_MAX - S.HALLUCINATION_SECONDS_MIN) * deficit)
+        self.hallu_progress += dt / max(0.1, seconds_to_fill)
+        if self.hallu_progress >= self.hallu_target and self.hallu_cooldown <= 0:
+            self.hallu_progress = 0.0
+            self.hallu_target = random.uniform(0.85, 1.15)
+            self.hallu_cooldown = S.HALLUCINATION_MIN_GAP
+            self._trigger_random_hallucination()
+
+    def _tick_active_hallucinations(self, dt):
+        still = []
+        for h in self.hallu_active:
+            h["remaining"] -= dt
+            if h["remaining"] <= 0:
+                continue
+            if h["kind"] == "door":
+                h["next_hit"] -= dt
+                if h["next_hit"] <= 0:
+                    h["next_hit"] = S.HALLUCINATION_DOOR_HIT_INTERVAL
+                    pan, vol = self._pan_vol_for(*h["pos"])
+                    self.sounds.play_hallu_bang(pan, vol)
+                    self.fx_shake.add(0.15)
+            still.append(h)
+        self.hallu_active = still
+
+    def _trigger_random_hallucination(self):
+        roll = random.random()
+        if roll < 0.40:
+            self._start_hallu_pulse()
+        elif roll < 0.70:
+            self.sounds.play_hallu_alert()
+            self.fx_shake.add(0.10)
+        else:
+            self._start_hallu_door_break()
+
+    def _start_hallu_pulse(self):
+        duration = random.uniform(S.HALLUCINATION_PULSE_MIN_LEN, S.HALLUCINATION_PULSE_MAX_LEN)
+        angle = random.uniform(0.0, math.tau)
+        self.hallu_active.append({
+            "kind": "pulse", "remaining": duration, "total": duration, "angle": angle,
+        })
+        self.fx_shake.add(0.06)
+
+    def _start_hallu_door_break(self):
+        if not self.doors:
+            return
+        p = self.player
+        nearest = min(self.doors, key=lambda d: math.hypot(d.x - p.x, d.y - p.y))
+        duration = random.uniform(S.HALLUCINATION_DOOR_MIN_LEN, S.HALLUCINATION_DOOR_MAX_LEN)
+        self.hallu_active.append({
+            "kind": "door", "pos": (nearest.x, nearest.y), "next_hit": 0.0, "remaining": duration,
+        })
 
     def _play_spatial_scare(self):
         p = self.player
@@ -1837,12 +2173,18 @@ class App:
                         self._apply_slider(self.dragging_slider, rect, self._logical_mouse_pos(event.pos)[0])
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 self.dragging_slider = None
+            elif event.type == pygame.MOUSEWHEEL and self.state == "menu" and self._show_changelog:
+                self._changelog_scroll_px = max(
+                    0, min(self._changelog_max_scroll, self._changelog_scroll_px - event.y * 40))
             elif event.type == pygame.WINDOWFOCUSLOST and self.state == "playing":
                 self.state = "paused"
                 self._release_mouse()
 
     def _handle_click(self, pos):
-        if self.state == "menu":
+        if self.state == "menu" and self._show_changelog:
+            if self._changelog_close_rect.collidepoint(pos):
+                self._close_changelog()
+        elif self.state == "menu":
             self._handle_button_click(self._menu_buttons(), pos)
         elif self.state == "paused":
             self._handle_button_click(self._pause_buttons(), pos)
@@ -1854,6 +2196,8 @@ class App:
             self._handle_button_click(self._warning_buttons(), pos)
         elif self.state == "confirm_quit":
             self._handle_button_click(self._confirm_quit_buttons(), pos)
+        elif self.state == "update_prompt":
+            self._handle_button_click(self._update_prompt_buttons(), pos)
         elif self.state in ("dead_caught", "dead_sanity", "win"):
             self._handle_button_click(self._end_buttons(
                 S.SCREEN_H // 2 + (85 if self.state == "win" else 105)), pos)
@@ -1862,7 +2206,10 @@ class App:
         if self.awaiting_bind is not None:
             self._resolve_bind(key)
             return
-        if self.state == "menu":
+        if self.state == "menu" and self._show_changelog:
+            if key == pygame.K_ESCAPE:
+                self._close_changelog()
+        elif self.state == "menu":
             if key == pygame.K_F9:
                 self._start_debug_level()
         elif self.state == "credits":
@@ -1871,12 +2218,15 @@ class App:
         elif self.state == "confirm_quit":
             if key == pygame.K_ESCAPE:
                 self._cancel_quit()
+        elif self.state == "update_prompt":
+            if key == pygame.K_ESCAPE:
+                self._decline_update()
         elif self.state == "playing":
             if key == pygame.K_ESCAPE:
                 self.state = "paused"
                 self._release_mouse()
             elif key == self.settings["bindings"]["flashlight"]:
-                if self.player.is_hiding or self.is_peeking:
+                if self.is_peeking:
                     self.sounds.play_denied()
                 elif not self.player.toggle_flashlight():
                     self.sounds.play_denied()
@@ -1895,7 +2245,8 @@ class App:
         self.hud_surf.fill((0, 0, 0, 0))
 
         if self.state in ("menu", "playing", "paused", "settings",
-                           "catch_sanity", "win_seq", "credits", "warning", "confirm_quit"):
+                           "catch_sanity", "win_seq", "credits", "warning", "confirm_quit",
+                           "update_prompt", "update_downloading"):
             shake_yaw, shake_pitch = self.fx_shake.offset(max_px=0.045)
             hide_locker, hide_swing = None, 0.0
             if self.hide_transition is not None:
@@ -1919,6 +2270,14 @@ class App:
 
         if self.state == "menu":
             self._draw_menu()
+            if self._show_changelog:
+                self._draw_changelog()
+        elif self.state == "update_prompt":
+            self._draw_menu()
+            self._draw_update_prompt()
+        elif self.state == "update_downloading":
+            self._draw_menu()
+            self._draw_update_downloading()
         elif self.state == "warning":
             self._draw_warning()
         elif self.state == "credits":
@@ -1989,7 +2348,7 @@ class App:
         if gameplay and self.settings.get("debug_hud_monster"):
             m, p = self.monster, self.player
             dist = math.hypot(m.x - p.x, m.y - p.y)
-            lines.append(f"Monster: {m.state}  dist: {dist:.1f}  alert: {m.alert_level:.2f}")
+            lines.append(f"Monster: {i18n.t(f'debug_hud.state_{m.state}')}  dist: {dist:.1f}  alert: {m.alert_level:.2f}")
         if gameplay and self.settings.get("debug_hud_seed"):
             lines.append(f"Seed: {self.floor_seed}")
         if gameplay and self.settings.get("debug_hud_scares"):
@@ -2235,9 +2594,10 @@ class App:
             self._draw_slider(rect, slider_frac(key), label, value_text, dragging=(self.dragging_slider == key))
 
         if page == "graphics":
-            fs_btn, aa_btn = layout["buttons"]
+            fs_btn, aa_btn, vs_btn = layout["buttons"]
             self._draw_toggle(fs_btn, self.settings["fullscreen"])
             self._draw_toggle(aa_btn, self.settings["upscale_smoothing"])
+            self._draw_toggle(vs_btn, self.settings["vsync"])
             fps_options = STEPPED_SLIDERS["fps_limit"]
             fps_idx = fps_options.index(self.settings["fps_limit"]) if self.settings["fps_limit"] in fps_options else 0
             self._draw_stepped_slider(layout["sliders"]["fps_limit"], fps_idx, len(fps_options),
@@ -2498,11 +2858,11 @@ class App:
     def _draw_note_box(self, cx):
         title = i18n.t("note.title")
         pad_x, pad_top, pad_bottom = 20, 34, 16
-        line_h = 23
+        line_h = self.font_note.get_linesize()
         max_box_w = min(820, S.SCREEN_W - 220)
-        lines = self._wrap_text(self.note_text, self.font_sm, max_box_w - pad_x * 2)
+        lines = self._wrap_text(self.note_text, self.font_note, max_box_w - pad_x * 2)
 
-        content_w = max([self.font_sm.size(line)[0] for line in lines] +
+        content_w = max([self.font_note.size(line)[0] for line in lines] +
                          [self.font_md.size(title)[0]])
         box_w = min(max_box_w, max(380, content_w + pad_x * 2))
         box_h = pad_top + line_h * len(lines) + pad_bottom
@@ -2521,7 +2881,7 @@ class App:
         note_surf.blit(self.font_md.render(title, True, (225, 205, 150)), (pad_x, 9))
         yy = pad_top
         for line in lines:
-            note_surf.blit(self.font_sm.render(line, True, (215, 205, 185)), (pad_x, yy))
+            note_surf.blit(self.font_note.render(line, True, (215, 205, 185)), (pad_x, yy))
             yy += line_h
         note_surf.set_alpha(int(255 * alpha))
         self.hud_surf.blit(note_surf, (box_x, box_y))
@@ -2590,4 +2950,6 @@ class App:
             self.draw()
         self.mic.stop()
         pygame.quit()
+        if self._next_mode == "editor":
+            return "editor"
         sys.exit(0)

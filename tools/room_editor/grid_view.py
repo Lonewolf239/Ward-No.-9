@@ -6,7 +6,13 @@ BG = (10, 10, 12)
 FLOOR_COLOR = (150, 150, 158)
 WALL_COLOR = (58, 52, 46)
 BORDER_COLOR = (100, 100, 110)
-DOOR_COLORS = {"passage": (90, 200, 120), "door": (230, 190, 60), "broken": (205, 95, 60)}
+DOOR_COLORS = {
+    "passage": (90, 200, 120), 
+    "door": (230, 190, 60), 
+    "broken": (205, 95, 60), 
+    "window": (100, 200, 240), 
+    "random": (170, 80, 220)
+}
 FURNITURE_COLOR = (110, 150, 230)
 QUEST_COLOR = (235, 140, 40)
 HOVER_COLOR = (255, 255, 255)
