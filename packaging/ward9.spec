@@ -19,6 +19,7 @@ a = Analysis(
         (os.path.join(ROOT, "game", "assets"), os.path.join("game", "assets")),
         (os.path.join(ROOT, "game", "room_data"), os.path.join("game", "room_data")),
         (os.path.join(ROOT, "game", "zone_data"), os.path.join("game", "zone_data")),
+        (os.path.join(ROOT, "game", "locale_data"), os.path.join("game", "locale_data")),
     ],
     hiddenimports=[
         # main.py only imports this lazily (inside the app<->editor mode
