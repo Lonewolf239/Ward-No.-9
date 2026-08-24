@@ -1,9 +1,18 @@
-# 🏥 ПАЛАТА №9 (Ward No. 9)
+[![Release](https://img.shields.io/github/v/release/Lonewolf239/Ward-No.-9?style=for-the-badge&label=version&color=2D2D2D&logo=github&logoColor=FFFFFF)](../../releases)
+[![Python](https://img.shields.io/badge/Made_with-Python_%26_Pygame-2D2D2D?style=for-the-badge&logo=python&logoColor=FFFFFF)](https://www.python.org/)
+[![Status](https://img.shields.io/badge/status-%D0%92%20%D1%80%D0%B0%D0%B7%D1%80%D0%B0%D0%B1%D0%BE%D1%82%D0%BA%D0%B5-2D2D2D?style=for-the-badge)](https://github.com/Lonewolf239/Ward-No.-9)
+[![License](https://img.shields.io/badge/License-GPLv3-2D2D2D?style=for-the-badge&logo=gnu&logoColor=FFFFFF)](LICENSE)
 
-![Version](https://img.shields.io/badge/version-ALPHA__2-orange.svg)
-![Python](https://img.shields.io/badge/made_with-Python_%26_Pygame-blue.svg)
-![Status](https://img.shields.io/badge/status-In%20Development-success.svg)
-![License](https://img.shields.io/badge/license-GPLv3-lightgrey.svg)
+[![Releases](https://img.shields.io/badge/Ward_No._9-RELEASES-2D2D2D?style=for-the-badge&logo=github&logoColor=FFFFFF)](../../releases)
+[![itch.io](https://img.shields.io/badge/ITCH.IO-Play_Now-2D2D2D?style=for-the-badge&logo=itchdotio&logoColor=FFFFFF)](https://lonewolf239.itch.io/ward-no-9)
+[![Feedback](https://img.shields.io/badge/Отзывы-Бот-2D2D2D?style=for-the-badge&logo=telegram&logoColor=FFFFFF)](https://t.me/ward9_feedback_bot)
+
+### Languages
+
+[![EN](https://img.shields.io/badge/README-EN-2D2D2D?style=for-the-badge&logo=github&logoColor=FFFFFF)](./README.md)
+[![RU](https://img.shields.io/badge/README-RU-2D2D2D?style=for-the-badge&logo=google-translate&logoColor=FFFFFF)](./README-RU.md)
+
+# 🏥 ПАЛАТА №9 (Ward No. 9)
 
 **«ПАЛАТА №9»** — хардкорный хоррор на выживание от первого лица, сделанный одним разработчиком на чистом Python: без игрового движка и без сторонних ассетов — каждая модель, текстура и звук сгенерированы самим кодом. Вы приходите в себя в заброшенной психиатрической больнице, и чтобы выбраться, придётся уходить от существа, которое реагирует не только на происходящее на экране, но и на реальный звук с вашего микрофона.
 
