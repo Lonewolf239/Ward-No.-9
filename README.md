@@ -1,7 +1,7 @@
 # 🏥 WARD NO. 9
 
 ![Version](https://img.shields.io/badge/version-ALPHA__2-orange.svg)
-![Python](https://img.shields.io/badge/Made_with-Python_%26_Pygame-blue.svg)
+![Python](https://img.shields.io/badge/made_with-Python_%26_Pygame-blue.svg)
 ![Status](https://img.shields.io/badge/status-In%20Development-success.svg)
 ![License](https://img.shields.io/badge/license-GPLv3-lightgrey.svg)
 
