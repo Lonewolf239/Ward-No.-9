@@ -6,7 +6,6 @@ from game.props import HAND_FURNITURE_BY_KIND, HAND_FURNITURE_KINDS, ZONE_HAND_F
 from tools.room_editor.room_model import (
     DOOR_KINDS, KINDS_BY_FLOOR, WALL_MATERIALS, list_saved_ids, required_fixture_kind,
 )
-from tools.room_editor import upload as up
 from tools.room_editor import zone_model as zm
 
 BG = (18, 18, 22)
@@ -137,20 +136,6 @@ class Panel:
             self.content_h = y + 14
             return
 
-        if self.mode == "import_browse":
-            header(i18n.t("editor.ui.import_header"))
-            label(i18n.t("editor.ui.import_hint", dir=up.INCOMING_DIR))
-            row(i18n.t("editor.ui.back"), "browse_back")
-            next_row()
-            names = up.list_incoming()
-            if not names:
-                label(i18n.t("editor.ui.import_empty"))
-            for name in names:
-                row(name, f"import:{name}", h=32)
-                next_row(h=32, gap=4)
-            self.content_h = y + 14
-            return
-
         mode_label = i18n.t("editor.ui.mode_zone" if editor_mode == "zone" else "editor.ui.mode_room")
         row(mode_label, "toggle_editor_mode", active=True, h=40)
         next_row(h=40, gap=4)
@@ -276,7 +261,7 @@ class Panel:
         row(i18n.t("editor.ui.open_list"), "list", h=36)
         next_row(h=36)
         if dev_mode:
-            row(i18n.t("editor.ui.import_button"), "import_list", h=36)
+            row(i18n.t("editor.ui.import_button"), "import_pick", h=36)
             next_row(h=36)
         row(i18n.t("editor.ui.save" if dev_mode else "editor.ui.save_upload"), "save", h=42)
         next_row(h=42)
@@ -374,9 +359,4 @@ class Panel:
             self.current_furniture_kind = action.split(":", 1)[1]; return None
         if action == "list":
             self.mode = "browse"; return None
-        if action == "import_list":
-            self.mode = "import_browse"; return None
-        if action.startswith("import:"):
-            self.mode = "normal"
-            return action
         return action

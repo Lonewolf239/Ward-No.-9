@@ -440,14 +440,38 @@ class Editor:
             self._set_message(i18n.t(ok_key) if not errors else "; ".join(errors), bool(errors))
         elif action.startswith("load:"):
             self._load(action.split(":", 1)[1])
-        elif action.startswith("import:"):
-            self._do_import(action.split(":", 1)[1])
+        elif action == "import_pick":
+            self._do_import_via_dialog()
 
-    def _do_import(self, zip_name):
-        zip_path = os.path.join(up.INCOMING_DIR, zip_name)
+    def _do_import_via_dialog(self):
         try:
-            with open(zip_path, "rb") as f:
+            import tkinter as tk
+            from tkinter import filedialog
+        except Exception as e:
+            self._set_message(i18n.t("editor.msg.import_dialog_unavailable", error=str(e)), True)
+            return
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+            path = filedialog.askopenfilename(
+                title=i18n.t("editor.ui.import_button"),
+                filetypes=[("Zip files", "*.zip")],
+            )
+        finally:
+            root.destroy()
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
                 blob = f.read()
+        except OSError as e:
+            self._set_message(i18n.t("editor.msg.import_failed", error=str(e)), True)
+            return
+        self._do_import(blob)
+
+    def _do_import(self, blob):
+        try:
             parsed = up.unpack_upload_zip(blob)
             data = parsed["model_json"]
             if not isinstance(data, dict):

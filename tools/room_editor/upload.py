@@ -105,16 +105,6 @@ def unpack_upload_zip(blob):
     return out
 
 
-INCOMING_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__)))), "incoming_uploads")
-
-
-def list_incoming():
-    if not os.path.isdir(INCOMING_DIR):
-        return []
-    return sorted(f for f in os.listdir(INCOMING_DIR) if f.lower().endswith(".zip"))
-
-
 def upload(data, kind, item_id):
     if not UPLOAD_URL or not UPLOAD_KEY:
         return False, "upload endpoint not configured in this build"

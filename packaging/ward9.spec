@@ -32,6 +32,8 @@ a = Analysis(
         "tools.room_editor.camera",
         "tools.room_editor.room_model",
         "tools.room_editor.zone_model",
+        "tkinter",
+        "tkinter.filedialog",
     ],
     hookspath=[],
     runtime_hooks=[],
