@@ -8,12 +8,13 @@ from game import zone_templates
 
 class Maze:
     def __init__(self, w=S.MAZE_W, h=S.MAZE_H, seed=None, wall_bias=None, layout="corridor",
-                 template_floor=None):
+                 template_floor=None, room_count_range=None):
         self.w = w if w % 2 == 1 else w + 1
         self.h = h if h % 2 == 1 else h + 1
         self.rng = random.Random(seed)
         self.wall_bias = wall_bias
         self.layout = layout
+        self.room_count_range = room_count_range or S.TEMPLATE_ROOM_COUNT
         self.grid = [[S.WALL_CONCRETE for _ in range(self.w)] for _ in range(self.h)]
         self.rooms = []
         self.template_doors = []
@@ -28,7 +29,7 @@ class Maze:
             self._carve_template_rooms(template_floor)
 
     def _carve_template_rooms(self, floor_key):
-        target = self.rng.randint(*S.TEMPLATE_ROOM_COUNT)
+        target = self.rng.randint(*self.room_count_range)
         result = room_templates.generate(self.rng, floor_key, target)
         if result is None:
             raise RuntimeError(

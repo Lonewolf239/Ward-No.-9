@@ -146,6 +146,7 @@ class Prop:
         self.picked = False
         self.installed = 0
         self.powered = False
+        self.broken = False
         self.note_text = note_text
         self.bob_phase = random.uniform(0, math.tau)
         self.interact_cell = None
@@ -668,6 +669,16 @@ def link_adjacent_pipes(props):
                 a.pipe_open_neg = True
 
 
+BREAKABLE_LIGHT_KINDS = {"wall_sconce", "lamp_desk", "monitor"}
+
+
+def _break_some_lights(props, rng):
+    for p in props:
+        if p.kind in BREAKABLE_LIGHT_KINDS and rng.random() < S.BROKEN_LIGHT_CHANCE:
+            p.broken = True
+    return props
+
+
 def populate_level(maze, spec, rng):
     sx, sy = int(maze.start[0]), int(maze.start[1])
     spawn = (sx, sy)
@@ -841,6 +852,7 @@ def populate_level(maze, spec, rng):
 
     props = _finalize_physical_safety(maze, props, dist)
     link_adjacent_pipes(props)
+    _break_some_lights(props, rng)
 
     return props, panel_prop, exit_prop, monster_cell, doors
 
@@ -990,6 +1002,7 @@ def populate_yard(maze, spec, rng):
 
     props = _finalize_physical_safety(maze, props, dist)
     link_adjacent_pipes(props)
+    _break_some_lights(props, rng)
 
     return props, panel_prop, exit_prop, monster_cell, yard_doors
 
@@ -1008,6 +1021,16 @@ def populate_debug(maze, rng):
         props.append(Prop(kind, x, y, facing=math.pi / 2))
         wx += spec["hw"] + 0.35
 
+    broken_wall_kinds = sorted(k for k in BREAKABLE_LIGHT_KINDS if PROP_DEFS[k]["wall_mounted"])
+    for kind in broken_wall_kinds:
+        spec = PROP_DEFS[kind]
+        wx += spec["hw"]
+        x, y = _wall_mount_position((wx, wall_y), math.pi / 2, spec["hd"])
+        broken_prop = Prop(kind, x, y, facing=math.pi / 2)
+        broken_prop.broken = True
+        props.append(broken_prop)
+        wx += spec["hw"] + 0.35
+
     cols = 8
     spacing = 1.5
     x0, y0 = 1.6, 3.6
@@ -1018,7 +1041,16 @@ def populate_debug(maze, rng):
         p = make_prop(kind, cell, facing=0.0, note_text=note_text)
         props.append(p)
 
-    rows = -(-len(floor_kinds) // cols)
+    broken_floor_kinds = sorted(k for k in BREAKABLE_LIGHT_KINDS if not PROP_DEFS[k]["wall_mounted"])
+    for j, kind in enumerate(broken_floor_kinds):
+        row, col = divmod(len(floor_kinds) + j, cols)
+        cell = (int(x0 + col * spacing), int(y0 + row * spacing))
+        p = make_prop(kind, cell, facing=0.0)
+        p.broken = True
+        props.append(p)
+
+    total_floor_items = len(floor_kinds) + len(broken_floor_kinds)
+    rows = -(-total_floor_items // cols)
     door_row_y = int(y0 + (rows + 1) * spacing)
     d_closed = Door(x0 + 0.5, door_row_y + 0.5, 0.0)
     d_open = Door(x0 + 2.3, door_row_y + 0.5, 0.0)
@@ -1066,23 +1098,72 @@ def populate_debug(maze, rng):
             ("elevator", ("base", "powered")),
             ("fence_gap", ("base", "powered")),
         ])
+        hatch_base = make_prop("hatch", (sx0 + 2, sy0 + 1), facing=0.0)
+        props.append(hatch_base)
         hatch_powered = make_prop("hatch", (sx0 + 2, sy0 + 2), facing=0.0)
         hatch_powered.powered = True
         props.append(hatch_powered)
 
-        door_y = (sy0 - 1) + (sy1 - (sy0 - 1)) // 2
-        no_locker_row = door_y + 3 if door_y + 3 < sy1 - 1 else door_y - 3
-        locker_row = door_y + 5 if door_y + 5 < sy1 - 1 else door_y - 5
+        def _mount_demo_locker(row):
+            # The showcase's own entrance doorway interrupts its west wall at one
+            # specific row (maze._carve_debug's door_y) - if a demo row lands on
+            # exactly that row there is no wall to mount on, so nudge outward
+            # until a real wall segment is found.
+            for candidate_row in (row, row + 1, row - 1, row + 2, row - 2):
+                wall_candidates = _wall_cells_around(maze, (sx0, candidate_row))
+                if wall_candidates:
+                    boundary, facing, fc = wall_candidates[0]
+                    lx, ly = _wall_mount_position(boundary, facing, PROP_DEFS["locker"]["hd"])
+                    locker = Prop("locker", lx, ly, facing=facing)
+                    props.append(locker)
+                    return locker
+            return None
 
-        demo_spots.append(((sx0 + 4.0, no_locker_row + 0.5), (sx0 + 1.5, no_locker_row + 0.5), False))
-        demo_spots.append(((sx0 + 4.0, locker_row + 0.5), (sx0 + 1.4, locker_row + 0.5), True))
+        def _locker_stand_point(lk, extra=0.0):
+            # Mirrors Monster._locker_stand_point (game/entities.py) exactly - the
+            # spot directly in front of the locker's door, along its facing.
+            standoff = lk.hd + 0.34 + extra
+            return lk.x + math.cos(lk.facing) * standoff, lk.y + math.sin(lk.facing) * standoff
 
-        locker_cell = (sx0, locker_row)
-        wall_candidates = _wall_cells_around(maze, locker_cell)
-        if wall_candidates:
-            boundary, facing, fc = wall_candidates[0]
-            lx, ly = _wall_mount_position(boundary, facing, PROP_DEFS["locker"]["hd"])
-            props.append(Prop("locker", lx, ly, facing=facing))
+        # Spread the 4 demo rows evenly across the usable showcase height, clear of the
+        # hatch pair near the top - offset-from-center math here previously let the
+        # farthest row (stalk) land outside the floor area on short showcases.
+        usable_top = sy0 + 4
+        usable_bot = sy1 - 2
+        span = max(1, usable_bot - usable_top)
+        patrol_row, investigate_row, hunt_row, stalk_row = (
+            int(usable_top + span * frac) for frac in (0.15, 0.40, 0.65, 0.90)
+        )
+
+        investigate_locker = _mount_demo_locker(investigate_row)
+        stalk_locker = _mount_demo_locker(stalk_row)
+
+        # Patrol: calm, normal speed, no locker involved.
+        demo_spots.append(dict(
+            start=(sx0 + 4.0, patrol_row + 0.5), target=(sx0 + 1.5, patrol_row + 0.5),
+            has_locker=False, speed=S.MONSTER_BASE_SPEED, alert_target=0.0,
+        ))
+        # Investigate: normal speed, briefly checks a locker (moderate alert).
+        if investigate_locker is not None:
+            demo_spots.append(dict(
+                start=_locker_stand_point(investigate_locker, extra=3.0),
+                target=_locker_stand_point(investigate_locker),
+                has_locker=True, speed=S.MONSTER_BASE_SPEED, alert_target=0.4,
+                check_seconds=S.MONSTER_LOCKER_CHECK_SECONDS, locker_target=investigate_locker,
+            ))
+        # Hunt: fast aggressive charge, no locker, max alert.
+        demo_spots.append(dict(
+            start=(sx0 + 4.0, hunt_row + 0.5), target=(sx0 + 1.5, hunt_row + 0.5),
+            has_locker=False, speed=S.MONSTER_HUNT_SPEED, alert_target=1.0,
+        ))
+        # Stalk: slow creeping approach, then a long hold checking its own locker (max alert).
+        if stalk_locker is not None:
+            demo_spots.append(dict(
+                start=_locker_stand_point(stalk_locker, extra=3.0),
+                target=_locker_stand_point(stalk_locker),
+                has_locker=True, speed=S.MONSTER_STALK_APPROACH_SPEED, alert_target=1.0,
+                check_seconds=S.MONSTER_STALK_OPEN_SECONDS, locker_target=stalk_locker,
+            ))
     maze.demo_monster_spots = demo_spots
 
     monster_cell = (maze.w - 3, maze.h - 3)

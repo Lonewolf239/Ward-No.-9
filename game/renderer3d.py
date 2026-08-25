@@ -7,12 +7,14 @@ import numpy as np
 
 from game import settings as S
 from game import gl_math as gm
+from game.props import BREAKABLE_LIGHT_KINDS
 
 EYE_HEIGHT = 0.62
 FOV_DEGREES = 88.0
 MAX_POINT_LIGHTS = 12
 MAX_DOOR_SEGS = 16
 MAX_WINDOW_SEGS = 24
+DOOR_SWING_MAX_ANGLE = math.radians(120)
 
 VERTEX_SHADER = """
 #version 330
@@ -1187,6 +1189,19 @@ def build_lamp_desk_mesh():
     return np.array(v, dtype="f4")
 
 
+def build_lamp_desk_broken_mesh():
+    v = []
+    base = (0.22, 0.21, 0.19)
+    pole = (0.30, 0.28, 0.25)
+    shade = (0.45, 0.40, 0.30)
+    dead_bulb = (0.08, 0.07, 0.07)
+    _mini_box(v, 0, 0, 0.05, 0.26, 0.26, 0.05, base, skip_bottom=True)
+    _mini_box(v, 0.05, 0.02, 0.34, 0.045, 0.045, 0.26, pole)
+    _mini_box(v, 0.14, 0.05, 0.60, 0.22, 0.22, 0.12, shade)
+    _mini_box(v, 0.14, 0.05, 0.55, 0.10, 0.10, 0.02, dead_bulb)
+    return np.array(v, dtype="f4")
+
+
 def build_sign_exit_mesh():
     v = []
     frame = (0.14, 0.13, 0.12)
@@ -1207,6 +1222,16 @@ def build_wall_sconce_mesh():
     return np.array(v, dtype="f4")
 
 
+def build_wall_sconce_broken_mesh():
+    v = []
+    plate = (0.20, 0.18, 0.16)
+    cup = (0.24, 0.22, 0.18)
+    dead_bulb = (0.10, 0.09, 0.09)
+    _mini_box(v, -0.41, 0, 0.5, 0.09, 0.34, 0.34, plate)
+    _mini_box(v, -0.24, 0, 0.5, 0.10, 0.20, 0.20, cup)
+    _mini_box(v, -0.10, 0.03, 0.46, 0.05, 0.06, 0.06, dead_bulb)
+    return np.array(v, dtype="f4")
+
 
 def build_monitor_mesh():
     v = []
@@ -1222,6 +1247,28 @@ def build_monitor_mesh():
     _mini_box(v, 0.28, 0.0, 0.55, 0.12, 0.34, 0.34, case)
     _mini_box(v, 0.38, 0.0, 0.55, 0.03, 0.27, 0.27, well)
     _mini_box(v, 0.41, 0.0, 0.55, 0.02, 0.22, 0.22, glass)
+    _mini_box(v, 0.40, -0.08, 0.24, 0.015, 0.02, 0.02, well)
+    _mini_box(v, 0.40, 0.08, 0.24, 0.015, 0.02, 0.02, well)
+    return np.array(v, dtype="f4")
+
+
+def build_monitor_broken_mesh():
+    v = []
+    case = (0.42, 0.40, 0.36)
+    well = (0.08, 0.08, 0.09)
+    glass = (0.04, 0.04, 0.05)
+    stand = (0.20, 0.19, 0.18)
+    crack = (0.55, 0.58, 0.62)
+
+    _mini_box(v, 0.0, 0.0, 0.05, 0.16, 0.12, 0.05, stand, skip_bottom=True)
+    _mini_box(v, 0.0, 0.0, 0.14, 0.06, 0.05, 0.04, stand)
+
+    _mini_box(v, -0.06, 0.0, 0.58, 0.36, 0.42, 0.42, case)
+    _mini_box(v, 0.28, 0.0, 0.55, 0.12, 0.34, 0.34, case)
+    _mini_box(v, 0.38, 0.0, 0.55, 0.03, 0.27, 0.27, well)
+    _mini_box(v, 0.41, 0.0, 0.55, 0.02, 0.22, 0.22, glass)
+    _mini_box(v, 0.415, -0.10, 0.62, 0.006, 0.16, 0.006, crack)
+    _mini_box(v, 0.415, 0.06, 0.48, 0.006, 0.14, 0.006, crack)
     _mini_box(v, 0.40, -0.08, 0.24, 0.015, 0.02, 0.02, well)
     _mini_box(v, 0.40, 0.08, 0.24, 0.015, 0.02, 0.02, well)
     return np.array(v, dtype="f4")
@@ -1761,6 +1808,9 @@ class Renderer3D:
             "clutter_junk": build_clutter_junk_mesh,
             "lamp_desk": build_lamp_desk_mesh, "sign_exit": build_sign_exit_mesh,
             "wall_sconce": build_wall_sconce_mesh, "monitor": build_monitor_mesh,
+            "lamp_desk_broken": build_lamp_desk_broken_mesh,
+            "wall_sconce_broken": build_wall_sconce_broken_mesh,
+            "monitor_broken": build_monitor_broken_mesh,
         }
         self.prop_vaos = {}
         for kind, builder in self._mesh_builders.items():
@@ -2036,11 +2086,26 @@ class Renderer3D:
         cull_dist2 = cull_dist * cull_dist
         return [p for p in props if (p.x - ex) ** 2 + (p.y - ey) ** 2 <= cull_dist2]
 
-    def _hinge_swing_model(self, p, swing):
+    def _hinge_swing_model(self, p, swing, hinge_depth=0.0):
+        # Single shared hinge-rotation transform for every swinging door/lid
+        # (locker leaf, shed_lock, and - via the door_swings/p.swing values fed
+        # in from the player's hide transition, the real monster's checking
+        # timers, and the debug mannequins - all three sources ultimately
+        # render through this one method, so the pivot math only lives here).
+        #
+        # hinge_depth is the local-X offset (along facing) from the prop's own
+        # center to the true hinge edge: 0.0 for a symmetric box like
+        # shed_lock (both faces exist, hinge runs through its own mid-depth),
+        # p.hd for a leaf mesh built flush against the front face only (the
+        # locker door) - omitting it there previously left the pivot short by
+        # exactly that amount, so the door's own edge traced a small circle
+        # around the hinge instead of staying on it.
+        fx, fy = math.cos(p.facing), math.sin(p.facing)
         rx, ry = -math.sin(p.facing), math.cos(p.facing)
-        hinge_x, hinge_y = p.x + rx * p.hw, p.y + ry * p.hw
-        vx0, vy0 = -rx * p.hw, -ry * p.hw
-        angle = swing * (math.pi / 2)
+        hinge_x = p.x + fx * hinge_depth + rx * p.hw
+        hinge_y = p.y + fy * hinge_depth + ry * p.hw
+        vx0, vy0 = p.x - hinge_x, p.y - hinge_y
+        angle = swing * DOOR_SWING_MAX_ANGLE
         ca, sa = math.cos(angle), math.sin(angle)
         sx = hinge_x + (vx0 * ca - vy0 * sa)
         sy = hinge_y + (vx0 * sa + vy0 * ca)
@@ -2072,15 +2137,19 @@ class Renderer3D:
                 variant = "pipes_open_both" if p.pipe_open_neg and p.pipe_open_pos else (
                     "pipes_open_neg" if p.pipe_open_neg else "pipes_open_pos")
                 vao = self.prop_vaos.get(variant, self.box_vao)
+            elif p.kind in BREAKABLE_LIGHT_KINDS and getattr(p, "broken", False):
+                vao = self.prop_vaos.get(p.kind + "_broken", self.box_vao)
             else:
                 vao = self.prop_vaos.get(p.kind, self.box_vao)
-            self._draw_box(model, self._prop_color(p, t), 1.0 if p.emissive else 0.0, texture=tex, tex_scale=tex_scale, vao=vao)
+            is_dead_light = p.kind in BREAKABLE_LIGHT_KINDS and getattr(p, "broken", False)
+            self._draw_box(model, self._prop_color(p, t), 1.0 if (p.emissive and not is_dead_light) else 0.0,
+                            texture=tex, tex_scale=tex_scale, vao=vao)
             glass_vao = self.glass_vaos.get(p.kind)
             if glass_vao is not None:
                 self._draw_box(model, (1.0, 1.0, 1.0), 0.15, vao=glass_vao, alpha=0.35)
             if p.kind == "locker":
                 leaf_swing = door_swings.get(id(p), 0.0)
-                leaf_model = self._hinge_swing_model(p, leaf_swing) if leaf_swing > 0.0 else model
+                leaf_model = self._hinge_swing_model(p, leaf_swing, hinge_depth=p.hd) if leaf_swing > 0.0 else model
                 self._draw_box(leaf_model, self._prop_color(p, t), 0.0, texture=tex, tex_scale=tex_scale,
                                 vao=self.locker_door_vao)
 
@@ -2308,7 +2377,7 @@ class Renderer3D:
 
     def _set_point_lights(self, props, eye, t):
         ex, ey, ez = eye
-        all_lights = [p for p in props if not p.picked and getattr(p, "light_radius", None)]
+        all_lights = [p for p in props if not p.picked and not getattr(p, "broken", False) and getattr(p, "light_radius", None)]
         boundary_dist = None
         lights = []
         if all_lights:
@@ -2341,7 +2410,7 @@ class Renderer3D:
     def render(self, maze, player, monster, props, dread, t, shake_yaw=0.0, shake_pitch=0.0,
                fog_color=None, fog_dist=12.5, ambient=0.06, moon_strength=0.0,
                qa_mode=False, view_distance_mult=1.0, hide_locker=None, hide_swing=0.0,
-               camera_override=None):
+               camera_override=None, extra_door_swings=None):
         ctx = self.ctx
         self.fbo.use()
         ctx.viewport = (0, 0, self.low_w, self.low_h)
@@ -2472,6 +2541,9 @@ class Renderer3D:
             door_swings[id(closing_locker)] = max(door_swings.get(id(closing_locker), 0.0), close_frac)
         if hide_locker is not None and hide_swing > 0.0:
             door_swings[id(hide_locker)] = max(door_swings.get(id(hide_locker), 0.0), hide_swing)
+        if extra_door_swings:
+            for key, frac in extra_door_swings.items():
+                door_swings[key] = max(door_swings.get(key, 0.0), frac)
 
         self._draw_props(visible_props, t, door_swings=door_swings)
         _t_props1 = time.perf_counter()

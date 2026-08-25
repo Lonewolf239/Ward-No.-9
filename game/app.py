@@ -54,6 +54,28 @@ FEEDBACK_URL = "https://t.me/ward9_feedback_bot"
 CONTRIBUTORS = (
     ("music", "Darsin", "https://t.me/DARSINrock"),
 )
+
+SPLASH_TITLE_FADE = (0.0, 0.6)
+SPLASH_SUBTITLE_FADE = (0.25, 0.6)
+SPLASH_HEADPHONES_FADE = (1.3, 0.6)
+SPLASH_SKIP_HINT_FADE = (0.3, 0.5)
+SPLASH_HOLD_END = 3.0
+SPLASH_FADE_OUT_DUR = 0.6
+SPLASH_TOTAL_DURATION = SPLASH_HOLD_END + SPLASH_FADE_OUT_DUR
+
+_COMMUNITY_CREATORS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "community_creators.json")
+
+
+def _load_community_creators():
+    try:
+        with open(_COMMUNITY_CREATORS_PATH, "r", encoding="utf-8") as f:
+            names = json.load(f)
+        return [str(n).strip() for n in names if str(n).strip()]
+    except Exception:
+        return []
+
+
+COMMUNITY_CREATORS = _load_community_creators()
 FLOOR_THEME_SURFACE = {"upper": "tile", "basement": "stone", "yard": "grass"}
 SLIDER_SPECS = {
     "master_volume": (0.0, 1.0),
@@ -75,17 +97,24 @@ NOTE_FONT_PATH = os.path.join(_ASSETS_DIR, "note_font.ttf")
 
 
 class _DemoMonster:
-    def __init__(self, start, target, has_locker, speed=1.1):
+    def __init__(self, start, target, has_locker, speed=1.1, alert_target=0.0, check_seconds=None,
+                 locker_target=None):
         self.start = start
         self.target = target
         self.has_locker = has_locker
         self.speed = speed
+        self.alert_target = alert_target
+        self.check_seconds = check_seconds if check_seconds is not None else S.MONSTER_LOCKER_CHECK_SECONDS
+        self.locker_target = locker_target
         self.x, self.y = start
         self.facing = math.atan2(target[1] - start[1], target[0] - start[0])
         self.walk_phase = 0.0
         self.walk_amp = 0.0
         self.alert_level = 0.0
         self.checking_timer = 0.0
+        self.checking_timer_total = self.check_seconds
+        self.closing_locker = None
+        self.closing_timer = 0.0
         self.phase = "approach"
         self.phase_t = 0.0
 
@@ -100,6 +129,11 @@ class _DemoMonster:
             self.facing = math.atan2(b[1] - a[1], b[0] - a[0])
 
     def update(self, dt):
+        self.alert_level += (self.alert_target - self.alert_level) * min(1.0, dt * 2.0)
+        if self.closing_timer > 0.0:
+            self.closing_timer = max(0.0, self.closing_timer - dt)
+            if self.closing_timer <= 0.0:
+                self.closing_locker = None
         if self.phase == "approach":
             self.phase_t += dt
             t = min(1.0, self.phase_t / self._travel_time())
@@ -108,13 +142,17 @@ class _DemoMonster:
             self.walk_phase += dt * self.speed * 3.4
             if t >= 1.0:
                 if self.has_locker:
-                    self.phase, self.phase_t, self.checking_timer = "check", 0.0, S.MONSTER_LOCKER_CHECK_SECONDS
+                    self.phase, self.phase_t, self.checking_timer = "check", 0.0, self.check_seconds
                 else:
                     self.phase, self.phase_t = "pause", 0.0
         elif self.phase == "check":
             self.walk_amp += (0.0 - self.walk_amp) * min(1.0, dt * 8.0)
             self.checking_timer = max(0.0, self.checking_timer - dt)
+            if self.locker_target is not None:
+                self.facing = math.atan2(self.locker_target.y - self.y, self.locker_target.x - self.x)
             if self.checking_timer <= 0.0:
+                self.closing_locker = self.locker_target
+                self.closing_timer = S.MONSTER_LOCKER_CLOSE_SECONDS
                 self.phase, self.phase_t = "return", 0.0
         elif self.phase == "pause":
             self.phase_t += dt
@@ -230,6 +268,8 @@ class App:
         self._changelog_scroll_px = 0
         self._changelog_max_scroll = 0
         self._changelog_close_rect = pygame.Rect(0, 0, 0, 0)
+        self._community_scroll_px = 0
+        self._community_max_scroll = 0
         if self.settings.get("last_seen_version") != S.VERSION:
             self._show_changelog = True
             self._changelog_scroll_px = 0
@@ -243,6 +283,9 @@ class App:
         self.new_game()
         if not self.settings.get("warning_seen"):
             self.state = "warning"
+        self._splash_t = 0.0
+        self._post_splash_state = self.state
+        self.state = "splash"
         if not self.sounds.ch_ambient.get_busy():
             self.sounds.start_ambient()
 
@@ -353,7 +396,7 @@ class App:
         self.sounds.stop_all_threat_audio()
         self.player = Player(0.0, 0.0)
         self.debug_demo_monsters = []
-        self._load_floor(0)
+        self._load_menu_scene()
 
         self.elapsed = 0.0
         self.anim_t = 0.0
@@ -395,18 +438,15 @@ class App:
         self.confirm_return = "menu"
         self.state = "menu"
 
-    def _load_floor(self, index):
-        spec = S.FLOOR_SPECS[index]
-        self.floor_i = index
-        self.spec = spec
-        self._floor_music_pending = True
+    def _build_floor_scene(self, spec, room_count_range=None):
         seed = random.randrange(1 << 30)
         self.floor_seed = seed
         layout = spec.get("layout", "corridor")
         if layout == "yard":
             self.maze = Maze(w=S.YARD_W, h=S.YARD_H, seed=seed, layout="yard")
         else:
-            self.maze = Maze(seed=seed, wall_bias=spec["wall_bias"], template_floor=spec.get("floor_theme"))
+            self.maze = Maze(seed=seed, wall_bias=spec["wall_bias"], template_floor=spec.get("floor_theme"),
+                              room_count_range=room_count_range)
         rng = random.Random(seed ^ 0x5EED)
         if layout == "yard":
             self.props, self.panel_prop, self.exit_prop, monster_cell, self.doors = populate_yard(self.maze, spec, rng)
@@ -438,6 +478,19 @@ class App:
             blocked_prop_candidates=[p for p in self.props if not p.wall_mounted or p.kind == "locker"],
             dead_end_lockers=self.maze.dead_end_lockers(lockers),
         )
+
+    def _load_menu_scene(self):
+        self.floor_i = 0
+        self.spec = S.FLOOR_SPECS[0]
+        self._floor_music_pending = False
+        self._build_floor_scene(self.spec, room_count_range=S.MENU_ROOM_COUNT)
+
+    def _load_floor(self, index):
+        spec = S.FLOOR_SPECS[index]
+        self.floor_i = index
+        self.spec = spec
+        self._floor_music_pending = True
+        self._build_floor_scene(spec)
         self._door_break_sfx_timer = 0.0
         self.floor_elapsed = 0.0
         self.floor_banner = self._spec_t("title")
@@ -486,8 +539,7 @@ class App:
             dead_end_lockers=self.maze.dead_end_lockers(debug_lockers),
         )
         self.debug_demo_monsters = [
-            _DemoMonster(start, target, has_locker)
-            for start, target, has_locker in getattr(self.maze, "demo_monster_spots", [])
+            _DemoMonster(**spec) for spec in getattr(self.maze, "demo_monster_spots", [])
         ]
         self._door_break_sfx_timer = 0.0
         self.floor_elapsed = 0.0
@@ -514,6 +566,10 @@ class App:
         pygame.mouse.get_rel()
         if not self.sounds.ch_ambient.get_busy():
             self.sounds.start_ambient()
+
+    def _start_playing(self):
+        self._load_floor(0)
+        self._begin_playing()
 
     def _release_mouse(self):
         pygame.mouse.set_visible(True)
@@ -984,7 +1040,7 @@ class App:
         left, w, _story_lines, _legend_lines, button_y0 = layout or self._menu_layout()
         h, gap = 44, 7
         buttons = [
-            self._button((left, button_y0, w, h), i18n.t("menu.play"), self._begin_playing),
+            self._button((left, button_y0, w, h), i18n.t("menu.play"), self._start_playing),
             self._button((left, button_y0 + (h + gap), w, h), i18n.t("menu.settings"), lambda: self._open_settings("menu")),
             self._button((left, button_y0 + 2 * (h + gap), w, h), i18n.t("menu.about"), self._open_credits),
             self._button((left, button_y0 + 3 * (h + gap), w, h), i18n.t("menu.room_editor"), self._open_room_editor),
@@ -1110,8 +1166,30 @@ class App:
         rect = (S.SCREEN_W - w - 20, S.SCREEN_H - h - 40, w, h)
         return self._button(rect, i18n.t("menu.feedback"), lambda: webbrowser.open(FEEDBACK_URL), theme="gold")
 
+    def _update_splash(self, dt):
+        self._splash_t += dt
+        if self._splash_t >= SPLASH_TOTAL_DURATION:
+            self._finish_splash()
+
+    def _finish_splash(self):
+        if self.state != "splash":
+            return
+        self.state = self._post_splash_state
+
+    @staticmethod
+    def _smooth01(x):
+        x = max(0.0, min(1.0, x))
+        return x * x * (3.0 - 2.0 * x)
+
+    def _splash_group_alpha(self, fade_start, fade_dur):
+        t = self._splash_t
+        fade_in = self._smooth01((t - fade_start) / fade_dur) if fade_dur > 0 else (1.0 if t >= fade_start else 0.0)
+        fade_out = 1.0 - self._smooth01((t - SPLASH_HOLD_END) / SPLASH_FADE_OUT_DUR)
+        return fade_in * fade_out
+
     def _open_credits(self):
         self.state = "credits"
+        self._community_scroll_px = 0
 
     def _credits_content(self):
         left = 90
@@ -1145,6 +1223,21 @@ class App:
 
         for line in body_lines:
             text_row(line, self.font_sm, S.COL_UI_DIM, 24)
+
+        community_viewport = None
+        if COMMUNITY_CREATORS:
+            divider_row()
+            text_row(i18n.t("about.community_title"), self.font_md, (215, 200, 190), 26)
+            text_row(i18n.t("about.community_hint", n=len(COMMUNITY_CREATORS)), self.font_sm, S.COL_UI_DIM, 28)
+            names_lines = self._wrap_text(", ".join(COMMUNITY_CREATORS), self.font_sm, content_w)
+            line_h = 22
+            viewport_h = min(len(names_lines), 5) * line_h
+            community_viewport = dict(
+                rect=pygame.Rect(left, y, content_w, viewport_h),
+                lines=names_lines, line_h=line_h,
+            )
+            y += viewport_h + 20
+
         divider_row()
         text_row(i18n.t("about.links_label"), self.font_md, (215, 200, 190), 30)
         link_row_y = y
@@ -1158,10 +1251,10 @@ class App:
         ]
         back_btn = self._button((left, y + 30, 300, 44), i18n.t("ui.back"),
                                 lambda: setattr(self, "state", "menu"))
-        return rows, left, content_w, link_buttons, contributor_links, back_btn
+        return rows, left, content_w, link_buttons, contributor_links, back_btn, community_viewport
 
     def _credits_buttons(self):
-        _, _, _, link_buttons, contributor_links, back_btn = self._credits_content()
+        _, _, _, link_buttons, contributor_links, back_btn, _ = self._credits_content()
         return link_buttons + contributor_links + [back_btn]
 
     def _warning_buttons(self):
@@ -1696,7 +1789,9 @@ class App:
     def update(self, dt):
         dt = min(dt, 0.05)
         self.anim_t += dt
-        if self.state in ("menu", "credits", "warning"):
+        if self.state == "splash":
+            self._update_splash(dt)
+        elif self.state in ("menu", "credits", "warning"):
             self.player.angle = (self.player.angle + dt * 0.06) % math.tau
             self.sounds.set_ambient_volume(0.13)
         elif self.state == "playing":
@@ -2176,12 +2271,17 @@ class App:
             elif event.type == pygame.MOUSEWHEEL and self.state == "menu" and self._show_changelog:
                 self._changelog_scroll_px = max(
                     0, min(self._changelog_max_scroll, self._changelog_scroll_px - event.y * 40))
+            elif event.type == pygame.MOUSEWHEEL and self.state == "credits":
+                self._community_scroll_px = max(
+                    0, min(self._community_max_scroll, self._community_scroll_px - event.y * 40))
             elif event.type == pygame.WINDOWFOCUSLOST and self.state == "playing":
                 self.state = "paused"
                 self._release_mouse()
 
     def _handle_click(self, pos):
-        if self.state == "menu" and self._show_changelog:
+        if self.state == "splash":
+            self._finish_splash()
+        elif self.state == "menu" and self._show_changelog:
             if self._changelog_close_rect.collidepoint(pos):
                 self._close_changelog()
         elif self.state == "menu":
@@ -2206,7 +2306,9 @@ class App:
         if self.awaiting_bind is not None:
             self._resolve_bind(key)
             return
-        if self.state == "menu" and self._show_changelog:
+        if self.state == "splash":
+            self._finish_splash()
+        elif self.state == "menu" and self._show_changelog:
             if key == pygame.K_ESCAPE:
                 self._close_changelog()
         elif self.state == "menu":
@@ -2253,6 +2355,14 @@ class App:
                 hide_locker = self.hide_transition["locker"]
                 hide_frac = min(1.0, self.hide_transition["t"] / self.hide_transition["duration"])
                 hide_swing = math.sin(hide_frac * math.pi)
+            demo_door_swings = {}
+            for dm in self.debug_demo_monsters:
+                if dm.locker_target is not None and dm.checking_timer > 0.0:
+                    demo_door_swings[id(dm.locker_target)] = self.renderer.compute_check_frac(dm)
+                if dm.closing_locker is not None and dm.closing_timer > 0.0:
+                    close_frac = dm.closing_timer / S.MONSTER_LOCKER_CLOSE_SECONDS
+                    key = id(dm.closing_locker)
+                    demo_door_swings[key] = max(demo_door_swings.get(key, 0.0), close_frac)
             self.renderer.render(
                 self.maze, self.player, self.monster, self.props + self.doors, self.dread, self.anim_t,
                 shake_yaw, shake_pitch,
@@ -2262,13 +2372,16 @@ class App:
                 view_distance_mult=self.settings.get("view_distance", 1.0),
                 hide_locker=hide_locker, hide_swing=hide_swing,
                 camera_override=self._peek_camera_override(),
+                extra_door_swings=demo_door_swings,
             )
             for dm in self.debug_demo_monsters:
                 self.renderer._draw_monster(dm, 0.0, check_frac=self.renderer.compute_check_frac(dm))
             if self.player.is_hiding or self.hide_vignette_t > 0.0:
                 self._draw_hide_frame()
 
-        if self.state == "menu":
+        if self.state == "splash":
+            self._draw_splash()
+        elif self.state == "menu":
             self._draw_menu()
             if self._show_changelog:
                 self._draw_changelog()
@@ -2479,6 +2592,55 @@ class App:
         y += 30
         return left, content_w, story_lines, legend_lines, y
 
+    def _draw_splash(self):
+        self.hud_surf.fill((0, 0, 0, 255))
+        cx, cy = S.SCREEN_W // 2, S.SCREEN_H // 2
+
+        title_a = self._splash_group_alpha(*SPLASH_TITLE_FADE)
+        if title_a > 0.003:
+            drift = (1.0 - self._smooth01((self._splash_t - SPLASH_TITLE_FADE[0]) / SPLASH_TITLE_FADE[1])) * 14
+            surf = self.font_title.render("WARD No. 9", True, S.COL_TEXT)
+            surf.set_alpha(int(255 * title_a))
+            self.hud_surf.blit(surf, surf.get_rect(center=(cx, cy - 70 + drift)))
+
+        sub_a = self._splash_group_alpha(*SPLASH_SUBTITLE_FADE)
+        if sub_a > 0.003:
+            drift = (1.0 - self._smooth01((self._splash_t - SPLASH_SUBTITLE_FADE[0]) / SPLASH_SUBTITLE_FADE[1])) * 10
+            surf = self.font_md.render("by Lonewolf239", True, S.COL_UI_DIM)
+            surf.set_alpha(int(255 * sub_a))
+            self.hud_surf.blit(surf, surf.get_rect(center=(cx, cy - 14 + drift)))
+
+        hp_a = self._splash_group_alpha(*SPLASH_HEADPHONES_FADE)
+        if hp_a > 0.003:
+            self._draw_headphones_hint(cx, cy + 60, hp_a)
+
+        skip_a = self._splash_group_alpha(*SPLASH_SKIP_HINT_FADE)
+        if skip_a > 0.003:
+            surf = self.font_sm.render(i18n.t("splash.skip_hint"), True, S.COL_UI_DIM)
+            surf.set_alpha(int(130 * skip_a))
+            self.hud_surf.blit(surf, surf.get_rect(center=(cx, S.SCREEN_H - 50)))
+
+    def _draw_headphones_hint(self, cx, y, alpha):
+        gold = (215, 180, 120)
+        text_surf = self.font_sm.render(i18n.t("splash.headphones_hint"), True, gold)
+        icon_size = 28
+        gap = 10
+        group_w = icon_size + gap + text_surf.get_width()
+        group_h = max(icon_size, text_surf.get_height())
+        group = pygame.Surface((group_w, group_h), pygame.SRCALPHA)
+
+        icon_cx, icon_cy = icon_size // 2, group_h // 2
+        r = icon_size // 2 - 2
+        arc_rect = pygame.Rect(icon_cx - r, icon_cy - r - 2, r * 2, r * 2)
+        pygame.draw.arc(group, gold, arc_rect, 0.0, math.pi, width=3)
+        cup_w, cup_h = 7, 13
+        pygame.draw.rect(group, gold, (icon_cx - r - cup_w // 2, icon_cy - 2, cup_w, cup_h), border_radius=3)
+        pygame.draw.rect(group, gold, (icon_cx + r - cup_w // 2, icon_cy - 2, cup_w, cup_h), border_radius=3)
+
+        group.blit(text_surf, (icon_size + gap, (group_h - text_surf.get_height()) // 2))
+        group.set_alpha(int(255 * alpha))
+        self.hud_surf.blit(group, group.get_rect(center=(cx, y)))
+
     def _draw_warning(self):
         overlay = pygame.Surface((S.SCREEN_W, S.SCREEN_H), pygame.SRCALPHA)
         overlay.fill((2, 2, 3, 235))
@@ -2501,7 +2663,7 @@ class App:
     def _draw_credits(self):
         self.hud_surf.blit(self.menu_gradient, (0, 0))
         self._blit_static()
-        rows, left, content_w, link_buttons, contributor_links, back_btn = self._credits_content()
+        rows, left, content_w, link_buttons, contributor_links, back_btn, community_viewport = self._credits_content()
         self._text(self.font_lg, i18n.t("about.title"), S.COL_TEXT, topleft=(left, 70))
         for y, kind, payload in rows:
             if kind == "text":
@@ -2509,11 +2671,41 @@ class App:
                 self._text(font, text, col, topleft=(left, y))
             elif kind == "divider":
                 pygame.draw.line(self.hud_surf, (70, 62, 58), (left, y), (left + content_w, y), 1)
+        if community_viewport is not None:
+            self._draw_community_creators(community_viewport)
         for btn in contributor_links:
             self._draw_text_link(btn)
         for btn in link_buttons:
             self._draw_button(btn)
         self._draw_button(back_btn)
+
+    def _draw_community_creators(self, viewport_spec):
+        rect = viewport_spec["rect"]
+        lines = viewport_spec["lines"]
+        line_h = viewport_spec["line_h"]
+        content_h = len(lines) * line_h
+        self._community_max_scroll = max(0, content_h - rect.h)
+        self._community_scroll_px = max(0, min(self._community_max_scroll, self._community_scroll_px))
+
+        prev_clip = self.hud_surf.get_clip()
+        self.hud_surf.set_clip(rect)
+        y = rect.top - self._community_scroll_px
+        for line in lines:
+            if y + line_h >= rect.top and y <= rect.bottom:
+                self._text(self.font_sm, line, S.COL_UI_DIM, topleft=(rect.left, y), shadow=True)
+            y += line_h
+        self.hud_surf.set_clip(prev_clip)
+
+        if self._community_max_scroll > 0:
+            track = pygame.Rect(rect.right + 14, rect.top, 6, rect.h)
+            pygame.draw.rect(self.hud_surf, (28, 26, 24), track, border_radius=3)
+            pygame.draw.rect(self.hud_surf, (70, 64, 58), track, width=1, border_radius=3)
+            thumb_h = max(20, int(rect.h * rect.h / content_h))
+            thumb_y = rect.top + int(
+                (rect.h - thumb_h) * (self._community_scroll_px / self._community_max_scroll))
+            thumb = pygame.Rect(track.x, thumb_y, track.w, thumb_h)
+            pygame.draw.rect(self.hud_surf, (110, 96, 62), thumb, border_radius=3)
+            pygame.draw.rect(self.hud_surf, (150, 130, 90), thumb, width=1, border_radius=3)
 
     def _draw_pause(self):
         self.hud_surf.blit(self.pause_gradient, (0, 0))
@@ -2900,7 +3092,7 @@ class App:
             self._start_debug_level()
         else:
             self.new_game()
-            self._begin_playing()
+            self._start_playing()
 
     def _end_buttons(self, y0):
         cx = S.SCREEN_W // 2
