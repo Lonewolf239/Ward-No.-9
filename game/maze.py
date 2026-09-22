@@ -396,17 +396,31 @@ class Maze:
             return abs(x - (ix + 0.5)) < t + r and iy <= y + r and y - r <= iy + 1
         return abs(y - (iy + 0.5)) < t + r and ix <= x + r and x - r <= ix + 1
 
-    def blocks_reach(self, x0, y0, x1, y1):
+    def segment_blocked(self, x0, y0, x1, y1, step=0.04):
         dx, dy = x1 - x0, y1 - y0
-        steps = max(2, int(math.hypot(dx, dy) / 0.08) + 1)
+        steps = max(1, int(math.hypot(dx, dy) / step) + 1)
         for i in range(steps + 1):
             t = i / float(steps)
-            ix, iy = int(x0 + dx * t), int(y0 + dy * t)
-            if not (0 <= ix < self.w and 0 <= iy < self.h):
-                return True
-            if self.grid[iy][ix] != S.FLOOR:
+            if self.is_wall(x0 + dx * t, y0 + dy * t):
                 return True
         return False
+
+    def standing_cell(self, x, y):
+        ix, iy = int(x), int(y)
+        if self.is_walkable_cell(ix, iy):
+            return ix, iy
+        best = None
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = ix + dx, iy + dy
+            if not self.is_walkable_cell(nx, ny):
+                continue
+            cx, cy = nx + 0.5, ny + 0.5
+            if self.segment_blocked(x, y, cx, cy):
+                continue
+            d = (cx - x) ** 2 + (cy - y) ** 2
+            if best is None or d < best[0]:
+                best = (d, (nx, ny))
+        return best[1] if best is not None else (ix, iy)
 
     def reset_derived(self):
         self.wall_tint = {}

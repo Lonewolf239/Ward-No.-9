@@ -754,7 +754,7 @@ class Monster:
         return cands
 
     def _replan(self, maze, target_cell, extra_blocked=None):
-        sx, sy = self.cell
+        sx, sy = maze.standing_cell(self.x, self.y)
         tx, ty = target_cell
         blocked = self.blocked_cells | extra_blocked if extra_blocked else self.blocked_cells
         path = maze.bfs_path(sx, sy, tx, ty, blocked=blocked)
@@ -1075,6 +1075,7 @@ class Monster:
             self._locker_target_elapsed = 0.0
 
         dist = math.hypot(player.x - self.x, player.y - self.y)
+        pcell = maze.standing_cell(player.x, player.y)
 
         if grace or blind:
             if grace and self.state != Monster.PATROL:
@@ -1194,7 +1195,7 @@ class Monster:
                 hx, hy = bx, by
                 for i in range(1, int(FLASH_RANGE / step) + 1):
                     tx, ty = bx + fx * step * i, by + fy * step * i
-                    if maze.is_wall(tx, ty):
+                    if maze.blocks_sight(tx, ty):
                         break
                     hx, hy = tx, ty
                 if (math.hypot(hx - self.x, hy - self.y) < S.MONSTER_BEAM_SPOT_RANGE
@@ -1262,7 +1263,7 @@ class Monster:
                 self.state = Monster.HUNT
                 self.lose_interest_timer = S.MONSTER_LOSE_INTEREST_TIME
                 self._sight_memory_t = S.MONSTER_SIGHT_MEMORY_SECONDS
-                self.target_cell = player.cell
+                self.target_cell = pcell
                 self.pending_reaction = None
                 if self.checking_timer > 0.0 and self.locker_target is not None:
                     self.closing_locker = self.locker_target
@@ -1270,41 +1271,41 @@ class Monster:
                 self.locker_target = None
                 self.stalk_origin = False
                 self._glow_sight_t = 0.0
-                self._note_contact(player.cell)
+                self._note_contact(pcell)
             elif loud_and_close:
                 self.state = Monster.HUNT
                 self.lose_interest_timer = S.MONSTER_LOSE_INTEREST_TIME * 0.6
                 self._sight_memory_t = S.MONSTER_SIGHT_MEMORY_SECONDS
-                self.target_cell = player.cell
+                self.target_cell = pcell
                 self.pending_reaction = None
                 if self.checking_timer > 0.0 and self.locker_target is not None:
                     self.closing_locker = self.locker_target
                     self.closing_timer = S.MONSTER_LOCKER_CLOSE_SECONDS
                 self.locker_target = None
                 self.stalk_origin = False
-                self._note_contact(player.cell)
+                self._note_contact(pcell)
             elif tracking:
-                self.target_cell = player.cell
+                self.target_cell = pcell
                 self.lose_interest_timer = S.MONSTER_LOSE_INTEREST_TIME
                 self._sight_memory_t = S.MONSTER_SIGHT_MEMORY_SECONDS
-                self._note_contact(player.cell)
+                self._note_contact(pcell)
             elif self.state == Monster.HUNT and self._sight_memory_t > 0:
                 self._sight_memory_t -= dt
                 if not self.stalk_origin:
-                    self.target_cell = player.cell
-                    self._note_contact(player.cell)
+                    self.target_cell = pcell
+                    self._note_contact(pcell)
             elif self.state == Monster.HUNT:
                 if hearing_hit and not self.stalk_origin:
-                    self.target_cell = player.cell
-                    self._note_contact(player.cell)
+                    self.target_cell = pcell
+                    self._note_contact(pcell)
                 self.lose_interest_timer -= dt
                 if self.lose_interest_timer <= 0:
                     self.state = Monster.INVESTIGATE
                     self._search_hops_left = S.MONSTER_SEARCH_HOPS
             elif hearing_hit:
-                target = player.cell
+                target = pcell
                 if self.rng.random() < S.MONSTER_INTERCEPT_CHANCE:
-                    target = self._predict_target_cell(maze, player, player.cell)
+                    target = self._predict_target_cell(maze, player, pcell)
                 if self.pending_reaction is None and self.rng.random() < S.MONSTER_REACTION_DELAY_CHANCE:
                     self.pending_reaction = {
                         "target_cell": target, "hops": 3,
@@ -1314,14 +1315,14 @@ class Monster:
                     self.state = Monster.INVESTIGATE
                     self.target_cell = target
                     self._search_hops_left = S.MONSTER_SEARCH_HOPS
-                self._note_contact(player.cell)
+                self._note_contact(pcell)
             elif glow_spotted:
                 self.state = Monster.INVESTIGATE
-                self.target_cell = player.cell
+                self.target_cell = pcell
                 self.pending_reaction = None
                 self._search_hops_left = S.MONSTER_SEARCH_HOPS
                 self._glow_sight_t = 0.0
-                self._note_contact(player.cell)
+                self._note_contact(pcell)
             elif beam_spot is not None:
                 hx, hy = beam_spot
                 f = self.rng.uniform(*S.MONSTER_BEAM_BACKTRACK)
@@ -1330,7 +1331,7 @@ class Monster:
                     target = (gx, gy)
                 else:
                     near = self._nearby_open_cell(maze, gx, gy)
-                    target = near[0] if near else player.cell
+                    target = near[0] if near else pcell
                 if self.pending_reaction is None and self.rng.random() < S.MONSTER_REACTION_DELAY_CHANCE:
                     self.pending_reaction = {
                         "target_cell": target, "hops": 2,
@@ -1635,10 +1636,12 @@ class Monster:
                 self.checking_timer = S.MONSTER_LOCKER_CHECK_SECONDS
                 self.checking_timer_total = S.MONSTER_LOCKER_CHECK_SECONDS
 
-        catch_reach = (dist < S.MONSTER_CATCH_RADIUS
-                        and not _closed_door_between(self.doors, self.x, self.y, player.x, player.y)
-                        and not maze.blocks_reach(self.x, self.y, player.x, player.y))
-        stuck_catch = self._catch_stuck_time > S.MONSTER_STUCK_CATCH_TIME and dist < S.MONSTER_STUCK_CATCH_RADIUS
+        reach_clear = (dist < max(S.MONSTER_CATCH_RADIUS, S.MONSTER_STUCK_CATCH_RADIUS)
+                       and not _closed_door_between(self.doors, self.x, self.y, player.x, player.y)
+                       and not maze.segment_blocked(self.x, self.y, player.x, player.y))
+        catch_reach = reach_clear and dist < S.MONSTER_CATCH_RADIUS
+        stuck_catch = (reach_clear and self._catch_stuck_time > S.MONSTER_STUCK_CATCH_TIME
+                       and dist < S.MONSTER_STUCK_CATCH_RADIUS)
         if (not grace and not blind and not player.is_hiding
                 and self.state == Monster.HUNT and (catch_reach or stuck_catch)):
             self.caught_player = True
