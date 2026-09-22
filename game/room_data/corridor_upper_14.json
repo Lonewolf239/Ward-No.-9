@@ -1,0 +1,100 @@
+{
+  "schema_version": 3,
+  "id": "corridor_upper_14",
+  "kind": "corridor",
+  "floor": "upper",
+  "w": 6,
+  "h": 5,
+  "weight": 0.4,
+  "required": false,
+  "cells": [
+    [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ]
+  ],
+  "doors": {
+    "E": {
+      "cell": [
+        5,
+        2
+      ],
+      "kind": "random"
+    },
+    "W": {
+      "cell": [
+        0,
+        2
+      ],
+      "kind": "random"
+    }
+  },
+  "interior_doors": [],
+  "furniture": [
+    [
+      "fire_extinguisher",
+      1.5,
+      1.065,
+      0.45,
+      1.5708
+    ],
+    [
+      "wall_sconce",
+      4.5,
+      1.075,
+      0.55,
+      1.5708
+    ],
+    [
+      "wall_sconce",
+      1.5,
+      3.925,
+      0.55,
+      4.7124
+    ],
+    [
+      "fire_extinguisher",
+      4.5,
+      3.935,
+      0.45,
+      4.7124
+    ]
+  ],
+  "mirror": true
+}

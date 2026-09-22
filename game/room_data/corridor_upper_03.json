@@ -77,9 +77,25 @@
   "furniture": [
     [
       "wall_sconce",
-      1,
-      1,
+      1.075,
+      1.5,
+      0.55,
       0.0
+    ],
+    [
+      "fire_extinguisher",
+      2.5,
+      4.935,
+      0.45,
+      4.7124
+    ],
+    [
+      "fire_extinguisher",
+      4.935,
+      4.5,
+      0.45,
+      3.1416
     ]
-  ]
+  ],
+  "mirror": true
 }
