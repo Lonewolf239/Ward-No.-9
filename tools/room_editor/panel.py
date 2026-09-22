@@ -2,20 +2,36 @@ import pygame
 
 from game import settings as S
 from game import i18n
+from game import ui
 from game.props import HAND_FURNITURE_BY_KIND, HAND_FURNITURE_KINDS, ZONE_HAND_FURNITURE_BY_KIND
 from tools.room_editor.room_model import (
-    DOOR_KINDS, KINDS_BY_FLOOR, WALL_MATERIALS, list_saved_ids, required_fixture_kind,
+    DOOR_KINDS, KINDS_BY_FLOOR, list_saved_ids, required_fixture_kind,
 )
 from tools.room_editor import zone_model as zm
 
-BG = (18, 18, 22)
-ROW_BG = (34, 34, 40)
-ROW_BG_ACTIVE = (70, 110, 90)
-ROW_BG_QUEST_ACTIVE = (150, 95, 40)
-ROW_BORDER = (60, 60, 68)
-TEXT = (220, 220, 220)
-TEXT_DIM = (150, 150, 155)
-TOOL_LABELS = ("furniture", "wall", "floor", "door")
+BG = (14, 12, 12)
+TEXT = ui.TEXT
+TEXT_DIM = ui.TEXT_DIM
+TOOL_LABELS = ("furniture", "wall", "brick", "window", "bars", "floor", "door")
+TOOL_ONLY_IN = {
+    "brick": {"zone": None},
+    "bars":  {"room": {"cell"}, "zone": {"pen"}},
+}
+
+
+def _tools_for(is_zone, kind):
+    scope = "zone" if is_zone else "room"
+    out = []
+    for tool in TOOL_LABELS:
+        allow = TOOL_ONLY_IN.get(tool)
+        if allow is not None:
+            if scope not in allow:
+                continue
+            kinds = allow[scope]
+            if kinds is not None and kind not in kinds:
+                continue
+        out.append(tool)
+    return out
 
 
 def _tool_label(tool):
@@ -24,10 +40,6 @@ def _tool_label(tool):
 
 def _door_kind_label(kind):
     return i18n.t(f"editor.door_kind.{kind}")
-
-
-def _door_scope_label(scope):
-    return i18n.t(f"editor.door_scope.{scope}")
 
 
 def _floor_label(floor):
@@ -42,10 +54,6 @@ def _furniture_label(kind):
     return i18n.t(f"editor.furniture.{kind}")
 
 
-def _material_label(mat):
-    return i18n.t(f"editor.material.{mat}")
-
-
 def _furniture_kinds_for(kind, floor):
     kinds = set(HAND_FURNITURE_BY_KIND.get(kind, HAND_FURNITURE_KINDS))
     required = required_fixture_kind(kind, floor)
@@ -58,13 +66,18 @@ def _zone_furniture_kinds_for(kind):
     return sorted(ZONE_HAND_FURNITURE_BY_KIND.get(kind, ()))
 
 
+GIZMO_MODES = ("cursor", "move", "turn", "magnet")
+REPEATABLE_ACTIONS = ("w-", "w+", "h-", "h+", "weight-", "weight+")
+
+
 class Panel:
     def __init__(self, width=380):
         self.width = width
+        self.gizmo_mode = "cursor"
+        self.magnet_count = 0
         self.current_tool = "furniture"
         self.current_furniture_kind = "shelf"
         self.current_door_kind = "door"
-        self.current_door_scope = "link"
         self.mode = "normal"
         self.settings_open = False
         self.kind_open = False
@@ -73,14 +86,16 @@ class Panel:
         self._rows = []
         self._labels = []
         pygame.font.init()
-        self.font = pygame.font.SysFont("consolas,monospace", 18)
-        self.font_small = pygame.font.SysFont("consolas,monospace", 15)
+        self.font = ui.font(18)
+        self.font_small = ui.font(15)
+        self.font_tiny = ui.font(13)
 
     def scroll(self, dy_rows, viewport_h):
         max_scroll = max(0, self.content_h - viewport_h)
         self.scroll_y = max(0, min(max_scroll, self.scroll_y - dy_rows * 30))
 
-    def layout(self, model, view_mode, natural_color=False, testing_floor=None, editor_mode="room", dev_mode=True):
+    def layout(self, model, view_mode, natural_color=False, testing_floor=None, editor_mode="room",
+               dev_mode=True, test_seed=None):
         self._rows = []
         self._labels = []
         y = 14
@@ -98,19 +113,23 @@ class Panel:
 
         def label(text):
             nonlocal y
-            self._labels.append((text, x, y))
-            y += 20
+            for line in self._wrap(text, self.width - x - 8):
+                self._labels.append((line, x, y))
+                y += 20
 
         def header(text):
             nonlocal y
             y += 8
-            self._labels.append((text, x, y))
-            y += 22
+            for line in self._wrap(text, self.width - x - 8):
+                self._labels.append((line, x, y))
+                y += 22
 
         if testing_floor is not None:
             spec = S.FLOOR_SPECS[testing_floor]
             header(i18n.t("editor.ui.test_header"))
             label(i18n.t(spec["title"]))
+            if test_seed is not None:
+                label(i18n.t("editor.ui.test_seed", seed=test_seed))
             label(i18n.t("editor.ui.test_hint"))
             next_row(h=0, gap=8)
             row(i18n.t("editor.ui.reroll"), "test_reroll", h=40)
@@ -187,15 +206,24 @@ class Panel:
             row("+", "weight+", rx=x + w // 2 + 3, rw=w // 2 - 3)
             next_row()
 
-            if not is_zone:
-                label(i18n.t("editor.ui.material_preview"))
-                mw = w // len(WALL_MATERIALS)
-                for i, mat in enumerate(WALL_MATERIALS):
-                    row(_material_label(mat), f"material:{mat}", active=(mat == model.wall_material_preview),
-                        h=32, rx=x + i * mw, rw=mw - 4)
-                next_row(h=32, gap=14)
+        tool_list = _tools_for(is_zone, getattr(model, "kind", None))
+        if self.current_tool not in tool_list:
+            self.current_tool = "wall"
+        header(i18n.t("editor.ui.gizmo_header"))
+        gw = w // 4
+        for i, mode in enumerate(GIZMO_MODES):
+            row(i18n.t("editor.gizmo.%s" % mode), "gizmo:%s" % mode,
+                active=(mode == self.gizmo_mode), h=34, rx=x + i * gw, rw=gw - 4)
+        next_row(h=34)
+        if self.gizmo_mode == "magnet":
+            hw = w // 2
+            row(i18n.t("editor.ui.magnet_apply", n=self.magnet_count), "magnet",
+                h=34, rx=x, rw=hw - 4, active=self.magnet_count >= 2)
+            row(i18n.t("editor.ui.magnet_clear"), "magnet_clear", h=34, rx=x + hw, rw=hw - 4)
+            next_row(h=34)
+            label(i18n.t("editor.ui.magnet_hint"))
+        next_row(h=34, gap=12)
 
-        tool_list = TOOL_LABELS
         header(i18n.t("editor.ui.tool_header"))
         tw = w // 2
         for i, tool in enumerate(tool_list):
@@ -220,14 +248,6 @@ class Panel:
             label(i18n.t("editor.ui.door_remove_hint"))
             next_row(h=0, gap=6)
         elif self.current_tool == "door":
-            header(i18n.t("editor.ui.border_door_header"))
-            for scope in ("link", "local"):
-                row(_door_scope_label(scope), f"door_scope:{scope}", active=(scope == self.current_door_scope), h=32)
-                next_row(h=32, gap=2)
-            label(i18n.t("editor.ui.local_door_hint1"))
-            label(i18n.t("editor.ui.local_door_hint2"))
-            next_row(h=0, gap=8)
-
             header(i18n.t("editor.ui.door_kind_header"))
             for kind in DOOR_KINDS:
                 row(_door_kind_label(kind), f"door_kind:{kind}", active=(kind == self.current_door_kind), h=36)
@@ -276,12 +296,37 @@ class Panel:
 
         self.content_h = y + 14
 
-    def draw(self, surf, model, view_mode, natural_color=False, testing_floor=None, editor_mode="room", dev_mode=True):
-        self.layout(model, view_mode, natural_color, testing_floor, editor_mode, dev_mode)
+    def _wrap(self, text, max_w):
+        lines, current = [], ""
+        for word in text.split(" "):
+            trial = f"{current} {word}" if current else word
+            if current and self.font_small.size(trial)[0] > max_w:
+                lines.append(current)
+                current = word
+            else:
+                current = trial
+        lines.append(current)
+        return lines
+
+    def _fit_label(self, text, max_w):
+        if self.font_small.size(text)[0] <= max_w:
+            return self.font_small, text
+        if self.font_tiny.size(text)[0] <= max_w:
+            return self.font_tiny, text
+        while len(text) > 1 and self.font_tiny.size(text + "…")[0] > max_w:
+            text = text[:-1]
+        return self.font_tiny, text.rstrip() + "…"
+
+    def draw(self, surf, model, view_mode, natural_color=False, testing_floor=None, editor_mode="room",
+             dev_mode=True, test_seed=None):
+        self.layout(model, view_mode, natural_color, testing_floor, editor_mode, dev_mode, test_seed)
         viewport_h = surf.get_height()
         max_scroll = max(0, self.content_h - viewport_h)
         self.scroll_y = max(0, min(max_scroll, self.scroll_y))
         surf.fill(BG)
+        ui.draw_panel(surf, pygame.Rect(4, 4, surf.get_width() - 8, viewport_h - 8),
+                      fill=ui.PANEL_FILL_SOLID, corner=22)
+        surf.set_clip(pygame.Rect(6, 8, surf.get_width() - 12, viewport_h - 16))
         for text, lx, ly in self._labels:
             sy = ly - self.scroll_y
             if -20 <= sy <= viewport_h:
@@ -292,11 +337,11 @@ class Panel:
             if sy < -rect.h or sy > viewport_h:
                 continue
             screen_rect = pygame.Rect(rect.x, sy, rect.w, rect.h)
-            color = (ROW_BG_QUEST_ACTIVE if quest else ROW_BG_ACTIVE) if active else ROW_BG
-            pygame.draw.rect(surf, color, screen_rect)
-            pygame.draw.rect(surf, ROW_BORDER, screen_rect, 1)
-            txt = self.font_small.render(text, True, TEXT)
-            surf.blit(txt, (screen_rect.x + 8, screen_rect.y + (screen_rect.h - txt.get_height()) // 2))
+            ui.draw_row(surf, screen_rect, active=active, special=active and quest)
+            font, shown = self._fit_label(text, screen_rect.w - 16)
+            txt = font.render(shown, True, ui.row_text_color(active))
+            surf.blit(txt, (screen_rect.x + 10, screen_rect.y + (screen_rect.h - txt.get_height()) // 2))
+        surf.set_clip(None)
 
     def handle_click(self, mx, my, model, view_mode, natural_color=False, testing_floor=None, editor_mode="room",
                       dev_mode=True):
@@ -306,6 +351,19 @@ class Panel:
             if action is not None and rect.collidepoint(mx, cy):
                 return self._apply(action, model)
         return None
+
+    def gizmo_mode_of(self, action):
+        return action.split(":", 1)[1] if action.startswith("gizmo:") else None
+
+    def action_at(self, mx, my):
+        cy = my + self.scroll_y
+        for rect, action, _text, _active, _quest in self._rows:
+            if action is not None and rect.collidepoint(mx, cy):
+                return action
+        return None
+
+    def apply_action(self, action, model):
+        return self._apply(action, model)
 
     def _apply(self, action, model):
         if action == "browse_back":
@@ -347,14 +405,15 @@ class Panel:
         if action == "weight+":
             step = 0.01 if model.weight < 0.2 else 0.1
             model.weight = round(model.weight + step, 2); return None
-        if action.startswith("material:"):
-            model.wall_material_preview = action.split(":", 1)[1]; return None
+        if action.startswith("gizmo:"):
+            self.gizmo_mode = action.split(":", 1)[1]
+            if self.gizmo_mode != "cursor":
+                self.current_tool = "furniture"
+            return None
         if action.startswith("tool:"):
             self.current_tool = action.split(":", 1)[1]; return None
         if action.startswith("door_kind:"):
             self.current_door_kind = action.split(":", 1)[1]; return None
-        if action.startswith("door_scope:"):
-            self.current_door_scope = action.split(":", 1)[1]; return None
         if action.startswith("furniture_kind:"):
             self.current_furniture_kind = action.split(":", 1)[1]; return None
         if action == "list":

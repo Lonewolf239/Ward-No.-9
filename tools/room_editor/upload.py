@@ -5,6 +5,8 @@ import urllib.error
 import urllib.request
 import zipfile
 
+from game import i18n
+
 UPLOAD_URL = os.environ.get("WARD9_UPLOAD_URL", "")
 UPLOAD_KEY = os.environ.get("WARD9_UPLOAD_KEY", "")
 if not UPLOAD_URL or not UPLOAD_KEY:
@@ -107,7 +109,7 @@ def unpack_upload_zip(blob):
 
 def upload(data, kind, item_id):
     if not UPLOAD_URL or not UPLOAD_KEY:
-        return False, "upload endpoint not configured in this build"
+        return False, i18n.t("editor.msg.upload_not_configured")
     req = urllib.request.Request(
         UPLOAD_URL, data=data, method="POST",
         headers={

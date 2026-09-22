@@ -8,14 +8,15 @@ import moderngl
 import pygame
 
 from game import settings as S
+from game import ui
 from game import gl_math as gm
 from game import i18n
 from game.maze import Maze
 from game.entities import Player, Monster
 from game.props import (
-    Door, Prop, _authored_prop_position, PROP_DEFS, SURFACE_ITEM_KINDS, populate_level, populate_yard,
-    link_adjacent_pipes,
+    Door, Prop, PROP_DEFS, populate_level, populate_yard, link_adjacent_pipes,
 )
+from tools.room_editor.furniture_model import entry as furn_entry
 from game.renderer3d import Renderer3D, EYE_HEIGHT, FOV_DEGREES
 from game.room_templates import door_facing as _border_door_facing
 
@@ -25,7 +26,9 @@ from tools.room_editor import zone_model as zm
 from tools.room_editor.camera import FreeCamera
 from tools.room_editor.grid_view import GridView
 from tools.room_editor.panel import Panel
-from tools.room_editor.raycast import ray_floor_cell
+from tools.room_editor import panel as panel_mod
+from tools.room_editor.raycast import (ray_floor_cell, ray_floor_point, screen_ray,
+                                       world_to_screen, ray_vertical_plane_z)
 
 
 def _apply_saved_language():
@@ -46,6 +49,15 @@ _apply_saved_language()
 PANEL_W = 380
 PAD = 3
 MONSTER_PARK = (-2000.0, -2000.0)
+
+
+def _seg_dist(px, py, a, b):
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    L = dx * dx + dy * dy
+    t = 0.0 if L <= 1e-9 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L))
+    return math.hypot(px - (ax + dx * t), py - (ay + dy * t))
 
 
 class Editor:
@@ -76,7 +88,7 @@ class Editor:
         self.camera = FreeCamera()
         self._center_camera_on_room()
 
-        self._fake_maze = Maze(w=16, h=16, layout="debug")
+        self._fake_maze = Maze(w=S.DEBUG_W, h=S.DEBUG_H, layout="debug")
         self._fake_player = Player(0.0, 0.0)
         self._fake_player.flashlight_on = False
         self._fake_player.battery = 100.0
@@ -89,6 +101,17 @@ class Editor:
 
         self.looking = False
         self.painting = False
+        self.selected_furn = None
+        self.gizmo_handle = None
+        self.gizmo_grab = (0.0, 0.0)
+        self.gizmo_turn_from = (0.0, 0.0)
+        self.selected_entry = None
+        self.selection = []
+        self._hover_furn_index = None
+        self.gizmo_hover = None
+        self._drag_riders = None
+        self.repeat_action = None
+        self.repeat_at = 0.0
         self.paint_value = S.WALL_CONCRETE
         self.natural_color = False
         self.testing_floor = None
@@ -108,10 +131,11 @@ class Editor:
         self.running = True
         self._t0 = time.time()
         pygame.font.init()
-        self._msg_font = pygame.font.SysFont("consolas,monospace", 22)
-        self._help_title_font = pygame.font.SysFont("consolas,monospace", 28, bold=True)
-        self._help_font = pygame.font.SysFont("consolas,monospace", 19)
+        self._msg_font = ui.font(20)
+        self._help_title_font = ui.font(26)
+        self._help_font = ui.font(17)
         self.show_help = False
+        self._scan_down = set()
 
     def _center_camera_on_room(self):
         self.camera.x = PAD + 1.5
@@ -127,9 +151,12 @@ class Editor:
 
     def _rebuild_level(self):
         gw, gh, grid, pad = self.model.to_maze_grid(pad=PAD)
-        self._fake_maze.w, self._fake_maze.h = gw, gh
-        self._fake_maze.grid = grid
+        self._fake_maze.regrid(gw, gh, grid)
         theme = self.model.floor if self.editor_mode == "room" else "yard"
+        self._fake_maze.layout = "yard" if self.editor_mode == "zone" else "debug"
+        self._fake_maze.zones = ([{"rect": (pad, pad, pad + self.model.w, pad + self.model.h),
+                                   "kind": self.model.kind}]
+                                 if self.editor_mode == "zone" else [])
         self.renderer.build_level(self._fake_maze, theme=theme)
         self.dirty = False
 
@@ -138,20 +165,12 @@ class Editor:
 
     def _current_props(self):
         out = []
-        furn_kind_by_cell = {
-            (lx + PAD, ly + PAD): (kind, facing) for kind, lx, ly, facing in self.model.furniture
-            if kind not in SURFACE_ITEM_KINDS
-        }
-        for kind, lx, ly, facing in self.model.furniture:
-            cell = (lx + PAD, ly + PAD)
-            x, y, z0, forced_facing = _authored_prop_position(cell, kind, facing, self._fake_maze, furn_kind_by_cell)
-            if forced_facing is not None:
-                facing = forced_facing
+        for _i, kind, x, y, z0, facing in self._furniture_props():
             p = Prop(kind, x, y, facing=facing)
             p.z0 = z0
             out.append(p)
         for info in self.model.doors.values():
-            if info["kind"] in ("passage", "window"):
+            if info["kind"] == "passage":
                 continue
             lx, ly = info["cell"]
             side = self.model.side_of_border_cell(lx, ly)
@@ -161,8 +180,6 @@ class Editor:
                 d.break_open()
             out.append(d)
         for lx, ly, facing, kind in self.model.interior_doors:
-            if kind == "window":
-                continue
             d = Door(lx + PAD + 0.5, ly + PAD + 0.5, facing)
             if kind == "broken":
                 d.break_open()
@@ -174,11 +191,18 @@ class Editor:
         while self.running:
             dt = self.clock.tick(60) / 1000.0
             self._handle_events(dt)
+            self._tick_repeat()
             self._update_camera(dt)
             if self.testing_floor is not None:
                 self.hover_cell = None
             elif not self.looking:
                 self.hover_cell = self._resolve_cell(*pygame.mouse.get_pos())
+                mx, my = pygame.mouse.get_pos()
+                if self.gizmo_handle is None:
+                    self.gizmo_hover = self._handle_under_cursor(mx, my)
+                    self._hover_furn_index = (
+                        None if self.panel.gizmo_mode == "cursor" or self.gizmo_hover
+                        else self._pick_furniture(mx, my))
             if self.dirty and self.testing_floor is None:
                 self._rebuild_level()
             self._draw()
@@ -187,6 +211,19 @@ class Editor:
     def _toggle_view(self):
         self.view_mode = "camera" if self.view_mode == "grid" else "grid"
         self.painting = False
+
+    def _resolve_point(self, mx, my):
+        if mx >= self.primary_w:
+            return None
+        if self.view_mode == "grid":
+            pt = self.grid.point_at(mx, my, self.model)
+            return None if pt is None else (pt[0] + PAD, pt[1] + PAD)
+        aspect = self.renderer.low_w / self.renderer.low_h
+        pt = ray_floor_point(
+            mx, my, self.primary_w, self.window_h, self.camera.eye, self.camera.yaw,
+            self.camera.pitch, math.radians(FOV_DEGREES), aspect,
+        )
+        return pt
 
     def _resolve_cell(self, mx, my):
         if mx >= self.primary_w:
@@ -212,7 +249,10 @@ class Editor:
                 if ch.isprintable():
                     self._nickname_buffer = (self._nickname_buffer + ch)[:32]
             elif event.type == pygame.KEYDOWN:
+                self._scan_down.add(event.scancode)
                 self._handle_keydown(event)
+            elif event.type == pygame.KEYUP:
+                self._scan_down.discard(event.scancode)
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 self._handle_mousedown(event)
             elif event.type == pygame.MOUSEBUTTONUP:
@@ -221,14 +261,72 @@ class Editor:
                     pygame.mouse.set_visible(True)
                     pygame.event.set_grab(False)
                 elif event.button == 1:
+                    self.repeat_action = None
+                    self._end_drag()
                     self.painting = False
             elif event.type == pygame.MOUSEWHEEL:
                 mx, my = pygame.mouse.get_pos()
-                if mx >= self.primary_w:
+                if self.show_help:
+                    self.help_scroll = max(0, getattr(self, "help_scroll", 0) - event.y * 44)
+                elif mx >= self.primary_w:
                     self.panel.scroll(event.y, self.window_h)
+                elif self.hover_cell is not None:
+                    if pygame.key.get_mods() & pygame.KMOD_CTRL:
+                        self._raise_hovered(event.y)
+                    else:
+                        step = self._rotate_step()
+                        self._rotate_hovered(step if event.y > 0 else -step)
             elif event.type == pygame.MOUSEMOTION:
-                if self.painting and self.panel.current_tool in ("wall", "floor"):
+                if self.gizmo_handle is not None:
+                    self._gizmo_drag(*event.pos)
+                elif self.painting and self.panel.current_tool in ("wall", "window", "bars", "floor"):
                     self._paint_at(*event.pos)
+
+    def _hovered_item(self):
+        idx = self._hover_furn_index
+        if idx is not None and idx < len(self.model.furniture):
+            return self.model.furniture[idx]
+        item = self._selected_item()
+        if item is not None:
+            return item
+        if self.hover_cell is not None:
+            return self.model.furniture_at(*self.hover_cell)
+        return None
+
+    HEIGHT_STEP = 0.05
+
+    def _raise_hovered(self, dir_):
+        item = self._hovered_item()
+        if item is None:
+            return
+        if not self.model.hangs(item[0]):
+            self._set_message(i18n.t("editor.msg.height_fixed"), True)
+            return
+        self.model.set_hanging_height(
+            item, float(item[3]) + self.HEIGHT_STEP * (1 if dir_ > 0 else -1))
+        self._set_message(i18n.t("editor.msg.height", z=("%.2f" % float(item[3]))))
+        self._mark_dirty()
+
+    def _rotate_hovered(self, step):
+        item = self._hovered_item()
+        if item is None:
+            return
+        if not self.model.turns(item[0]):
+            self._set_message(i18n.t("editor.msg.no_turn_wall"), True)
+            return
+        if self._alt_held():
+            want = round((float(item[4]) + step) / (math.pi / 2)) * (math.pi / 2)
+            step = want - float(item[4])
+        self.model.rotate_entry(item, step)
+        self._mark_dirty()
+
+    ROTATE_COARSE = math.pi / 2
+    ROTATE_FINE = math.radians(15.0)
+
+    def _rotate_step(self):
+        mods = pygame.key.get_mods()
+        step = self.ROTATE_FINE if mods & pygame.KMOD_SHIFT else self.ROTATE_COARSE
+        return -step if mods & pygame.KMOD_CTRL else step
 
     def _handle_keydown(self, event):
         if self.prompting_nickname:
@@ -261,16 +359,478 @@ class Editor:
         if event.key == pygame.K_ESCAPE:
             if self.testing_floor is not None:
                 self._exit_test_floor()
+            elif self.panel.gizmo_mode == "magnet" and self.selection:
+                self.selection = []
+                self._set_message(i18n.t("editor.msg.magnet_cleared"))
+            elif self.selected_entry is not None and self.panel.gizmo_mode != "cursor":
+                self.selected_entry = None
+                self.selection = []
             else:
                 self.running = False
             return
+        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and self.panel.gizmo_mode == "magnet":
+            self._handle_panel_action("magnet")
+            return
+        modes = {pygame.KSCAN_Q: "cursor", pygame.KSCAN_W: "move",
+                 pygame.KSCAN_E: "turn", pygame.KSCAN_M: "magnet"}
+        if event.scancode in modes and not self.looking:
+            self._set_gizmo_mode(modes[event.scancode])
+            return
+        if pygame.K_1 <= event.key <= pygame.K_9:
+            tools = panel_mod._tools_for(self.editor_mode == "zone",
+                                          getattr(self.model, "kind", None))
+            idx = event.key - pygame.K_1
+            if idx < len(tools):
+                self.panel.current_tool = tools[idx]
+                self._set_message(i18n.t("editor.msg.tool_picked",
+                                          tool=i18n.t("editor.tool.%s" % tools[idx])))
+            return
         if self.hover_cell is not None:
-            if event.key == pygame.K_r:
-                self.model.rotate_furniture(*self.hover_cell)
-                self._mark_dirty()
+            if event.scancode == pygame.KSCAN_R:
+                self._rotate_hovered(self._rotate_step())
             elif event.key in (pygame.K_DELETE, pygame.K_BACKSPACE):
-                self.model.remove_furniture(*self.hover_cell)
+                item = self._hovered_item()
+                if item is not None:
+                    self.model.remove_entry(item)
+                else:
+                    self.model.remove_furniture(*self.hover_cell)
                 self._mark_dirty()
+
+    DRAG_SLOP = 0.12
+
+    REPEAT_DELAY = 0.38
+    REPEAT_EVERY = 0.07
+
+    def _tick_repeat(self):
+        if self.repeat_action is None:
+            return
+        now = time.time()
+        if now < self.repeat_at:
+            return
+        self.repeat_at = now + self.REPEAT_EVERY
+        self._handle_panel_action(self.panel.apply_action(self.repeat_action, self.model))
+
+    GIZMO_ARM = 0.62
+    GIZMO_RING = 0.70
+    GIZMO_ZARM = 0.50
+    GIZMO_PICK_PX = 18
+    GIZMO_RING_PX = 12
+
+    def _furniture_props(self):
+        out = []
+        for i, f in enumerate(self.model.furniture):
+            kind, x, y, z, facing = furn_entry(f)
+            out.append((i, kind, x + PAD, y + PAD, z, facing))
+        return out
+
+    @staticmethod
+    def _ray_box(origin, direction, cx, cy, z0, z1, hd, hw, facing):
+        c, sn = math.cos(-facing), math.sin(-facing)
+        ox, oy = origin[0] - cx, origin[1] - cy
+        lx = ox * c - oy * sn
+        ly = ox * sn + oy * c
+        dx = direction[0] * c - direction[1] * sn
+        dy = direction[0] * sn + direction[1] * c
+        lo, hi = 0.0, 1e9
+        for p, d, half_lo, half_hi in ((lx, dx, -hd, hd), (ly, dy, -hw, hw),
+                                        (origin[2], direction[2], z0, z1)):
+            if abs(d) < 1e-9:
+                if p < half_lo or p > half_hi:
+                    return None
+                continue
+            t0, t1 = (half_lo - p) / d, (half_hi - p) / d
+            if t0 > t1:
+                t0, t1 = t1, t0
+            lo, hi = max(lo, t0), min(hi, t1)
+            if lo > hi:
+                return None
+        return lo if lo > 0.0 else None
+
+    def _cam(self):
+        aspect = self.renderer.low_w / self.renderer.low_h
+        return (self.primary_w, self.window_h, self.camera.eye, self.camera.yaw,
+                self.camera.pitch, math.radians(FOV_DEGREES), aspect)
+
+    def _to_screen(self, p):
+        if self.view_mode == "grid":
+            return self.grid.screen_of(p[0] - PAD, p[1] - PAD, self.model)
+        return world_to_screen(p, *self._cam())
+
+    def _plane_point(self, mx, my, z):
+        if self.view_mode == "grid":
+            pt = self.grid.point_at(mx, my, self.model)
+            return None if pt is None else (pt[0] + PAD, pt[1] + PAD)
+        if mx >= self.primary_w:
+            return None
+        return ray_floor_point(mx, my, *self._cam(), plane_z=z)
+
+    def _pick_furniture(self, mx, my):
+        if mx >= self.primary_w:
+            return None
+        if self.view_mode == "grid":
+            pt = self.grid.point_at(mx, my, self.model)
+            if pt is None:
+                return None
+            item = self.model.piece_at_point(pt[0], pt[1])
+            if item is None:
+                return None
+            return next(i for i, f in enumerate(self.model.furniture) if f is item)
+        origin, direction = screen_ray(mx, my, *self._cam())
+        best = None
+        for i, kind, x, y, z0, facing in self._furniture_props():
+            spec = PROP_DEFS[kind]
+            grab = 0.04
+            t = self._ray_box(origin, direction, x, y, z0 - grab,
+                              z0 + spec["height"] + grab,
+                              spec["hd"] + grab, spec["hw"] + grab, facing)
+            if t is None:
+                continue
+            key = (-z0, t)
+            if best is None or key < best[0]:
+                best = (key, i)
+        return None if best is None else best[1]
+
+    def _selected_item(self):
+        entry = self.selected_entry
+        if entry is None:
+            return None
+        for e in self.model.furniture:
+            if e is entry:
+                return entry
+        self.selected_entry = None
+        return None
+
+    def _furn_world_pos(self, item):
+        return float(item[1]) + PAD, float(item[2]) + PAD
+
+    @staticmethod
+    def _alt_held():
+        return bool(pygame.key.get_mods() & pygame.KMOD_ALT)
+
+    @staticmethod
+    def _shift_held():
+        return bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+
+    def _set_gizmo_mode(self, mode):
+        self.panel.gizmo_mode = mode
+        if mode != "cursor":
+            self.panel.current_tool = "furniture"
+        self.gizmo_handle = None
+        self._set_message(i18n.t("editor.gizmo.%s" % mode))
+
+    GIZMO_REF_DIST = 3.2
+
+    def _gizmo_scale(self, item):
+        if self.view_mode == "grid":
+            return 1.0
+        px, py = self._furn_world_pos(item)
+        ex, ey, ez = self.camera.eye
+        d = math.sqrt((px - ex) ** 2 + (py - ey) ** 2 + (float(item[3]) - ez) ** 2)
+        return max(0.6, min(3.0, d / self.GIZMO_REF_DIST))
+
+
+    def _gizmo_handles(self, item):
+        kind = item[0]
+        if self.model.docked(kind):
+            return {}
+        px, py = self._furn_world_pos(item)
+        z = float(item[3]) + 0.03
+        k = self._gizmo_scale(item)
+        arm = self.GIZMO_ARM * k
+        if PROP_DEFS[kind]["wall_mounted"]:
+            ax, ay = self.model.wall_axis(item)
+            out = {"along": (px + ax * arm, py + ay * arm, z),
+                   "along-": (px - ax * arm, py - ay * arm, z)}
+            if self.model.hangs(kind):
+                out["z"] = (px, py, z + PROP_DEFS[kind]["height"] + self.GIZMO_ZARM * k)
+            return out
+        d = arm * 0.62
+        return {"x": (px + arm, py, z), "y": (px, py + arm, z),
+                "xy": (px + d, py + d, z), "free": (px, py, z)}
+
+    def _handle_under_cursor(self, mx, my):
+        item = self._selected_item()
+        mode = self.panel.gizmo_mode
+        if item is None or mode not in ("move", "turn") or mx >= self.primary_w:
+            return None
+        if mode == "turn":
+            if not self.model.turns(item[0]):
+                return None
+            px, py = self._furn_world_pos(item)
+            z = float(item[3]) + 0.03
+            ring = self.GIZMO_RING * self._gizmo_scale(item)
+            best = None
+            n = 32
+            pts = [self._to_screen((px + math.cos(math.tau * i / n) * ring,
+                                    py + math.sin(math.tau * i / n) * ring, z))
+                   for i in range(n + 1)]
+            for a, b in zip(pts, pts[1:]):
+                if a is None or b is None:
+                    continue
+                d = _seg_dist(mx, my, a, b)
+                best = d if best is None else min(best, d)
+            return "turn" if best is not None and best <= self.GIZMO_RING_PX else None
+        best, best_d = None, self.GIZMO_PICK_PX
+        for name, p in self._gizmo_handles(item).items():
+            s = self._to_screen(p)
+            if s is None:
+                continue
+            d = math.hypot(s[0] - mx, s[1] - my)
+            if d <= best_d:
+                best, best_d = name, d
+        return best
+
+
+    def _gizmo_press(self, mx, my, cell):
+        mode = self.panel.gizmo_mode
+        item = self._selected_item()
+        if mode == "magnet":
+            idx = self._pick_furniture(mx, my)
+            if idx is None:
+                return
+            entry = self.model.furniture[idx]
+            if any(e is entry for e in self.selection):
+                self.selection = [e for e in self.selection if e is not entry]
+            else:
+                self.selection.append(entry)
+            self.selected_entry = entry
+            self._set_message(i18n.t("editor.msg.magnet_count", n=len(self.selection)))
+            return
+        handle = self._handle_under_cursor(mx, my)
+        if item is not None and handle is not None:
+            self._begin_drag(item, handle, mx, my)
+            return
+        idx = self._pick_furniture(mx, my)
+        if idx is None:
+            self.selected_furn = None
+            self._set_message(i18n.t("editor.msg.gizmo_pick"))
+            return
+        entry = self.model.furniture[idx]
+        self.selected_furn = (int(entry[1]), int(entry[2]))
+        if self._shift_held():
+            if any(e is entry for e in self.selection):
+                self.selection = [e for e in self.selection if e is not entry]
+            else:
+                self.selection.append(entry)
+        else:
+            self.selection = [entry]
+        self.selected_entry = entry
+        if mode == "move":
+            if self.model.docked(entry[0]):
+                self._set_message(i18n.t("editor.msg.docked_fixed"), True)
+                return
+            wall = PROP_DEFS[entry[0]]["wall_mounted"]
+            self._begin_drag(entry, "along" if wall else "free", mx, my)
+        elif mode == "turn":
+            if not self.model.turns(entry[0]):
+                self._set_message(i18n.t("editor.msg.no_turn_wall"), True)
+                return
+            self._begin_drag(entry, "turn", mx, my)
+
+    def _begin_drag(self, item, handle, mx, my):
+        self.gizmo_handle = handle
+        self._drag_riders = self.model.resting_on(item)
+        self._drag_z = float(item[3]) + 0.03
+        self._drag_moved = False
+        px, py = self._furn_world_pos(item)
+        pt = self._plane_point(mx, my, self._drag_z)
+        self.gizmo_grab = (0.0, 0.0) if pt is None else (px - pt[0], py - pt[1])
+        if handle == "turn":
+            a0 = 0.0 if pt is None else math.atan2(pt[1] - py, pt[0] - px)
+            self.gizmo_turn_from = (a0, float(item[4]))
+        elif handle == "z":
+            zc = ray_vertical_plane_z(mx, my, *self._cam(), px, py)
+            self._z_grab = 0.0 if zc is None else float(item[3]) - zc
+
+    def _end_drag(self):
+        item = self._selected_item()
+        if item is not None and self.gizmo_handle is not None and getattr(self, "_drag_moved", False):
+            self.model.settle(item, riders=getattr(self, "_drag_riders", None))
+            self._mark_dirty()
+        self.gizmo_handle = None
+        self._drag_riders = None
+
+    def _gizmo_drag(self, mx, my):
+        item = self._selected_item()
+        if item is None or self.gizmo_handle is None:
+            return
+        handle = self.gizmo_handle
+        riders = getattr(self, "_drag_riders", None)
+        px, py = self._furn_world_pos(item)
+        if handle == "z":
+            zc = ray_vertical_plane_z(mx, my, *self._cam(), px, py)
+            if zc is None:
+                return
+            want = zc + self._z_grab
+            if self._alt_held():
+                want = round(want / 0.05) * 0.05
+            if self.model.set_hanging_height(item, want):
+                self._drag_moved = True
+                self._mark_dirty()
+            return
+        pt = self._plane_point(mx, my, self._drag_z)
+        if pt is None:
+            return
+        gx, gy = self.gizmo_grab
+        if handle == "turn":
+            if math.hypot(pt[0] - px, pt[1] - py) < 0.08 * self._gizmo_scale(item):
+                return
+            a0, f0 = self.gizmo_turn_from
+            want = f0 + math.atan2(pt[1] - py, pt[0] - px) - a0
+            if self._alt_held():
+                want = round(want / (math.pi / 2)) * (math.pi / 2)
+            step = (want - float(item[4])) % math.tau
+            self.model.rotate_entry(item, step, riders=riders)
+            self._drag_moved = True
+            self._mark_dirty()
+            return
+        if handle in ("along", "along-"):
+            ax, ay = self.model.wall_axis(item)
+            t = (pt[0] + gx - px) * ax + (pt[1] + gy - py) * ay
+            want_x, want_y = px + ax * t, py + ay * t
+        elif handle == "xy":
+            step = ((pt[0] + gx - px) + (pt[1] + gy - py)) * 0.5
+            want_x, want_y = px + step, py + step
+        else:
+            want_x = pt[0] + gx if handle in ("x", "free") else px
+            want_y = pt[1] + gy if handle in ("y", "free") else py
+        if self._alt_held():
+            want_x = math.floor(want_x) + 0.5
+            want_y = math.floor(want_y) + 0.5
+        if self.model.move_entry(item, want_x - PAD, want_y - PAD, carry=True,
+                                 riders=riders, settle=False):
+            self.selected_furn = (int(item[1]), int(item[2]))
+            self._drag_moved = True
+            self._mark_dirty()
+
+
+    _GIZMO_X = (1.0, 0.25, 0.22)
+    _GIZMO_Y = (0.35, 0.95, 0.40)
+    _GIZMO_FREE = (1.0, 0.85, 0.25)
+    _GIZMO_XY = (1.0, 0.62, 0.20)
+    _GIZMO_TURN = (0.35, 0.72, 1.0)
+    _GIZMO_Z = (0.40, 0.60, 1.0)
+    _GIZMO_WALL = (1.0, 0.55, 0.85)
+    _GIZMO_PICKED = (0.35, 1.0, 0.85)
+
+    def _draw_furniture_marks(self):
+        hover = self._hover_furn_index
+        chosen = self._selected_item()
+        if hover is None and chosen is None and not self.selection:
+            return
+        ctx = self.renderer.ctx
+        ctx.disable(moderngl.DEPTH_TEST)
+        try:
+            self._draw_marks_inner(hover, chosen)
+        finally:
+            ctx.enable(moderngl.DEPTH_TEST)
+
+    def _draw_marks_inner(self, hover, chosen):
+        magnet = self.panel.gizmo_mode == "magnet"
+        for i, kind, x, y, z0, facing in self._furniture_props():
+            f = self.model.furniture[i]
+            is_chosen = chosen is not None and f is chosen
+            in_sel = any(f is e for e in self.selection)
+            if i != hover and not is_chosen and not (in_sel and (magnet or len(self.selection) > 1)):
+                continue
+            spec = PROP_DEFS[kind]
+            if in_sel and (magnet or len(self.selection) > 1):
+                color = self._GIZMO_PICKED
+            elif is_chosen:
+                color = self._GIZMO_FREE
+            else:
+                color = (0.55, 0.75, 0.95)
+            grow = 2.35 if i == hover else 2.2
+            self.renderer._draw_box(
+                gm.translate(x, y, max(0.015, z0 - 0.01)) @ gm.rotate_z(facing)
+                @ gm.scale(spec["hd"] * grow, spec["hw"] * grow, 0.03),
+                color, emissive=1.0, vao=self.renderer.box_vao)
+
+    def _selected_draw_info(self):
+        item = self._selected_item()
+        if item is None:
+            return None
+        px, py = self._furn_world_pos(item)
+        return px, py, float(item[3])
+
+    GHOST_COLOR = (1.0, 0.85, 0.25)
+
+    def _draw_place_ghost(self):
+        mx, my = pygame.mouse.get_pos()
+        pt = self._resolve_point(mx, my)
+        if pt is None:
+            return False
+        kind = self.panel.current_furniture_kind
+        px, py = pt[0] - PAD, pt[1] - PAD
+        if self._alt_held():
+            px, py = math.floor(px) + 0.5, math.floor(py) + 0.5
+        want = self.model.preview_place(kind, px, py)
+        if want is None:
+            return False
+        spec = PROP_DEFS[kind]
+        _k, gx, gy, gz, gf = furn_entry(want)
+        model = (gm.translate(gx + PAD, gy + PAD, gz)
+                 @ gm.rotate_z(gf)
+                 @ gm.scale(spec["hd"] * 2, spec["hw"] * 2, spec["height"]))
+        vao = self.renderer.prop_vaos.get(kind, self.renderer.box_vao)
+        self.renderer._draw_box(model, self.GHOST_COLOR, emissive=1.0, vao=vao)
+        return True
+
+    def _draw_gizmo(self):
+        item = self._selected_item()
+        if (item is None or self.panel.gizmo_mode not in ("move", "turn")
+                or self.testing_floor is not None):
+            return
+        ctx = self.renderer.ctx
+        ctx.disable(moderngl.DEPTH_TEST)
+        try:
+            self._draw_gizmo_shapes(item)
+        finally:
+            ctx.enable(moderngl.DEPTH_TEST)
+
+    def _draw_gizmo_shapes(self, item):
+        box = self.renderer.box_vao
+        live = self.gizmo_handle or self.gizmo_hover
+
+        def lit(color, on):
+            return tuple(min(1.0, c * 0.55 + 0.55) for c in color) if on else color
+
+        def cube(x, y, z, s, color, on=False):
+            k = 1.45 if on else 1.0
+            self.renderer._draw_box(gm.translate(x, y, z) @ gm.scale(s * k, s * k, s * 0.7 * k),
+                                    lit(color, on), emissive=1.0, vao=box)
+
+        def rod(a, b, color, on, n=7, s=0.045):
+            for i in range(n):
+                t = (i + 1) / (n + 1.0)
+                cube(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t,
+                     a[2] + (b[2] - a[2]) * t, s, color, on)
+
+        px, py = self._furn_world_pos(item)
+        z = float(item[3]) + 0.03
+        k = self._gizmo_scale(item)
+        if self.panel.gizmo_mode == "turn":
+            if not self.model.turns(item[0]):
+                return
+            on = live == "turn"
+            n = 24
+            ring = self.GIZMO_RING * k
+            for i in range(n):
+                a = math.tau * i / n
+                cube(px + math.cos(a) * ring, py + math.sin(a) * ring, z, 0.075 * k,
+                     self._GIZMO_TURN, on)
+            cube(px, py, z, 0.09 * k, self._GIZMO_FREE)
+            return
+        centre = (px, py, z)
+        colours = {"x": self._GIZMO_X, "y": self._GIZMO_Y, "xy": self._GIZMO_XY,
+                   "free": self._GIZMO_FREE, "along": self._GIZMO_WALL,
+                   "along-": self._GIZMO_WALL, "z": self._GIZMO_Z}
+        for name, p in self._gizmo_handles(item).items():
+            on = live == name or (live in ("along", "along-") and name in ("along", "along-"))
+            col = colours[name]
+            if name != "free":
+                rod(centre, p, col, on, s=0.045 * k)
+            cube(p[0], p[1], p[2], (0.11 if name != "free" else 0.10) * k, col, on)
 
     def _paint_at(self, mx, my):
         cell = self._resolve_cell(mx, my)
@@ -320,6 +880,10 @@ class Editor:
         if event.button != 1:
             return
         if mx >= self.primary_w:
+            hit = self.panel.action_at(mx - self.primary_w, my)
+            if hit in panel_mod.REPEATABLE_ACTIONS:
+                self.repeat_action = hit
+                self.repeat_at = time.time() + self.REPEAT_DELAY
             action = self.panel.handle_click(mx - self.primary_w, my, self.model, self.view_mode,
                                               self.natural_color, self.testing_floor, self.editor_mode,
                                               self.mode == "dev")
@@ -327,16 +891,26 @@ class Editor:
             return
         if self.testing_floor is not None:
             return
+        if self.panel.gizmo_mode != "cursor" and self.panel.current_tool == "furniture":
+            self._gizmo_press(mx, my, None)
+            return
         cell = self._resolve_cell(mx, my)
         if cell is None:
             return
         x, y = cell
         tool = self.panel.current_tool
-        if tool == "wall":
+        if tool in ("wall", "window", "bars", "brick"):
             if self.editor_mode == "zone" and self.model.on_border(x, y):
                 self._set_message(i18n.t("editor.msg.zone_border_fixed"), True)
                 return
-            self.paint_value = S.WALL_SHED if self.editor_mode == "zone" else S.WALL_CONCRETE
+            if tool == "window":
+                self.paint_value = S.WALL_WINDOW
+            elif tool == "bars":
+                self.paint_value = S.WALL_BARS
+            elif tool == "brick":
+                self.paint_value = S.WALL_BRICK
+            else:
+                self.paint_value = S.WALL_SHED if self.editor_mode == "zone" else S.WALL_CONCRETE
             self.painting = True
             self.model.set_cell(x, y, self.paint_value)
             self._mark_dirty()
@@ -352,18 +926,27 @@ class Editor:
             else:
                 self._set_message(i18n.t("editor.msg.no_interior_door"), True)
         elif tool == "door":
-            scope = self.panel.current_door_scope
-            if self.model.click_door(x, y, kind=self.panel.current_door_kind, scope=scope):
+            if self.model.click_door(x, y, kind=self.panel.current_door_kind):
                 self._mark_dirty()
             else:
                 side = self.model.side_of_border_cell(x, y)
-                if side is not None and scope == "link" and side in self.model.doors:
+                if side is not None and side in self.model.doors:
                     self._set_message(i18n.t("editor.msg.door_side_taken"), True)
                 else:
                     self._set_message(i18n.t("editor.msg.no_door_here"), True)
         elif tool == "furniture":
-            ok = self.model.place_furniture(self.panel.current_furniture_kind, x, y)
-            if ok:
+            if self.panel.gizmo_mode != "cursor":
+                self._gizmo_press(mx, my, (x, y))
+                return
+            pt = self._resolve_point(mx, my)
+            px = (pt[0] - PAD) if pt else (x + 0.5)
+            py = (pt[1] - PAD) if pt else (y + 0.5)
+            if self._alt_held():
+                px, py = math.floor(px) + 0.5, math.floor(py) + 0.5
+            ok = self.model.place_furniture(self.panel.current_furniture_kind, px, py)
+            if ok is not None:
+                self.selected_entry = ok
+                self.selection = [ok]
                 self._mark_dirty()
             elif PROP_DEFS[self.panel.current_furniture_kind]["wall_mounted"]:
                 self._set_message(i18n.t("editor.msg.wall_only_furniture"), True)
@@ -373,6 +956,19 @@ class Editor:
     def _handle_panel_action(self, action):
         if action is None:
             self._mark_dirty()
+            return
+        if action == "magnet":
+            picked = [e for e in self.selection if any(e is f for f in self.model.furniture)]
+            if len(picked) < 2:
+                self._set_message(i18n.t("editor.msg.magnet_none"), True)
+                return
+            n = self.model.magnet(picked)
+            self._set_message(i18n.t("editor.msg.magnet_done", n=n))
+            self._mark_dirty()
+            return
+        if action == "magnet_clear":
+            self.selection = []
+            self._set_message(i18n.t("editor.msg.magnet_cleared"))
             return
         if action == "toggle_view":
             self._toggle_view()
@@ -456,7 +1052,7 @@ class Editor:
             root.attributes("-topmost", True)
             path = filedialog.askopenfilename(
                 title=i18n.t("editor.ui.import_button"),
-                filetypes=[("Zip files", "*.zip")],
+                filetypes=[(i18n.t("editor.ui.zip_files"), "*.zip")],
             )
         finally:
             root.destroy()
@@ -537,15 +1133,16 @@ class Editor:
             self._set_message(i18n.t("editor.msg.upload_failed", error=err or "?"), True)
 
     def _enter_test_floor(self, index):
-        already_testing = self.testing_floor is not None
         spec = S.FLOOR_SPECS[index]
         seed = random.randrange(1 << 30)
+        self.test_seed = seed
         layout = spec.get("layout", "corridor")
         if layout == "yard":
             maze = Maze(w=S.YARD_W, h=S.YARD_H, seed=seed, layout="yard")
             props, panel_prop, exit_prop, monster_cell, doors = populate_yard(maze, spec, random.Random(seed ^ 0x5EED))
         else:
-            maze = Maze(seed=seed, wall_bias=spec["wall_bias"], template_floor=spec.get("floor_theme"))
+            maze = Maze(seed=seed, wall_bias=spec["wall_bias"], template_floor=spec.get("floor_theme"),
+                        room_count_range=spec.get("room_count"))
             props, panel_prop, exit_prop, monster_cell, doors = populate_level(maze, spec, random.Random(seed ^ 0x5EED))
 
         self.testing_floor = index
@@ -558,8 +1155,6 @@ class Editor:
         )
         self.renderer.build_level(maze, theme=spec.get("floor_theme", "upper"))
         self.view_mode = "camera"
-        if not already_testing:
-            self.natural_color = True
         sx, sy = maze.start
         self.camera.x, self.camera.y, self.camera.z = sx, sy, 2.4
         self.camera.yaw = math.pi / 4
@@ -579,13 +1174,16 @@ class Editor:
         return (self.primary_w // 2, self.window_h // 2)
 
     def _update_camera(self, dt):
-        keys = pygame.key.get_pressed()
+        sd = self._scan_down
+        if not self.looking:
+            self.camera.update(dt, {}, sprint=False)
+            return
         move = {
-            "forward": keys[pygame.K_w], "back": keys[pygame.K_s],
-            "left": keys[pygame.K_a], "right": keys[pygame.K_d],
-            "up": keys[pygame.K_SPACE], "down": keys[pygame.K_LCTRL],
+            "forward": pygame.KSCAN_W in sd, "back": pygame.KSCAN_S in sd,
+            "left": pygame.KSCAN_A in sd, "right": pygame.KSCAN_D in sd,
+            "up": pygame.KSCAN_SPACE in sd, "down": pygame.KSCAN_LCTRL in sd,
         }
-        self.camera.update(dt, move, sprint=keys[pygame.K_LSHIFT])
+        self.camera.update(dt, move, sprint=pygame.KSCAN_LSHIFT in sd)
 
         if self.looking:
             cx, cy = self._look_center()
@@ -631,6 +1229,7 @@ class Editor:
             self.camera.yaw = math.atan2(cy - self.camera.y, cx - self.camera.x)
             self.camera.pitch = -0.05
             self._fake_player.x, self._fake_player.y = self.camera.x, self.camera.y
+            self._fake_player.peek_x, self._fake_player.peek_y = self._fake_player.x, self._fake_player.y
             self._fake_player.angle = self.camera.yaw
             self._fake_player.pitch = self.camera.pitch
             self._fake_player.bob_phase = 0.0
@@ -653,6 +1252,7 @@ class Editor:
 
     def _draw(self):
         self._fake_player.x, self._fake_player.y = self.camera.x, self.camera.y
+        self._fake_player.peek_x, self._fake_player.peek_y = self._fake_player.x, self._fake_player.y
         self._fake_player.angle = self.camera.yaw
         self._fake_player.pitch = self.camera.pitch
         self._fake_player.bob_phase = 0.0
@@ -680,16 +1280,23 @@ class Editor:
             sx, sy = self._test_spawn
             model = gm.translate(sx, sy, 0.0) @ gm.scale(0.14, 0.14, 1.7)
             self.renderer._draw_box(model, (0.35, 1.0, 0.55), emissive=1.0, vao=self.renderer.box_vao)
+        elif self.panel.gizmo_mode != "cursor":
+            self._draw_furniture_marks()
+        elif self.panel.current_tool == "furniture" and self._draw_place_ghost():
+            pass
         elif self.hover_cell is not None:
             hx, hy = self.hover_cell[0] + PAD, self.hover_cell[1] + PAD
             model = gm.translate(hx + 0.5, hy + 0.5, 0.02) @ gm.scale(0.92, 0.92, 0.03)
             color = (1.0, 0.85, 0.2) if self.panel.current_tool == "furniture" else \
                     (0.3, 0.8, 1.0) if self.panel.current_tool == "door" else (1.0, 0.3, 0.3)
             self.renderer._draw_box(model, color, emissive=1.0, vao=self.renderer.box_vao)
+        self._draw_gizmo()
 
+        self.panel.magnet_count = sum(
+            1 for e in self.selection if any(e is f for f in self.model.furniture))
         panel_surf = pygame.Surface((self.panel.width, self.window_h), pygame.SRCALPHA)
         self.panel.draw(panel_surf, self.model, self.view_mode, self.natural_color, self.testing_floor,
-                         self.editor_mode, self.mode == "dev")
+                         self.editor_mode, self.mode == "dev", getattr(self, "test_seed", None))
 
         hud_surf = pygame.Surface((self.window_w, self.window_h), pygame.SRCALPHA)
         if not testing and self.view_mode == "grid":
@@ -753,27 +1360,90 @@ class Editor:
         sub = self._msg_font.render(i18n.t("editor.ui.help_close_hint"), True, (140, 135, 130))
         hud_surf.blit(sub, sub.get_rect(center=(cx, 78)))
 
-        col_w = min(560, self.window_w // 2 - 60)
+        col_w = min(620, self.window_w // 2 - 60)
         col_x = (cx - col_w - 30, cx + 30)
-        col_y = [104, 104]
-        col = 0
+        top, line_h, head_h, gap = 104, 22, 28, 16
+        blocks = []
         for header, lines in self._help_sections():
-            needed = 30 + len(lines) * 22 + 14
-            if col_y[col] + needed > self.window_h - 20 and col == 0:
-                col = 1
-            x, y = col_x[col], col_y[col]
-            head_surf = self._msg_font.render(header, True, (205, 120, 100))
-            hud_surf.blit(head_surf, (x, y))
-            y += 28
-            for line in lines:
-                line_surf = self._help_font.render(line, True, (205, 198, 190))
-                hud_surf.blit(line_surf, (x, y))
-                y += 22
-            col_y[col] = y + 16
+            wrapped = [w for para in self._reflow_help(lines)
+                       for w in self._wrap_help(para, col_w)]
+            blocks.append((header, wrapped, head_h + len(wrapped) * line_h + gap))
+        total = sum(b[2] for b in blocks)
+        split, run = len(blocks), 0
+        for i, b in enumerate(blocks):
+            if run + b[2] / 2.0 > total / 2.0:
+                split = max(1, i)
+                break
+            run += b[2]
+        cols = (blocks[:split], blocks[split:])
+        tallest = max(sum(b[2] for b in c) for c in cols)
+        room = self.window_h - top - 20
+        self.help_scroll = max(0, min(max(0, tallest - room), getattr(self, "help_scroll", 0)))
+        clip = hud_surf.get_clip()
+        hud_surf.set_clip(pygame.Rect(0, top - 4, self.window_w, room + 8))
+        for ci, column in enumerate(cols):
+            x, y = col_x[ci], top - self.help_scroll
+            for header, wrapped, _h in column:
+                hud_surf.blit(self._msg_font.render(header, True, (205, 120, 100)), (x, y))
+                y += head_h
+                for line in wrapped:
+                    if line:
+                        hud_surf.blit(self._help_font.render(line, True, (205, 198, 190)), (x, y))
+                    y += line_h
+                y += gap
+        hud_surf.set_clip(clip)
+        if tallest > room:
+            more = self._msg_font.render(i18n.t("editor.ui.help_scroll"), True, (140, 135, 130))
+            hud_surf.blit(more, more.get_rect(center=(cx, self.window_h - 12)))
+
+    @staticmethod
+    def _reflow_help(lines):
+        out, cur = [], ""
+        for line in lines:
+            line = line.strip()
+            if not line:
+                if cur:
+                    out.append(cur)
+                    cur = ""
+                out.append("")
+                continue
+            cur = line if not cur else cur + " " + line
+            if cur[-1] in ".:!?)":
+                out.append(cur)
+                cur = ""
+        if cur:
+            out.append(cur)
+        return out
+
+    def _wrap_help(self, text, width):
+        if not text.strip():
+            return [""]
+        words, out, cur = text.split(" "), [], ""
+        for word in words:
+            trial = word if not cur else cur + " " + word
+            if self._help_font.size(trial)[0] <= width:
+                cur = trial
+            else:
+                if cur:
+                    out.append(cur)
+                cur = word
+        if cur:
+            out.append(cur)
+        return out
+
+    MESSAGE_SECONDS = 3.5
+    MESSAGE_SECONDS_ERROR = 8.0
+    MESSAGE_FADE = 0.7
 
     def _draw_message(self, hud_surf):
         if not self.message:
             return
+        total = self.MESSAGE_SECONDS_ERROR if self.message_is_error else self.MESSAGE_SECONDS
+        age = time.time() - self.message_time
+        if age >= total:
+            self.message = ""
+            return
+        fade = min(1.0, max(0.0, (total - age) / self.MESSAGE_FADE))
         color = (255, 130, 110) if self.message_is_error else (225, 225, 230)
         max_w = self.window_w - 80
         words = self.message.split(" ")
@@ -796,6 +1466,8 @@ class Editor:
         for i, line in enumerate(lines):
             txt = self._msg_font.render(line, True, color)
             box.blit(txt, ((self.window_w - txt.get_width()) // 2, 12 + i * line_h))
+        if fade < 1.0:
+            box.set_alpha(int(255 * fade))
         hud_surf.blit(box, (0, self.window_h - box_h - 16))
 
     def _composite(self, hud_rgba_bytes):
