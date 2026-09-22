@@ -21,11 +21,14 @@ Created by: **Lonewolf239**
 ## 🌟 Features
 
 - **Your microphone is part of the level.** `MicListener` samples real ambient noise while you play — cough, bump your desk, or talk too loudly near a hiding spot, and the creature will hear it exactly like an in-game sound.
-- **A creature that actually thinks.** Four behavioral states (`Patrol`, `Investigate`, `Stalk`, `Hunt`), sight memory, muffled hearing through walls and doors, door-breaking, and locker searches when it's certain you're close.
+- **A creature that actually thinks.** Four behavioral states (`Patrol`, `Investigate`, `Stalk`, `Hunt`), sight memory, hearing that fades with every wall between you, a search that widens the longer it loses you, door-breaking, and a habit of glancing into lockers as it passes. Your flashlight is not a range bonus for it — it is a clue.
+- **Light is the game.** Every lamp, your flashlight and the moon cast real shadows with soft edges. What you see on screen and what the creature can see are computed by the same lighting model, so a dark corner really does hide you. Lamps flicker, and many of them no longer work at all.
+- **Windows.** Rooms look into each other and out onto the grounds. The creature can see you through the glass too — just not as well.
+- **A map you draw yourself.** There is no automap. Find a clipboard, then sketch the floor as you learn it with pencils you scavenge along the way — and they run out.
 - **Sanity under pressure.** Darkness and proximity to the threat drain your sanity, triggering panic effects, a racing heartbeat, and hallucinations once it drops low enough. Sprinting buys distance but burns limited stamina.
 - **Fully procedural audio.** Ambient drones, heartbeats, footsteps, and the creature's own sounds are synthesized from raw waveforms (sine waves, filtered noise) at runtime — no sound library, no recorded stock effects.
-- **Three distinct stages**, connected through a hub: the hospital's upper floor (find the fuses), the basement (find the valves), and an outdoor yard (find the bolt cutters) — each with its own layout generator, visual theme, and pacing.
-- **Community room editor.** A built-in editor lets you design your own rooms and yard zones and submit them straight from the game; approved submissions can be folded into future levels.
+- **Three stages, no loading screens.** The hospital's upper floor (restore the power: find the fuses), the basement (find the valve keys), and the outdoor yard (find the keys to the shed, take the bolt cutters, cut through the fence). You ride the elevator down and climb out through the hatch — every transition happens in the world. Each floor is generated from hand-built rooms grouped into wings with their own character, and the building does not always stay the way it was built.
+- **Community room editor.** A built-in editor lets you design your own rooms and yard zones and submit them straight from the game; approved submissions can be folded into future levels. Furniture goes anywhere and at any angle, stacks on other furniture, snaps to walls, and lines up with a magnet.
 - **Five languages** out of the box: English, Russian, Spanish, French, and German.
 
 ---
@@ -52,26 +55,37 @@ The game checks GitHub Releases for updates on startup and can download and inst
 | :--- | :--- |
 | **W, A, S, D** | Movement |
 | **Shift** | Sprint (drains stamina, very loud) |
-| **Ctrl** | Crouch (silent movement, lets you take cover and peek) |
-| **F** | Toggle flashlight (drains battery, attracts the creature) |
+| **Ctrl** | Crouch (silent movement, lets you take cover) |
+| **LMB / RMB** | Lean left / right (peek around corners) |
+| **F** | Toggle flashlight (drains battery, gives you away) |
 | **E** | Interact (open doors, hide in lockers, pick up items) |
+| **R** | Lock / unlock a door |
+| **Tab** | Take out the map — then **RMB** to start drawing and **LMB** to draw |
+| **Q** (hold) | Status: battery, objectives |
 | **Mouse** | Look |
+
+Every key can be rebound in the settings.
 
 ---
 
 ## 🛠 Development Status
 
-Current version: **ALPHA_2**
+Current version: **ALPHA_3**
 
 **Implemented:**
 - [x] Full player controller — walking, sprinting, crouching, peeking, and hiding.
-- [x] Multi-state creature AI with sight memory, muffled hearing, and door-breaking.
+- [x] Multi-state creature AI with sight memory, hearing through walls, a widening search, and door-breaking.
 - [x] Real-microphone integration (`sounddevice` / `parec`).
 - [x] Sanity system with panic effects and hallucinations.
-- [x] Three procedurally laid out stages plus a connecting hub.
-- [x] In-game room and yard-zone editor, with community submission and an auto-updater.
+- [x] One lighting model for every light source, with real soft shadows, shared by the renderer and the creature's eyes.
+- [x] Windows between rooms and out onto the grounds.
+- [x] A hand-drawn map with a limited supply of pencils.
+- [x] Three procedurally laid out stages joined by in-world transitions, and reworked endings.
+- [x] In-game room and yard-zone editor with free furniture placement, community submission, and an auto-updater.
 - [x] Custom procedural sound engine.
 - [x] Localization in 5 languages.
+
+**Next — BETA_1:** the story. The hospital has a past, and the next release is about finding out what it is.
 
 ---
 
