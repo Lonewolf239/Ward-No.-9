@@ -18,31 +18,51 @@ def trs_z(x, y, z, theta, sx, sy, sz):
 
 
 def translate(x, y, z):
-    m = np.eye(4)
-    m[0, 3], m[1, 3], m[2, 3] = x, y, z
-    return m
+    return np.array((
+        (1.0, 0.0, 0.0, x),
+        (0.0, 1.0, 0.0, y),
+        (0.0, 0.0, 1.0, z),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
 
 
 def scale(sx, sy, sz):
-    m = np.eye(4)
-    m[0, 0], m[1, 1], m[2, 2] = sx, sy, sz
-    return m
+    return np.array((
+        (sx, 0.0, 0.0, 0.0),
+        (0.0, sy, 0.0, 0.0),
+        (0.0, 0.0, sz, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
 
 
 def rotate_z(theta):
-    c, s = np.cos(theta), np.sin(theta)
-    m = np.eye(4)
-    m[0, 0], m[0, 1] = c, -s
-    m[1, 0], m[1, 1] = s, c
-    return m
+    c, s = math.cos(theta), math.sin(theta)
+    return np.array((
+        (c, -s, 0.0, 0.0),
+        (s, c, 0.0, 0.0),
+        (0.0, 0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
+
+
+def rotate_x(theta):
+    c, s = math.cos(theta), math.sin(theta)
+    return np.array((
+        (1.0, 0.0, 0.0, 0.0),
+        (0.0, c, -s, 0.0),
+        (0.0, s, c, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    ), dtype="f4")
 
 
 def rotate_y(theta):
-    c, s = np.cos(theta), np.sin(theta)
-    m = np.eye(4)
-    m[0, 0], m[0, 2] = c, s
-    m[2, 0], m[2, 2] = -s, c
-    return m
+    c, s = math.cos(theta), math.sin(theta)
+    return np.array((
+        (c, 0.0, s, 0.0),
+        (0.0, 1.0, 0.0, 0.0),
+        (-s, 0.0, c, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
 
 
 def perspective(fovy, aspect, near, far):
@@ -56,26 +76,44 @@ def perspective(fovy, aspect, near, far):
     return m
 
 
-def view_matrix(eye, yaw, pitch):
-    cy, sy = np.cos(yaw), np.sin(yaw)
-    cp, sp = np.cos(pitch), np.sin(pitch)
-    forward = np.array([cy * cp, sy * cp, sp])
-    world_up = np.array([0.0, 0.0, 1.0])
-    right = np.cross(forward, world_up)
-    rn = np.linalg.norm(right)
-    right = right / rn if rn > 1e-8 else np.array([1.0, 0.0, 0.0])
-    up = np.cross(right, forward)
+def orthographic(left, right, bottom, top, near, far):
+    m = np.eye(4)
+    m[0, 0] = 2.0 / (right - left)
+    m[1, 1] = 2.0 / (top - bottom)
+    m[2, 2] = -2.0 / (far - near)
+    m[0, 3] = -(right + left) / (right - left)
+    m[1, 3] = -(top + bottom) / (top - bottom)
+    m[2, 3] = -(far + near) / (far - near)
+    return m
 
-    screen_right = -right
+
+def view_matrix(eye, yaw, pitch, roll=0.0):
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    fx, fy, fz = cy * cp, sy * cp, sp
+    rx, ry, rz = fy * 1.0 - fz * 0.0, fz * 0.0 - fx * 1.0, fx * 0.0 - fy * 0.0
+    rn = math.sqrt(rx * rx + ry * ry + rz * rz)
+    if rn > 1e-8:
+        rx, ry, rz = rx / rn, ry / rn, rz / rn
+    else:
+        rx, ry, rz = 1.0, 0.0, 0.0
+    ux, uy, uz = ry * fz - rz * fy, rz * fx - rx * fz, rx * fy - ry * fx
+
+    if roll:
+        cr, sr = math.cos(roll), math.sin(roll)
+        rx, ry, rz, ux, uy, uz = (rx * cr + ux * sr, ry * cr + uy * sr, rz * cr + uz * sr,
+                                  -rx * sr + ux * cr, -ry * sr + uy * cr, -rz * sr + uz * cr)
+
+    sx_, sy_, sz_ = -rx, -ry, -rz
+    ex, ey, ez = float(eye[0]), float(eye[1]), float(eye[2])
 
     m = np.eye(4)
-    m[0, 0:3] = screen_right
-    m[1, 0:3] = up
-    m[2, 0:3] = -forward
-    eye = np.asarray(eye, dtype=np.float64)
-    m[0, 3] = -np.dot(screen_right, eye)
-    m[1, 3] = -np.dot(up, eye)
-    m[2, 3] = np.dot(forward, eye)
+    m[0, 0:3] = (sx_, sy_, sz_)
+    m[1, 0:3] = (ux, uy, uz)
+    m[2, 0:3] = (-fx, -fy, -fz)
+    m[0, 3] = -(sx_ * ex + sy_ * ey + sz_ * ez)
+    m[1, 3] = -(ux * ex + uy * ey + uz * ez)
+    m[2, 3] = fx * ex + fy * ey + fz * ez
     return m
 
 
