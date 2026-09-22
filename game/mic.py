@@ -1,7 +1,9 @@
+import queue
 import re
 import shutil
 import subprocess
 import threading
+import time
 
 try:
     import numpy as np
@@ -12,6 +14,9 @@ except Exception:
 
 _PAREC_PATH = shutil.which("parec")
 _PACTL_PATH = shutil.which("pactl")
+
+_PAREC_LATENCY_MS = 30
+_PAREC_READ_BYTES = 512
 
 _VIRTUAL_DEVICE_NAMES = {
     "default", "sysdefault", "pulse", "pipewire", "front",
@@ -26,7 +31,7 @@ def _pulse_input_sources():
         return []
     try:
         out = subprocess.run([_PACTL_PATH, "list", "sources"],
-                              capture_output=True, text=True, timeout=1.0)
+                              capture_output=True, text=True, timeout=4.0)
     except Exception:
         return []
     if out.returncode != 0:
@@ -49,6 +54,10 @@ def _pulse_input_sources():
 
 
 def _match_pulse_source(name, pulse_sources):
+    for src_name, _desc in pulse_sources:
+        if src_name == name:
+            return src_name
+
     def tokens(s):
         return set(re.findall(r"[a-z0-9]+", s.lower()))
     wanted = tokens(name)
@@ -60,8 +69,24 @@ def _match_pulse_source(name, pulse_sources):
     return best if best_score >= 2 else None
 
 
+def _close_proc(proc):
+    try:
+        proc.terminate()
+        proc.wait(timeout=1.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        if proc.stdout is not None:
+            proc.stdout.close()
+    except Exception:
+        pass
+
+
 class MicListener:
-    def __init__(self, blocksize=1024):
+    def __init__(self, blocksize=256):
         self._blocksize = blocksize
         self._stream = None
         self._parec_proc = None
@@ -70,7 +95,14 @@ class MicListener:
         self._lock = threading.Lock()
         self.device_name = None
         self.last_error = None
-        self._device_cache = None
+        self.device_missing = False
+        self._devices = []
+        self._devices_known = False
+        self._active = False
+        self._busy = False
+        self._q = queue.Queue()
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
 
     @property
     def available(self):
@@ -78,23 +110,77 @@ class MicListener:
 
     @property
     def active(self):
-        return self._stream is not None or self._parec_proc is not None
+        with self._lock:
+            return self._active
 
-    def refresh_devices(self):
-        if _IMPORT_OK and self._stream is not None:
-            pass
-        elif _IMPORT_OK:
-            try:
-                sd._terminate()
-                sd._initialize()
-            except Exception:
-                pass
-        self._device_cache = None
-        return self.list_devices()
+    @property
+    def busy(self):
+        with self._lock:
+            return self._busy
+
+    def get_level(self):
+        with self._lock:
+            return self._level
 
     def list_devices(self):
-        if self._device_cache is not None:
-            return self._device_cache
+        with self._lock:
+            if not self._devices_known:
+                self._devices_known = True
+                self._q.put(("refresh", None))
+            return list(self._devices)
+
+    def refresh_devices(self):
+        self._q.put(("refresh", None))
+        return self.list_devices()
+
+    def start(self, device_name=None):
+        self._q.put(("start", device_name))
+
+    def stop(self):
+        self._q.put(("stop", None))
+
+    def shutdown(self, timeout=1.5):
+        self._q.put(("stop", None))
+        self._q.put(("quit", None))
+        self._worker.join(timeout=timeout)
+
+    def _run(self):
+        while True:
+            cmd, arg = self._q.get()
+            pending = []
+            while True:
+                try:
+                    pending.append(self._q.get_nowait())
+                except queue.Empty:
+                    break
+            for c, a in pending:
+                if c == "quit":
+                    cmd, arg = "quit", None
+                    break
+                if c in ("start", "stop"):
+                    cmd, arg = c, a
+                elif c == "refresh" and cmd == "refresh":
+                    pass
+            if cmd == "quit":
+                self._close()
+                return
+            with self._lock:
+                self._busy = True
+            try:
+                if cmd == "refresh":
+                    self._refresh()
+                elif cmd == "stop":
+                    self._close()
+                elif cmd == "start":
+                    self._open(arg)
+            except Exception as exc:
+                with self._lock:
+                    self.last_error = str(exc)
+            finally:
+                with self._lock:
+                    self._busy = False
+
+    def _refresh(self):
         pulse_sources = _pulse_input_sources()
         if pulse_sources:
             out = list(pulse_sources)
@@ -113,58 +199,73 @@ class MicListener:
                 out.append((name, name))
         else:
             out = []
-        self._device_cache = out
-        return out
+        with self._lock:
+            self._devices = out
+            self._devices_known = True
 
-    def start(self, device_name=None):
-        if not self.available or self.active:
+    def _open(self, device_name):
+        if not self.available:
             return
-        self.device_name = device_name
-        self.last_error = None
+        self._close()
+        with self._lock:
+            self.device_name = device_name
+            self.last_error = None
+            self.device_missing = False
 
         if device_name is None:
-            if _IMPORT_OK:
-                self._start_sounddevice(None)
-            elif _PAREC_PATH:
-                self._start_parec(None)
+            self._open_any(None)
             return
 
         source = _match_pulse_source(device_name, _pulse_input_sources())
         if source is not None and _PAREC_PATH and self._start_parec(source):
             return
-
         if _IMPORT_OK:
-            idx = next((i for i, info in enumerate(sd.query_devices())
-                        if info.get("name") == device_name), None)
-            if idx is not None:
-                self._start_sounddevice(idx)
+            try:
+                idx = next((i for i, info in enumerate(sd.query_devices())
+                            if info.get("name") == device_name), None)
+            except Exception:
+                idx = None
+            if idx is not None and self._start_sounddevice(idx):
                 return
+        with self._lock:
+            self.device_missing = True
+            self.last_error = "device not currently reachable"
+        self._open_any(None)
 
-        self.last_error = "device not currently reachable"
+    def _open_any(self, _device=None):
+        if _IMPORT_OK and self._start_sounddevice(device):
+            return
+        if _PAREC_PATH:
+            self._start_parec(None)
 
     def _start_parec(self, source_name):
-        cmd = [_PAREC_PATH, "--format=float32le", "--rate=16000", "--channels=1", "--raw"]
+        cmd = [_PAREC_PATH, "--format=float32le", "--rate=16000", "--channels=1",
+               "--latency-msec=%d" % _PAREC_LATENCY_MS, "--raw"]
         if source_name is not None:
             cmd += ["-d", source_name]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         except Exception as exc:
-            self.last_error = str(exc)
+            with self._lock:
+                self.last_error = str(exc)
             return False
-        import time
         time.sleep(0.08)
         if proc.poll() is not None:
-            self.last_error = "parec exited immediately"
+            _close_proc(proc)
+            with self._lock:
+                self.last_error = "parec exited immediately"
             return False
         self._parec_proc = proc
         self._parec_thread = threading.Thread(target=self._parec_reader, args=(proc,), daemon=True)
         self._parec_thread.start()
+        with self._lock:
+            self._active = True
         return True
 
     def _parec_reader(self, proc):
         try:
             while True:
-                data = proc.stdout.read(4096)
+                data = proc.stdout.read(_PAREC_READ_BYTES)
                 if not data:
                     break
                 samples = np.frombuffer(data, dtype="<f4")
@@ -175,6 +276,12 @@ class MicListener:
                     self._level = rms
         except Exception:
             pass
+        with self._lock:
+            if self._parec_proc is proc:
+                self._active = False
+                self._level = 0.0
+                if self.last_error is None:
+                    self.last_error = "capture ended"
 
     def _start_sounddevice(self, device):
         def callback(indata, frames, time_info, status):
@@ -188,36 +295,27 @@ class MicListener:
                 dtype="float32", callback=callback, device=device,
             )
             stream.start()
-            self._stream = stream
         except Exception as exc:
             self._stream = None
-            self.last_error = str(exc)
-
-    def stop(self):
-        if self._parec_proc is not None:
-            proc, self._parec_proc, self._parec_thread = self._parec_proc, None, None
-            try:
-                proc.terminate()
-                proc.wait(timeout=1.0)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
             with self._lock:
-                self._level = 0.0
-            return
-        if self._stream is None:
-            return
-        try:
-            self._stream.stop()
-            self._stream.close()
-        except Exception:
-            pass
-        self._stream = None
+                self.last_error = str(exc)
+            return False
+        self._stream = stream
         with self._lock:
-            self._level = 0.0
+            self._active = True
+        return True
 
-    def get_level(self):
+    def _close(self):
+        proc, self._parec_proc, self._parec_thread = self._parec_proc, None, None
+        stream, self._stream = self._stream, None
+        if proc is not None:
+            _close_proc(proc)
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
         with self._lock:
-            return self._level
+            self._active = False
+            self._level = 0.0
