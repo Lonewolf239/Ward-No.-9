@@ -3,8 +3,11 @@ import math
 import numpy as np
 
 
+_IDENTITY = np.eye(4, dtype=np.float64)
+
+
 def identity():
-    return np.eye(4, dtype=np.float64)
+    return _IDENTITY.copy()
 
 
 def trs_z(x, y, z, theta, sx, sy, sz):
@@ -18,31 +21,29 @@ def trs_z(x, y, z, theta, sx, sy, sz):
 
 
 def translate(x, y, z):
-    return np.array((
-        (1.0, 0.0, 0.0, x),
-        (0.0, 1.0, 0.0, y),
-        (0.0, 0.0, 1.0, z),
-        (0.0, 0.0, 0.0, 1.0),
-    ))
+    m = _IDENTITY.copy()
+    m[0, 3] = x
+    m[1, 3] = y
+    m[2, 3] = z
+    return m
 
 
 def scale(sx, sy, sz):
-    return np.array((
-        (sx, 0.0, 0.0, 0.0),
-        (0.0, sy, 0.0, 0.0),
-        (0.0, 0.0, sz, 0.0),
-        (0.0, 0.0, 0.0, 1.0),
-    ))
+    m = _IDENTITY.copy()
+    m[0, 0] = sx
+    m[1, 1] = sy
+    m[2, 2] = sz
+    return m
 
 
 def rotate_z(theta):
     c, s = math.cos(theta), math.sin(theta)
-    return np.array((
-        (c, -s, 0.0, 0.0),
-        (s, c, 0.0, 0.0),
-        (0.0, 0.0, 1.0, 0.0),
-        (0.0, 0.0, 0.0, 1.0),
-    ))
+    m = _IDENTITY.copy()
+    m[0, 0] = c
+    m[0, 1] = -s
+    m[1, 0] = s
+    m[1, 1] = c
+    return m
 
 
 def rotate_x(theta):

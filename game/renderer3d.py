@@ -5457,6 +5457,7 @@ class Renderer3D:
         self.wall_holes = []
         self.snap_props_whole = True
         self._uniform_cache = {}
+        self._uniform_members = {}
         self.quad_prog = ctx.program(vertex_shader=QUAD_VERTEX_SHADER, fragment_shader=QUAD_FRAGMENT_SHADER)
 
         box_data = build_box_mesh()
@@ -5495,6 +5496,8 @@ class Renderer3D:
             self.prog, [(self.broken_door_vbo, "3f 3f 2f 3f", "in_pos", "in_normal", "in_uv", "in_color")]
         )
 
+        self._prop_xy_cache = None
+        self._prop_subsets = []
         self.variant_vbos, self.variant_vaos = {}, {}
         for kind, builders in VARIANT_MESH_BUILDERS.items():
             if len(builders) != PROP_DEFS[kind].get("variants", 1):
@@ -5696,6 +5699,7 @@ class Renderer3D:
                               "in_pos", "in_normal", "in_uv")])
 
         self.hud_tex = None
+        self._hud_tex_raw = False
         self.wall_parts = []
         self.depth_wall_chunks = []
         self.floor_tex_density = S.FLOOR_CEILING_TEX_DENSITY
@@ -6065,16 +6069,45 @@ class Renderer3D:
     last_drawn_prop_count = 0
     last_light_count = 0
 
+    def _prop_xy(self, props):
+        cache = self._prop_xy_cache
+        if cache is not None and cache[0] is props and cache[1] == len(props):
+            return cache[2], cache[3]
+        for kept, xs_sub, ys_sub in self._prop_subsets:
+            if kept is props:
+                return xs_sub, ys_sub
+        xs = np.array([p.x for p in props], dtype=np.float64)
+        ys = np.array([p.y for p in props], dtype=np.float64)
+        self._prop_xy_cache = (props, len(props), xs, ys)
+        return xs, ys
+
+    def _within_radius(self, props, x, y, radius, inclusive=False):
+        if len(props) < self._NUMPY_CULL_MIN:
+            r2 = radius * radius
+            if inclusive:
+                return [p for p in props if (p.x - x) ** 2 + (p.y - y) ** 2 <= r2]
+            return [p for p in props if (p.x - x) ** 2 + (p.y - y) ** 2 < r2]
+        xs, ys = self._prop_xy(props)
+        dx = xs - x
+        dy = ys - y
+        d2 = dx * dx + dy * dy
+        r2 = radius * radius
+        hits = d2 <= r2 if inclusive else d2 < r2
+        idx = np.flatnonzero(hits)
+        kept = [props[i] for i in idx]
+        subsets = self._prop_subsets
+        subsets.append((kept, xs[idx], ys[idx]))
+        if len(subsets) > 3:
+            del subsets[0]
+        return kept
+
     def _props_in_cone(self, props, origin, direction, half_angle, far):
         fx, fy, fz = origin
         dx, dy, dz = direction
-        far2 = far * far
         overhang = self._CULL_OVERHANG
         kept = []
-        for p in props:
+        for p in self._within_radius(props, fx, fy, far):
             ox, oy = p.x - fx, p.y - fy
-            if ox * ox + oy * oy >= far2:
-                continue
             oz = p.z0 + p.height * 0.5 - fz
             radius = getattr(p, "_cull_radius", None)
             if radius is None:
@@ -6364,7 +6397,13 @@ class Renderer3D:
             self.prog["wall_grid_size"].value = (maze.w, maze.h)
 
     def _prop_color(self, prop, t):
-        return tuple(c / 255.0 for c in prop.base_color)
+        base = prop.base_color
+        cached = prop.__dict__.get("_color_cache")
+        if cached is not None and cached[0] is base:
+            return cached[1]
+        col = tuple(c / 255.0 for c in base)
+        prop._color_cache = (base, col)
+        return col
 
     def _moon_can_show(self, eye):
         cells = getattr(self, "_outdoor_cells", None)
@@ -6392,7 +6431,10 @@ class Renderer3D:
 
     def _set_uniform(self, name, value):
         if self._uniform_cache.get(name) != value:
-            self.prog[name].value = value
+            member = self._uniform_members.get(name)
+            if member is None:
+                member = self._uniform_members[name] = self.prog[name]
+            member.value = value
             self._uniform_cache[name] = value
 
     def _apply_material(self, material, alpha=None):
@@ -6475,9 +6517,7 @@ class Renderer3D:
             self.ctx.disable(moderngl.BLEND)
 
     def _cull_by_distance(self, props, eye, cull_dist, fade_band=0.0):
-        ex, ey = eye[0], eye[1]
-        outer2 = cull_dist ** 2
-        return [p for p in props if (p.x - ex) ** 2 + (p.y - ey) ** 2 <= outer2]
+        return self._within_radius(props, eye[0], eye[1], cull_dist, inclusive=True)
 
     def _hinge_swing_model(self, p, swing, hinge_depth=0.0):
         fx, fy = math.cos(p.facing), math.sin(p.facing)
@@ -6490,6 +6530,31 @@ class Renderer3D:
         sx = hinge_x + (vx0 * ca - vy0 * sa)
         sy = hinge_y + (vx0 * sa + vy0 * ca)
         return gm.trs_z(sx, sy, p.z0, p.facing + angle, p.hd * 2, p.hw * 2, p.height)
+
+    _NUMPY_CULL_MIN = 48
+
+    _PLAIN_SPECIAL_KINDS = frozenset({"hatch", "hatch_arrival", "locker", "elevator", "elevator_arrival"})
+
+    def _plain_draw_plan(self, p):
+        kind = p.kind
+        plan = False
+        special = (kind in self.variant_vaos or kind in _STATEFUL_VAO_KINDS or kind in _INSTALL_PARTS
+                   or kind in self._PLAIN_SPECIAL_KINDS or kind in self.glass_vaos
+                   or any(k == kind or k.startswith(kind + "_") for k in self.cutout_vaos)
+                   or getattr(p, "cut", False) or getattr(p, "cut_stage", 0))
+        if not special:
+            tex = self.prop_textures.get(p.texture) if p.texture else None
+            if tex is not None:
+                tex_scale = p.__dict__.get("_tex_scale")
+                if tex_scale is None:
+                    n = max(1, int(max(p.hw, p.hd, p.height) * 2.5))
+                    tex_scale = p._tex_scale = (n, n)
+            else:
+                tex_scale = (1.0, 1.0)
+            plan = (self.prop_vaos.get(kind, self.box_vao), tex, tex_scale,
+                    bool(getattr(p, "outdoor", False)), bool(getattr(p, "emissive", False)))
+        p._plain_plan = plan
+        return plan
 
     def _draw_props(self, props, t, door_swings=None, eye=None, cull_dist=None, fade_band=0.0):
         door_swings = door_swings or {}
@@ -6506,6 +6571,16 @@ class Renderer3D:
                     alpha *= max(0.0, min(1.0, (cull_dist - d) / fade_band))
                     if alpha <= 0.0:
                         continue
+            plan = p.__dict__.get("_plain_plan")
+            if plan is None:
+                plan = self._plain_draw_plan(p)
+            if plan:
+                vao, tex, tex_scale, outdoor, emits = plan
+                self._set_outdoor(outdoor)
+                self._draw_box(prop_model_bytes(p), self._prop_color(p, t),
+                               prop_emission(p, t) if emits else 0.0,
+                               texture=tex, tex_scale=tex_scale, vao=vao, alpha=alpha)
+                continue
             self._set_outdoor(getattr(p, "outdoor", False))
             swing = p.swing
             if p.kind == "shed_lock" and swing > 0.0:
@@ -7593,7 +7668,8 @@ class Renderer3D:
     _RAW_SURFACE_MASKS = (0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000)
 
     def composite(self, hud_rgba_bytes, hud_size, screen_size, trip_intensity=0.0, t=0.0,
-                  comedown_intensity=0.0, hud_surface=None, god_ray=None, keep_color=False):
+                  comedown_intensity=0.0, hud_surface=None, god_ray=None, keep_color=False,
+                  hud_reuse=False):
         raw = None
         if hud_surface is not None:
             if (hud_surface.get_bytesize() == 4 and hud_surface.get_masks() == self._RAW_SURFACE_MASKS
@@ -7608,7 +7684,7 @@ class Renderer3D:
         ctx.disable(moderngl.DEPTH_TEST)
         ctx.disable(moderngl.BLEND)
         if keep_color:
-            self._composite_hud(raw, hud_rgba_bytes, hud_size)
+            self._composite_hud(raw, hud_rgba_bytes, hud_size, hud_reuse)
             return
         ctx.clear(0.0, 0.0, 0.0)
 
@@ -7623,21 +7699,28 @@ class Renderer3D:
             self.quad_prog["god_ray"].value = god_ray if god_ray is not None else (0.5, 0.5, 0.0)
         self.quad_vao.render(moderngl.TRIANGLES)
 
-        self._composite_hud(raw, hud_rgba_bytes, hud_size)
+        self._composite_hud(raw, hud_rgba_bytes, hud_size, hud_reuse)
 
-    def _composite_hud(self, raw, hud_rgba_bytes, hud_size):
+    def _composite_hud(self, raw, hud_rgba_bytes, hud_size, reuse=False):
         ctx = self.ctx
-        if raw is not None or hud_rgba_bytes is not None:
-            self.ensure_hud_texture(*hud_size)
-            if raw is not None:
+        if reuse and self.hud_tex is None:
+            reuse = False
+        if reuse or raw is not None or hud_rgba_bytes is not None:
+            if not reuse:
+                self.ensure_hud_texture(*hud_size)
+            if reuse:
+                self.quad_prog["raw_surface"].value = 1.0 if self._hud_tex_raw else 0.0
+            elif raw is not None:
                 view = raw.get_view("0")
                 try:
                     self.hud_tex.write(view)
                 finally:
                     del view
+                self._hud_tex_raw = True
                 self.quad_prog["raw_surface"].value = 1.0
             else:
                 self.hud_tex.write(hud_rgba_bytes)
+                self._hud_tex_raw = False
             ctx.enable(moderngl.BLEND)
             ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
             self.hud_tex.use(location=0)

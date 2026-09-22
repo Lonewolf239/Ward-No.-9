@@ -253,6 +253,13 @@ class App:
         self.open_combo = None
         if self.settings["fullscreen"]:
             self._try_toggle_fullscreen()
+        self._scene_props_cache = None
+        self._hud_drawn_at = 0.0
+        self._debug_lines = None
+        self._debug_lines_at = 0.0
+        self._debug_back = None
+        self._clip_pending = None
+        self._hud_live = True
         self.settings_return = "menu"
         self.settings_page = SETTINGS_TABS[0]
         self.console = debug_console.DebugConsole()
@@ -394,6 +401,16 @@ class App:
             os.replace(tmp, SETTINGS_PATH)
         except Exception:
             pass
+
+    def _scene_props(self):
+        props, doors = self.props, self.doors
+        cache = self._scene_props_cache
+        if (cache is not None and cache[0] is props and cache[1] == len(props)
+                and cache[2] is doors and cache[3] == len(doors)):
+            return cache[4]
+        merged = props + doors
+        self._scene_props_cache = (props, len(props), doors, len(doors), merged)
+        return merged
 
     def _moon_strength(self):
         m = self.spec.get("moon_strength", 0.0) if self.spec else 0.0
@@ -1344,7 +1361,7 @@ class App:
                 y = locker.y + math.sin(ang) * radius
                 if self.maze.is_wall(x, y):
                     continue
-                if not p._collides(self.maze, self.props + self.doors, x, y, S.PLAYER_RADIUS):
+                if not p._collides(self.maze, self._scene_props(), x, y, S.PLAYER_RADIUS):
                     return x, y, ang
         return (locker.x + math.cos(locker.facing) * 0.85, locker.y + math.sin(locker.facing) * 0.85,
                 locker.facing)
@@ -2256,6 +2273,7 @@ class App:
         self._sheet_mark_list = None
         self._clip_key = None
         self._clip_surf = None
+        self._clip_pending = None
         self._clip_raise = 0.0
         self._clip_shade = None
         self._clip_lit = -1.0
@@ -3733,11 +3751,11 @@ class App:
             self._update_hatch_turn(dt, False)
             self._update_fence_cut(dt, False)
             self._update_cutters_repair(dt, False)
-            self.player.update_lean(dt, False, False, self.maze, self.props + self.doors)
+            self.player.update_lean(dt, False, False, self.maze, self._scene_props())
             self._resolve_lean_input(dt, suppress=True)
         else:
             keys = pygame.key.get_pressed()
-            blockers = self.props + self.doors
+            blockers = self._scene_props()
             if self.is_peeking:
                 self.player.moved_this_frame = False
                 self.player.noise_radius = 0.0
@@ -4637,8 +4655,19 @@ class App:
             if key == pygame.K_ESCAPE:
                 self._close_gamma_calibration()
 
+    def _hud_live_now(self):
+        if self.state != "playing" or S.HUD_REFRESH_HZ <= 0.0:
+            return True
+        now = time.monotonic()
+        if now - self._hud_drawn_at < 1.0 / S.HUD_REFRESH_HZ:
+            return False
+        self._hud_drawn_at = now
+        return True
+
     def draw(self):
-        self.hud_surf.fill((0, 0, 0, 0))
+        self._hud_live = self._hud_live_now()
+        if self._hud_live:
+            self.hud_surf.fill((0, 0, 0, 0))
 
         if self.state == "note":
             self._draw_note_scene()
@@ -4711,7 +4740,7 @@ class App:
             self._upload_note_sheet()
             self._sync_hallu_eyes()
             self.renderer.render(
-                self.maze, self.player, self.monster, self.props + self.doors, self.dread, self.anim_t,
+                self.maze, self.player, self.monster, self._scene_props(), self.dread, self.anim_t,
                 shake_yaw, shake_pitch,
                 fog_color=fog_color, fog_dist=fog_dist,
                 ambient=ambient_level,
@@ -4765,7 +4794,7 @@ class App:
                 self.renderer._draw_monster(dm, 0.0, check_frac=self.renderer.compute_check_frac(dm))
             if self.debug_door_monster is not None:
                 self.renderer._draw_monster(self.debug_door_monster, 0.0)
-            if self.player.is_hiding or self.hide_vignette_t > 0.0:
+            if self._hud_live and (self.player.is_hiding or self.hide_vignette_t > 0.0):
                 self._draw_hide_frame()
 
         if self.state == "splash":
@@ -4785,8 +4814,9 @@ class App:
         elif self.state == "credits":
             self._draw_credits()
         elif self.state == "playing":
-            self._draw_hud()
-            self._draw_peek_mask()
+            if self._hud_live:
+                self._draw_hud()
+                self._draw_peek_mask()
         elif self.state == "paused":
             self._draw_hud()
             self._draw_peek_mask()
@@ -4844,17 +4874,19 @@ class App:
                 self._draw_hud()
             self._draw_confirm_quit()
 
-        if self.state not in ("catch", "catch_sanity", "win_seq", "elevator_ride", "hatch_climb",
-                               "fence_escape", "angel_seq"):
-            self._draw_wip_label()
-
-        self._draw_debug_overlay()
-        self._draw_console()
+        if self._hud_live:
+            if self.state not in ("catch", "catch_sanity", "win_seq", "elevator_ride", "hatch_climb",
+                                   "fence_escape", "angel_seq"):
+                self._draw_wip_label()
+            self._draw_debug_overlay()
+            self._draw_console()
 
         self._sync_window_size()
         self.renderer.composite(None, (S.SCREEN_W, S.SCREEN_H), self.window_size,
                                  trip_intensity=self.trip_intensity, t=self.anim_t,
-                                 comedown_intensity=self.comedown_intensity, hud_surface=self.hud_surf,
+                                 comedown_intensity=self.comedown_intensity,
+                                 hud_surface=self.hud_surf if self._hud_live else None,
+                                 hud_reuse=not self._hud_live,
                                  god_ray=getattr(self, "_god_ray", None))
         pygame.display.flip()
 
@@ -4895,6 +4927,10 @@ class App:
                        topleft=(rect.right - pad - font.size(tag)[0], rect.y + pad), shadow=False)
 
     def _draw_debug_overlay(self):
+        now = time.monotonic()
+        if self._debug_lines is not None and now - self._debug_lines_at < 1.0 / S.DEBUG_HUD_REFRESH_HZ:
+            self._blit_debug_lines(self._debug_lines)
+            return
         lines = []
         if self.settings.get("debug_hud_fps"):
             lines.append(f"FPS: {self.clock.get_fps():.0f}")
@@ -4929,15 +4965,22 @@ class App:
             rate = 100.0 / max(1.0, self._scare_seconds_to_fill)
             lines.append(i18n.t("debug_hud.line_scare", fill=f"{fill_pct:.0f}", rate=f"{rate:.1f}",
                                 tag=i18n.t("debug_hud.tag_lit" if self._scare_lit else "debug_hud.tag_dark")))
+        self._debug_lines = lines
+        self._debug_lines_at = now
+        self._blit_debug_lines(lines)
+
+    def _blit_debug_lines(self, lines):
         if not lines:
             return
         font = self.font_sm
         pad = 6
         w = max(font.size(line)[0] for line in lines) + pad * 2
         h = len(lines) * 18 + pad * 2
-        surf = pygame.Surface((w, h), pygame.SRCALPHA)
-        surf.fill((0, 0, 0, 150))
-        self.hud_surf.blit(surf, (8, 8))
+        back = self._debug_back
+        if back is None or back.get_size() != (w, h):
+            back = self._debug_back = pygame.Surface((w, h), pygame.SRCALPHA)
+            back.fill((0, 0, 0, 150))
+        self.hud_surf.blit(back, (8, 8))
         for i, line in enumerate(lines):
             self._text(font, line, (120, 230, 120), topleft=(8 + pad, 8 + pad + i * 18), shadow=False)
 
@@ -5525,6 +5568,17 @@ class App:
                damage_step, self.floor_i, i18n.get_language())
         if getattr(self, "_clip_key", None) == key and self._clip_surf is not None:
             return self._clip_surf
+        pending = self._clip_pending
+        if pending is not None:
+            if pending[1] != key:
+                pending = self._clip_pending = None
+            else:
+                if self._wear_step(pending):
+                    self._clip_key = key
+                    self._clip_surf = pending[0]
+                    self._clip_shade = None
+                    self._clip_pending = None
+                return self._clip_surf
         jitter = 0.9 + damage * 3.1
         marks = self._sheet_marks(int(damage * S.CONDITION_MARKS_MAX + 0.001))
         rng = random.Random(hash(key) & 0xFFFF)
@@ -5626,21 +5680,58 @@ class App:
             self._sketch_scribble(surf, 24 + mx * (w - 48), 70 + my * (h - 94),
                                   mr, ink, random.Random(mseed), jitter)
 
-        self._paper_wear(surf, hash(key) & 0xFFFF)
-        self._clip_key = key
-        self._clip_surf = surf
-        self._clip_shade = None
-        return surf
+        if self._clip_surf is None:
+            self._paper_wear(surf, hash(key) & 0xFFFF)
+            self._clip_key = key
+            self._clip_surf = surf
+            self._clip_shade = None
+            return surf
+        self._clip_pending = self._wear_start(surf, key, hash(key) & 0xFFFF)
+        return self._clip_surf
+
+    def _paper_dirt(self, w, h, floor, power):
+        key = (w, h, floor, power)
+        cache = self.__dict__.setdefault("_paper_dirt_cache", {})
+        base = cache.get(key)
+        if base is None:
+            edge_x = np.minimum(np.arange(w), w - 1 - np.arange(w))[:, None] / (w * 0.5)
+            edge_y = np.minimum(np.arange(h), h - 1 - np.arange(h))[None, :] / (h * 0.5)
+            dirt = np.clip(np.minimum(edge_x, edge_y), 0.0, 1.0) ** power
+            base = cache[key] = floor + (1.0 - floor) * dirt
+        return base
+
+    _WEAR_SLICES = 6
+
+    def _wear_start(self, surf, key, seed, floor=0.55, grain=7.0, power=0.55):
+        w, h = surf.get_size()
+        noise = np.random.default_rng(seed & 0xFFFFFFFF).normal(0.0, grain, (w, h))
+        shade = self._paper_dirt(w, h, floor, power) + noise / 255.0
+        return [surf, key, shade, 0]
+
+    def _wear_step(self, pending):
+        surf, _key, shade, done = pending
+        w, h = surf.get_size()
+        band = -(-h // self._WEAR_SLICES)
+        y0 = done * band
+        y1 = min(h, y0 + band)
+        px = pygame.surfarray.pixels3d(surf)
+        flat = np.array(px[:, y0:y1], dtype=np.float64)
+        flat *= shade[:, y0:y1, None]
+        np.clip(flat, 0, 255, out=flat)
+        px[:, y0:y1] = flat.astype(np.uint8)
+        del px
+        pending[3] = done + 1
+        return y1 >= h
 
     def _paper_wear(self, surf, seed, floor=0.55, grain=7.0, power=0.55):
         px = pygame.surfarray.pixels3d(surf)
         w, h = surf.get_size()
         noise = np.random.default_rng(seed & 0xFFFFFFFF).normal(0.0, grain, (w, h))
-        edge_x = np.minimum(np.arange(w), w - 1 - np.arange(w))[:, None] / (w * 0.5)
-        edge_y = np.minimum(np.arange(h), h - 1 - np.arange(h))[None, :] / (h * 0.5)
-        dirt = np.clip(np.minimum(edge_x, edge_y), 0.0, 1.0) ** power
-        shade = (floor + (1.0 - floor) * dirt) + noise / 255.0
-        px[:] = np.clip(px.astype(np.float32) * shade[:, :, None], 0, 255).astype(np.uint8)
+        shade = self._paper_dirt(w, h, floor, power) + noise / 255.0
+        flat = np.array(px, dtype=np.float64)
+        flat *= shade[:, :, None]
+        np.clip(flat, 0, 255, out=flat)
+        px[:] = flat.astype(np.uint8)
         del px
 
     def _text_on(self, surf, font, text, col, topleft):
