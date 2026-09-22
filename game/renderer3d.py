@@ -6824,6 +6824,7 @@ class Renderer3D:
         head_frame = neck_root @ gm.rotate_z(head_tilt) @ gm.rotate_y(head_pitch)
         head_sz = 0.15
         part(head_frame, 0.16, 0.16, head_sz)
+        self.last_monster_head = tuple(float(c) for c in (head_frame @ np.array([0.0, 0.0, head_sz * 0.5, 1.0]))[:3])
 
         shoulder_z = upper_len * 0.86
         shoulder_y = 0.24

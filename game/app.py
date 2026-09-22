@@ -15,6 +15,7 @@ from game import settings as S
 from game import debug_console
 from game import ui
 from game import fx
+from game import screamer as screamer_mod
 from game import i18n
 from game.audio import SoundBank
 from game.maze import Maze
@@ -4381,10 +4382,9 @@ class App:
     def _start_catch_sequence(self):
         self.state = "catch"
         self.catch_timer = 0.0
+        self.screamer = screamer_mod.Screamer()
         self.sounds.set_growl(False)
         self.sounds.stop_hunt(fade_ms=2000)
-        self.sounds.play_stinger()
-        self.fx_shake.add(1.0)
         self._release_mouse()
         p, m = self.player, self.monster
         self.catch_cam = {
@@ -4397,24 +4397,35 @@ class App:
         cc = getattr(self, "catch_cam", None)
         if cc is None:
             return None
-        f = min(1.0, self.catch_timer / S.CATCH_TURN_SECONDS)
+        sc = getattr(self, "screamer", None) if self.state == "catch" else None
+        f = 1.0 if sc is not None else min(1.0, self.catch_timer / S.CATCH_TURN_SECONDS)
         f = f * f * (3.0 - 2.0 * f)
         to_m = math.atan2(cc["my"] - cc["sy"], cc["mx"] - cc["sx"])
         yaw = cc["sa"] + _wrap_angle(to_m - cc["sa"]) * f
-        pitch = cc["sp"] + (S.CATCH_EYE_RISE - cc["sp"]) * f
         bx, by = -math.cos(to_m), -math.sin(to_m)
+        head = getattr(self.renderer, "last_monster_head", None)
         back = S.CATCH_BACK_OFF * f
-        while back > 0.05 and self.maze.circle_hits_wall(cc["sx"] + bx * back,
-                                                         cc["sy"] + by * back, 0.18):
+        tx, ty = (head[0], head[1]) if head is not None else (cc["mx"], cc["my"])
+
+        def blocked(b):
+            ex, ey = cc["sx"] + bx * b, cc["sy"] + by * b
+            return (self.maze.circle_hits_wall(ex, ey, 0.18)
+                    or line_blocked_by_cover(self.doors, ex, ey, tx, ty, min_height=0.3))
+        while back > 0.05 and blocked(back):
             back -= 0.1
         back = max(0.0, back)
         eye = (cc["sx"] + bx * back, cc["sy"] + by * back, EYE_HEIGHT)
+        rise = S.CATCH_EYE_RISE
+        if sc is not None and head is not None:
+            rise = math.atan2(head[2] - EYE_HEIGHT, max(0.25, math.hypot(head[0] - eye[0], head[1] - eye[1])))
+        pitch = cc["sp"] + (rise - cc["sp"]) * f
         return (eye, yaw, pitch, FOV_DEGREES)
 
     def _update_catch(self, dt):
         self.catch_timer += dt
+        self.screamer.update(dt, self.sounds, self.fx_shake)
         self.fx_shake.add(dt * 2.6)
-        if self.catch_timer > S.CATCH_SECONDS:
+        if self.catch_timer > self.screamer.duration:
             self.state = "dead_caught"
 
     def _start_sanity_death(self):
@@ -4765,8 +4776,16 @@ class App:
             frac = min(1.0, self.catch_timer / S.ANGEL_END_FADE_SECONDS)
             self._draw_angel_end(alpha_mult=frac)
         elif self.state == "catch":
-            progress = min(1.0, self.catch_timer / S.CATCH_SECONDS)
-            fx.draw_jumpscare_face(self.hud_surf, progress)
+            sc = self.screamer
+            if sc.wants_snapshot():
+                w, h = self.renderer.fbo.size
+                frame = np.frombuffer(self.renderer.fbo.read(components=3), dtype=np.uint8)
+                sc.snapshot = frame.reshape(h, w, 3)[::-1].copy()
+            head = getattr(self.renderer, "last_monster_head", None)
+            cam = self.renderer.last_camera
+            head_at = (self.renderer.project_to_screen(head, cam[0], cam[1], cam[2], cam[3], cam[4])
+                       if head is not None and cam is not None else None)
+            sc.draw(self.hud_surf, head_at)
         elif self.state == "catch_sanity":
             t = self.catch_timer / 2.6
             white = max(0, 255 * (1 - abs(t - 0.3) / 0.3)) if t < 0.6 else 0
