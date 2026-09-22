@@ -241,10 +241,7 @@ class App:
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
         pygame.display.gl_set_attribute(pygame.GL_DEPTH_SIZE, 24)
         pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
-        self.screen = pygame.display.set_mode(
-            (S.SCREEN_W, S.SCREEN_H), pygame.OPENGL | pygame.DOUBLEBUF,
-            vsync=1 if self.settings["vsync"] else 0,
-        )
+        self.screen = self._open_display()
         self.clock = pygame.time.Clock()
         self.window_size = (S.SCREEN_W, S.SCREEN_H)
         self.awaiting_bind = None
@@ -255,10 +252,7 @@ class App:
         self._settings_save_pending = False
         self.open_combo = None
         if self.settings["fullscreen"]:
-            try:
-                pygame.display.toggle_fullscreen()
-            except pygame.error:
-                pass
+            self._try_toggle_fullscreen()
         self.settings_return = "menu"
         self.settings_page = SETTINGS_TABS[0]
         self.console = debug_console.DebugConsole()
@@ -358,16 +352,36 @@ class App:
                 if k not in saved:
                     continue
                 if k == "bindings":
+                    if not isinstance(saved["bindings"], dict):
+                        continue
                     for action, value in saved["bindings"].items():
                         nb = self._normalize_binding(value)
                         if nb is not None and action in S.DEFAULT_BINDINGS:
                             self.settings["bindings"][action] = nb
-                else:
-                    self.settings[k] = saved[k]
+                elif self._saved_setting_ok(k, self.settings[k], saved[k]):
+                    value = saved[k]
+                    if k in SLIDER_SPECS:
+                        lo, hi = SLIDER_SPECS[k]
+                        value = max(lo, min(hi, value))
+                    self.settings[k] = value
             if self.settings.get("hud_style") not in S.HUD_STYLES:
                 self.settings["hud_style"] = S.HUD_STYLES[0]
         except Exception:
             pass
+
+    @staticmethod
+    def _saved_setting_ok(key, default, value):
+        if key in STEPPED_SLIDERS:
+            return not isinstance(value, bool) and value in STEPPED_SLIDERS[key]
+        if key == "language":
+            return value in i18n.LOCALES
+        if isinstance(default, bool):
+            return isinstance(value, bool)
+        if isinstance(default, (int, float)):
+            return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        if default is None:
+            return value is None or isinstance(value, str)
+        return isinstance(value, type(default))
 
     def _save_settings(self):
         try:
@@ -1243,9 +1257,27 @@ class App:
         self.awaiting_bind = None
         self.open_combo = None
 
+    def _open_display(self):
+        flags = pygame.OPENGL | pygame.DOUBLEBUF
+        if self.settings["vsync"]:
+            try:
+                return pygame.display.set_mode((S.SCREEN_W, S.SCREEN_H), flags, vsync=1)
+            except pygame.error:
+                self.settings["vsync"] = False
+        return pygame.display.set_mode((S.SCREEN_W, S.SCREEN_H), flags, vsync=0)
+
+    def _try_toggle_fullscreen(self):
+        try:
+            pygame.display.toggle_fullscreen()
+        except pygame.error:
+            return False
+        return True
+
     def _toggle_fullscreen(self):
+        if not self._try_toggle_fullscreen():
+            self.sounds.play_denied()
+            return
         self.settings["fullscreen"] = not self.settings["fullscreen"]
-        pygame.display.toggle_fullscreen()
         self._save_settings()
 
     def _toggle_mic(self):
@@ -1737,6 +1769,7 @@ class App:
             apply_update_and_restart(path)
         except Exception as e:
             print(f"ward9: failed to apply update from {path}: {e}")
+            self.state = "menu"
 
     def _feedback_button(self):
         w, h = 340, 44
@@ -2089,8 +2122,8 @@ class App:
             (S.SCREEN_W, S.SCREEN_H), pygame.OPENGL | pygame.DOUBLEBUF,
             vsync=1 if self.settings["vsync"] else 0,
         )
-        if self.settings["fullscreen"]:
-            pygame.display.toggle_fullscreen()
+        if self.settings["fullscreen"] and not self._try_toggle_fullscreen():
+            self.settings["fullscreen"] = False
         self._save_settings()
         self.sounds.play_ui()
 
@@ -6272,6 +6305,7 @@ class App:
             self.update(dt)
             self.draw()
         self.mic.shutdown()
+        self.sounds.shutdown()
         pygame.quit()
         if self._next_mode == "editor":
             return "editor"

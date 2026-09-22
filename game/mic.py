@@ -232,7 +232,7 @@ class MicListener:
             self.last_error = "device not currently reachable"
         self._open_any(None)
 
-    def _open_any(self, _device=None):
+    def _open_any(self, device=None):
         if _IMPORT_OK and self._start_sounddevice(device):
             return
         if _PAREC_PATH:
