@@ -70,6 +70,8 @@ def shadow_bias_k_ortho(near, far):
     return 1.0 / (far - near)
 
 
+SHADOW_NORMAL_OFFSET = 0.5
+
 FLASH_SHADOW_BIAS_K = shadow_bias_k_perspective(FLASH_SHADOW_NEAR, FLASH_SHADOW_FAR)
 POINT_SHADOW_BIAS_K = shadow_bias_k_perspective(POINT_SHADOW_NEAR, POINT_SHADOW_FAR)
 MOON_SHADOW_BIAS_K = shadow_bias_k_ortho(MOON_SHADOW_NEAR, MOON_SHADOW_FAR)

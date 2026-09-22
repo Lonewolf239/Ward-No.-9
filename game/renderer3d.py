@@ -18,6 +18,7 @@ from game.lighting import (
     FLASH_SHADOW_NEAR, FLASH_SHADOW_FAR, FLASH_SHADOW_FOV_DEGREES, FLASH_SHADOW_BIAS_K,
     POINT_SHADOW_NEAR, POINT_SHADOW_FAR, POINT_SHADOW_FOV_DEGREES, POINT_SHADOW_BIAS_K,
     MOON_SHADOW_NEAR, MOON_SHADOW_FAR, MOON_SHADOW_ORIGIN_DIST, MOON_SHADOW_HALF_EXTENT,
+    SHADOW_NORMAL_OFFSET,
     MOON_SHADOW_RECENTER_DIST, MOON_SHADOW_BIAS_K, MOON_TOWARD,
     MAX_OMNI_LIGHTS, OMNI_FACE_DIRS, FIXED_LIGHTS, FIXED_TILES, TILE_MOON, TILE_FLASH,
     GAMEPLAY_RECEIVER_HEIGHT,
@@ -31,7 +32,7 @@ FOV_DEGREES = 88.0
 FOG_EXPONENT = S.FOG_EXPONENT
 COLOR_QUANT_LEVELS = 44.0
 
-SHADOW_POLYGON_OFFSET = (2.0, 4.0)
+SHADOW_POLYGON_OFFSET = (0.0, 2.0)
 
 SHADOW_BLOCKER_MIN_DIST = 0.1
 MOON_BLOCKER_SEARCH_DEPTH = 20.0
@@ -310,6 +311,7 @@ const float SHADOW_BLOCKER_MIN_DIST = """ + repr(SHADOW_BLOCKER_MIN_DIST) + """;
 const float MOON_BLOCKER_SEARCH_DEPTH = """ + repr(MOON_BLOCKER_SEARCH_DEPTH) + """;
 const float SHADOW_MAX_SEARCH_TEXELS = """ + repr(SHADOW_MAX_SEARCH_TEXELS) + """;
 const float SHADOW_MAX_FILTER_TEXELS = """ + repr(SHADOW_MAX_FILTER_TEXELS) + """;
+const float SHADOW_NORMAL_OFFSET = """ + repr(SHADOW_NORMAL_OFFSET) + """;
 const float GOLDEN_ANGLE = 2.39996323;
 
 float shadow_axis_depth(float d, int shape) {
@@ -336,6 +338,10 @@ vec2 vogel_disk(int i, int n, float phi) {
 
 float sample_shadow_tex_core(vec4 shadowRect, mat4 mvp, vec3 worldPos, vec3 N, float ndotl,
                               float distToLight, float depthBiasK, int shape, float emitter) {
+    float tan_half = shape == SHAPE_SPOT ? FLASH_TAN_HALF : POINT_TAN_HALF;
+    float texel_world = shape == SHAPE_DIRECTIONAL ? 2.0 * MOON_HALF_EXTENT / shadowRect.z
+                                                   : 2.0 * distToLight * tan_half / shadowRect.z;
+    worldPos += N * (texel_world * SHADOW_NORMAL_OFFSET);
     vec4 clip = mvp * vec4(worldPos, 1.0);
     if (clip.w <= 0.0001) return 0.0;
     vec3 proj = clip.xyz / clip.w;
