@@ -12,6 +12,7 @@ import urllib.request
 import zipfile
 
 from game import settings as S
+from game import version as V
 
 GITHUB_REPO = "Lonewolf239/Ward-No.-9"
 API_LATEST_RELEASE = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -23,7 +24,6 @@ ASSET_NAME = f"ward9-{PLATFORM_TAG}.zip"
 
 
 class UpdateChecker:
-
     def __init__(self):
         self._lock = threading.Lock()
         self._state = "idle"
@@ -66,7 +66,7 @@ class UpdateChecker:
                     asset_url = asset.get("browser_download_url")
                     break
             with self._lock:
-                if not tag or tag == S.VERSION:
+                if not tag or not V.is_newer(tag, S.VERSION):
                     self._state = "none"
                 elif asset_url is None:
                     self._state = "error"
@@ -183,8 +183,10 @@ def _apply_update_linux(zip_path):
     new_exe = _find_new_binary(extract_dir, current_exe)
     backup_path = current_exe + ".bak"
     shutil.copy2(current_exe, backup_path)
-    shutil.copy2(new_exe, current_exe)
-    os.chmod(current_exe, os.stat(current_exe).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    staged = current_exe + ".new"
+    shutil.copy2(new_exe, staged)
+    os.chmod(staged, os.stat(staged).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    os.replace(staged, current_exe)
     os.execv(current_exe, [current_exe])
 
 

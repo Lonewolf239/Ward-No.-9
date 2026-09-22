@@ -3,6 +3,7 @@ import math
 import os
 import random
 import sys
+import time
 import webbrowser
 from pathlib import Path
 
@@ -11,14 +12,22 @@ import numpy as np
 import pygame
 
 from game import settings as S
+from game import debug_console
+from game import ui
 from game import fx
 from game import i18n
 from game.audio import SoundBank
 from game.maze import Maze
 from game.mic import MicListener
-from game.entities import Player, Monster
-from game.props import populate_level, populate_yard, populate_debug, line_blocked_by_cover, make_prop
-from game.renderer3d import Renderer3D, FOV_DEGREES
+from game.entities import Player, Monster, monster_vision_base, monster_lit_frac
+from game.props import (populate_level, populate_yard, populate_debug, populate_micro_yard, populate_micro_room,
+                         populate_forest_run, line_blocked_by_cover, make_prop, place_arrival_prop, Prop,
+                         cells_no_body_fits)
+from game.renderer3d import (Renderer3D, FOV_DEGREES, EYE_HEIGHT, MAP_CURSOR_V_MIN,
+                             ELEVATOR_OPENING_HALF as R3D_ELEVATOR_OPENING_HALF,
+                             HATCH_HALF as R3D_HATCH_HALF, HATCH_SHAFT_RISE as R3D_HATCH_SHAFT_RISE)
+from game.lighting import (SHAPE_DIRECTIONAL, GAMEPLAY_RECEIVER_HEIGHT, gameplay_lights, light_level_at,
+                           player_light_levels, flashlight_light, lighter_light)
 
 
 def _default_settings_path():
@@ -39,11 +48,20 @@ _LEGACY_SETTINGS_PATH = Path.home() / ".priyut9_settings.json"
 
 
 PICKUP_LABEL_KEYS = {"battery": "pickup.battery", "fuse": "pickup.fuse", "valve_key": "pickup.valve_key",
-                      "sanity_pill": "pickup.sanity_pill"}
+                      "sanity_pill": "pickup.sanity_pill", "lighter": "pickup.lighter",
+                      "cutters": "pickup.cutters", "key": "pickup.key",
+                      "paper_map": "pickup.paper_map", "pencil": "pickup.pencil",
+                      "map_sheet": "pickup.map_sheet"}
 PORTAL_LABEL_KEYS = {0: "portal.floor0", 1: "portal.floor1", 2: "portal.floor2", "hub": "portal.hub"}
-DEBUG_HUD_OPTIONS = ("fps", "coords", "monster", "seed", "scares")
-MENU_ONLY_DEBUG_HUD_OPTIONS = ("coords", "monster", "seed", "scares")
-SETTINGS_TABS = ("graphics", "sound", "controls", "language", "debug")
+DEBUG_HUD_OPTIONS = ("fps", "coords", "monster", "seed", "scares", "console")
+MENU_ONLY_DEBUG_HUD_OPTIONS = ("coords", "monster", "seed", "scares", "console")
+MENU_CAM_LAMP_KINDS = ("wall_sconce", "lamp_desk")
+MENU_CAM_LAMP_KINDS_FALLBACK = ("wall_sconce", "lamp_desk", "sign_exit", "monitor")
+
+
+def _wrap_angle(a):
+    return (a + math.pi) % math.tau - math.pi
+SETTINGS_TABS = ("graphics", "sound", "controls", "interface", "debug")
 FPS_OPTIONS = (30, 60, 75, 120, 144, 0)
 ICON_LINKS = (
     ("web", "http://31.58.179.104"),
@@ -62,6 +80,7 @@ SPLASH_SKIP_HINT_FADE = (0.3, 0.5)
 SPLASH_HOLD_END = 3.0
 SPLASH_FADE_OUT_DUR = 0.6
 SPLASH_TOTAL_DURATION = SPLASH_HOLD_END + SPLASH_FADE_OUT_DUR
+_splash_shown = False
 
 _COMMUNITY_CREATORS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "community_creators.json")
 
@@ -82,18 +101,21 @@ SLIDER_SPECS = {
     "sfx_volume": (0.0, 1.0),
     "music_volume": (0.0, 1.0),
     "mouse_sensitivity": (0.4, 2.2),
-    "mouse_sensitivity_y": (0.4, 2.2),
     "view_distance": (0.6, 1.6),
     "mic_sensitivity": (1.0, 20.0),
+    "gamma": (0.75, 1.8),
 }
+
+GAMMA_SYMBOL_STEPS = (0.5, 1.0, 2.5)
 STEPPED_SLIDERS = {
     "fps_limit": FPS_OPTIONS,
     "quality_preset": S.QUALITY_PRESET_ORDER,
+    **S.GFX_SETTING_OPTIONS,
 }
+GFX_SLIDER_KEYS = tuple(S.GFX_SETTING_OPTIONS)
 
-_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
-FONT_PATH = os.path.join(_ASSETS_DIR, "font.ttf")
-NOTE_FONT_PATH = os.path.join(_ASSETS_DIR, "note_font.ttf")
+FONT_PATH = S.FONT_PATH
+NOTE_FONT_PATH = S.NOTE_FONT_PATH
 
 
 class _DemoMonster:
@@ -184,7 +206,6 @@ class App:
             "fullscreen": False,
             "fps_limit": S.FPS,
             "mouse_sensitivity": 1.0,
-            "mouse_sensitivity_y": 1.0,
             "master_volume": 0.9,
             "sfx_volume": 1.0,
             "music_volume": 0.6,
@@ -192,7 +213,9 @@ class App:
             "mic_device": None,
             "mic_sensitivity": S.MIC_LEVEL_SCALE,
             "view_distance": 1.0,
+            "gamma": 1.0,
             "quality_preset": "medium",
+            **S.QUALITY_PRESETS["medium"],
             "upscale_smoothing": False,
             "vsync": True,
             "language": "en",
@@ -201,7 +224,10 @@ class App:
             "debug_hud_monster": False,
             "debug_hud_seed": False,
             "debug_hud_scares": False,
+            "debug_hud_console": False,
             "warning_seen": False,
+            "hud_style": S.HUD_STYLES[0],
+            "compass": True,
             "bindings": dict(S.DEFAULT_BINDINGS),
             "last_seen_version": S.VERSION,
             "pending_changelog": "",
@@ -223,12 +249,18 @@ class App:
         self.awaiting_bind = None
         self.controls_msg = None
         self.controls_msg_timer = 0.0
+        self._reset_map()
         self.dragging_slider = None
+        self._settings_save_pending = False
         self.open_combo = None
         if self.settings["fullscreen"]:
-            pygame.display.toggle_fullscreen()
+            try:
+                pygame.display.toggle_fullscreen()
+            except pygame.error:
+                pass
         self.settings_return = "menu"
         self.settings_page = SETTINGS_TABS[0]
+        self.console = debug_console.DebugConsole()
 
         self.ctx = moderngl.create_context()
         self.renderer = Renderer3D(self.ctx)
@@ -243,19 +275,32 @@ class App:
 
         self.mic = MicListener()
         self.mic_vu_level = 0.0
+        self._mic_device_missing = False
         self._apply_mic_setting()
 
+        self._text_cache = {}
         self.font_title = pygame.font.Font(FONT_PATH, 72)
         self.font_lg = pygame.font.Font(FONT_PATH, 42)
         self.font_md = pygame.font.Font(FONT_PATH, 24)
         self.font_sm = pygame.font.Font(FONT_PATH, 18)
         self.font_note = pygame.font.Font(NOTE_FONT_PATH, 30)
+        self.font_note_big = pygame.font.Font(NOTE_FONT_PATH, 62)
+        self.font_form = pygame.font.Font(FONT_PATH, 44)
+        self.font_form_s = pygame.font.Font(FONT_PATH, 30)
+        self.font_type = pygame.font.Font(FONT_PATH, 16)
+        self.font_type_s = pygame.font.Font(FONT_PATH, 13)
 
         self.static_overlay = self._make_static_overlay()
         self.hide_vignette = self._make_hide_vignette()
         self.sanity_vignette = self._make_sanity_vignette()
         self.menu_gradient = self._make_menu_gradient()
         self.pause_gradient = self._make_menu_gradient(max_alpha=125)
+        self.angel_glow_surf = self._make_angel_glow()
+        self._angel_eye_specs = self._make_angel_eye_specs()
+        self._angel_wing_specs = self._make_angel_wing_specs()
+        self._angel_vein_specs = self._make_angel_vein_specs()
+        self._angel_center_eye_specs = self._make_angel_center_eye_specs()
+        self.angel_canvas = pygame.Surface((S.ANGEL_CANVAS_SIZE, S.ANGEL_CANVAS_SIZE), pygame.SRCALPHA)
 
         self.running = True
         self._next_mode = None
@@ -270,6 +315,9 @@ class App:
         self._changelog_close_rect = pygame.Rect(0, 0, 0, 0)
         self._community_scroll_px = 0
         self._community_max_scroll = 0
+        self._controls_scroll_px = 0
+        self._controls_max_scroll = 0
+        self._scroll_surf = None
         if self.settings.get("last_seen_version") != S.VERSION:
             self._show_changelog = True
             self._changelog_scroll_px = 0
@@ -283,11 +331,22 @@ class App:
         self.new_game()
         if not self.settings.get("warning_seen"):
             self.state = "warning"
+        global _splash_shown
         self._splash_t = 0.0
         self._post_splash_state = self.state
-        self.state = "splash"
+        if not _splash_shown:
+            _splash_shown = True
+            self.state = "splash"
         if not self.sounds.ch_ambient.get_busy():
             self.sounds.start_ambient()
+
+    @staticmethod
+    def _normalize_binding(value):
+        if isinstance(value, int):
+            return ("key", value)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            return (value[0], value[1])
+        return None
 
     def _load_settings(self):
         path = SETTINGS_PATH if SETTINGS_PATH.exists() else _LEGACY_SETTINGS_PATH
@@ -298,22 +357,36 @@ class App:
                 if k not in saved:
                     continue
                 if k == "bindings":
-                    self.settings["bindings"].update(saved["bindings"])
+                    for action, value in saved["bindings"].items():
+                        nb = self._normalize_binding(value)
+                        if nb is not None and action in S.DEFAULT_BINDINGS:
+                            self.settings["bindings"][action] = nb
                 else:
                     self.settings[k] = saved[k]
+            if self.settings.get("hud_style") not in S.HUD_STYLES:
+                self.settings["hud_style"] = S.HUD_STYLES[0]
         except Exception:
             pass
 
     def _save_settings(self):
         try:
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            tmp = SETTINGS_PATH.with_suffix(SETTINGS_PATH.suffix + ".new")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self.settings, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, SETTINGS_PATH)
         except Exception:
             pass
 
+    def _moon_strength(self):
+        m = self.spec.get("moon_strength", 0.0) if self.spec else 0.0
+        if not m and self.maze is not None and self.maze.has_outdoors():
+            return S.OUTER_WINDOW_MOON
+        return m
+
     def _apply_mic_setting(self):
-        self._mic_device_missing = False
         if self.settings.get("mic_enabled") and self.mic.available:
             preferred = self.settings.get("mic_device")
             if preferred is not None and not isinstance(preferred, str):
@@ -321,13 +394,11 @@ class App:
                 self.settings["mic_device"] = None
             self.mic.refresh_devices()
             self.mic.start(preferred)
-            if not self.mic.active and preferred is not None:
-                self._mic_device_missing = True
-                self.mic.start(None)
         else:
             self.mic.stop()
 
     def _update_mic_level(self, dt):
+        self._mic_device_missing = self.mic.device_missing
         if self.settings.get("mic_enabled") and self.mic.available and self.mic.active:
             raw = min(1.0, self.mic.get_level() * self.settings.get("mic_sensitivity", S.MIC_LEVEL_SCALE))
             gated = raw if raw > S.MIC_NOISE_GATE else 0.0
@@ -392,24 +463,97 @@ class App:
         del pixel_view
         return surf
 
+    def _make_angel_glow(self):
+        size = 640
+        yy, xx = np.mgrid[0:size, 0:size]
+        cx = cy = size / 2.0
+        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / (size / 2.0)
+        t = np.clip(1.0 - dist, 0.0, 1.0)
+        alpha = (t ** 1.6 * 255.0).astype(np.uint8)
+        surf = pygame.Surface((size, size), pygame.SRCALPHA)
+        surf.fill((255, 248, 222, 255))
+        alpha_view = pygame.surfarray.pixels_alpha(surf)
+        alpha_view[:, :] = alpha.T
+        del alpha_view
+        return surf
+
+    def _make_angel_eye_specs(self):
+        rng = random.Random(0xA4732)
+        specs = []
+        for _ in range(S.ANGEL_EYE_COUNT):
+            ang = rng.uniform(0, math.tau)
+            rad = rng.uniform(0.2, 1.4)
+            phase = rng.uniform(0, math.tau)
+            rate = rng.uniform(1.2, 3.4)
+            size = rng.uniform(0.55, 1.15)
+            jitter_phase = rng.uniform(0, math.tau)
+            specs.append((ang, rad, phase, rate, size, jitter_phase))
+        return specs
+
+    def _make_angel_wing_specs(self):
+        rng = random.Random(0x71E63)
+        specs = []
+        for i in range(S.ANGEL_WING_COUNT):
+            base_ang = math.tau * i / S.ANGEL_WING_COUNT + rng.uniform(-0.08, 0.08)
+            length = rng.uniform(0.85, 1.15)
+            flap_phase = rng.uniform(0, math.tau)
+            flap_rate = rng.uniform(1.5, 2.3)
+            n_feathers = rng.randint(6, 8)
+            layer_offset = rng.uniform(-0.09, 0.09) * rng.choice((-1.0, 1.0))
+            specs.append((base_ang, length, flap_phase, flap_rate, n_feathers, layer_offset))
+        return specs
+
+    def _make_angel_vein_specs(self):
+        rng = random.Random(0x9CE41)
+        return [(rng.uniform(0, math.tau), rng.uniform(0.55, 1.0), rng.uniform(0, math.tau))
+                for _ in range(12)]
+
+    def _make_angel_center_eye_specs(self):
+        rng = random.Random(0x0C1E5)
+        specs = []
+        for i in range(18):
+            ang = math.tau * i / 18 + rng.uniform(-0.22, 0.22)
+            rad = rng.uniform(0.0, 1.0) ** 0.6
+            size = rng.uniform(0.55, 1.05)
+            phase = rng.uniform(0, math.tau)
+            rate = rng.uniform(1.1, 2.6)
+            specs.append((ang, rad, size, phase, rate))
+        return specs
+
     def new_game(self):
         self.sounds.stop_all_threat_audio()
+        self.sounds.stop_angel_choir(fade_ms=200)
         self.player = Player(0.0, 0.0)
         self.debug_demo_monsters = []
+        self.debug_door_monster = None
+        self.debug_door_monster_door = None
+        self._debug_door_goal = None
+        self._debug_door_ends = None
+        self._debug_door_corridor_set = None
+        self.anim_t = 0.0
+        self.frame_dt = 1.0 / 60.0
         self._load_menu_scene()
 
+        self.anomaly_roll = random.choices(S.ANOMALY_ROLLS,
+                                           weights=S.ANOMALY_ROLL_WEIGHTS)[0]
         self.elapsed = 0.0
-        self.anim_t = 0.0
         self.dread = 0.0
         self._dread_time_frac = 0.0
         self._dread_progress_frac = 0.0
         self._scare_seconds_to_fill = 14.0
         self._scare_lit = False
         self.note_text = None
-        self.note_timer = 0.0
+        self.note_back_text = None
+        self.note_back_kind = None
+        self.note_return_state = "playing"
+        self._note_fade = 0.0
+        self._note_closing = False
+        self._note_settling = False
+        self.note_spin = [0.0, 0.0]
+        self._note_dirty = False
         self.hint_text = None
         self.hint_timer = 0.0
-        self.floor_banner = self._spec_t("title")
+        self.floor_banner = self._spec_text("title")
         self.floor_banner_timer = 4.0
         self.scare_progress = 0.0
         self.scare_target = random.uniform(0.85, 1.15)
@@ -418,43 +562,71 @@ class App:
         self.hallu_target = random.uniform(0.85, 1.15)
         self.hallu_cooldown = 0.0
         self.hallu_active = []
+        self.hallu_intensity = 0.0
         self.sanity_boost_timer = 0.0
+        self.trip_intensity = 0.0
+        self.comedown_intensity = 0.0
+        self._comedown_remaining = 0.0
+        self._trip_cam_yaw = self.player.angle
+        self._trip_cam_pitch = self.player.pitch
+        self._trip_prev_player_angle = self.player.angle
+        self._trip_target_unwrapped = self.player.angle
+        self._trip_follower_unwrapped = self.player.angle
+        self._dark_time_t = 0.0
         self.fx_shake = fx.ScreenShake()
         self.catch_timer = 0.0
-        self.transition_timer = 0.0
         self.hide_transition = None
         self.hide_vignette_t = 0.0
+        self.elevator_ride = None
+        self.hatch_climb = None
+        self._debug_transition_test = False
+        self._debug_spectator = False
+        self.catch_cam = None
+        self.elevator_called = False
+        self.elevator_call_t = 0.0
+        self.elevator_arrived = False
+        self.elevator_guard_idle_t = 0.0
+        self._elevator_lit_index = 0
+        self.hatch_turn_progress = 0.0
+        self._hatch_wheel_coast = 0.0
+        self.hatch_turning = False
+        self._hatch_creak_timer = 0.0
+        self.fence_cut_progress = 0.0
+        self._cutters_break_count = 0
+        self.fence_cutting = False
+        self.fence_escape = None
+        self.angel_seq = None
+        self._angel_roll_done = False
         self._battery_warned = False
         self.stats = {"notes": 0, "batteries": 0, "scares": 0}
+        self._reset_map()
         self.scare_flash_timer = 0.0
         self.interact_feedback_timer = 0.0
+        self._reset_interaction_state()
+        self._lean_input_grace = 0.0
+        self.confirm_return = "menu"
+        self.state = "menu"
+
+    def _reset_interaction_state(self):
         self.install_hold_target = None
         self.install_hold_t = 0.0
+        self.cutters_repair_target = None
+        self.cutters_repair_t = 0.0
+        self._cutters_break_timer = 0.0
+        self._cutters_grace_remaining = 0.0
         self.peek_hold_target = None
         self.peek_hold_t = 0.0
         self.is_peeking = False
         self.peek_t = 0.0
         self.peek_door = None
-        self.confirm_return = "menu"
-        self.state = "menu"
+        self._lean_prev_left = False
+        self._lean_prev_right = False
+        self._lean_active_dir = 0
 
-    def _build_floor_scene(self, spec, room_count_range=None):
-        seed = random.randrange(1 << 30)
-        self.floor_seed = seed
-        layout = spec.get("layout", "corridor")
-        if layout == "yard":
-            self.maze = Maze(w=S.YARD_W, h=S.YARD_H, seed=seed, layout="yard")
-        else:
-            self.maze = Maze(seed=seed, wall_bias=spec["wall_bias"], template_floor=spec.get("floor_theme"),
-                              room_count_range=room_count_range)
-        rng = random.Random(seed ^ 0x5EED)
-        if layout == "yard":
-            self.props, self.panel_prop, self.exit_prop, monster_cell, self.doors = populate_yard(self.maze, spec, rng)
-        else:
-            self.props, self.panel_prop, self.exit_prop, monster_cell, self.doors = populate_level(self.maze, spec, rng)
+    def _install_level(self, spec, default_theme="upper"):
         self.props.sort(key=lambda p: (p.kind, p.texture or ""))
-        self.renderer.build_level(self.maze, theme=spec.get("floor_theme", "upper"))
-
+        self.renderer.build_level(self.maze, theme=spec.get("floor_theme", default_theme),
+                                  **self._hatch_holes())
         sx, sy = self.maze.start
         self.player.x, self.player.y = sx, sy
         self.player.angle = random.uniform(0, math.tau)
@@ -463,43 +635,301 @@ class App:
         self.player.is_hiding = False
         self.player.hidden_in = None
 
-        monster_blocked = {
-            (int(p.x), int(p.y)) for p in self.props
-            if p.solid and (not p.wall_mounted or p.kind == "locker")
-        }
-        lockers = [p for p in self.props if p.kind == "locker"]
+    def _inert_monster(self, cell, seed):
+        return Monster(
+            cell[0] + 0.5, cell[1] + 0.5, self.maze,
+            rng=random.Random(seed ^ 0xB0B0),
+            speed_mult=0.0, vision_mult=0.0,
+            blocked_cells=set(), lockers=[], doors=self.doors,
+            blocked_prop_candidates=[], dead_end_lockers=[],
+        )
+
+    _FLOOR_TRIES = 6
+
+    def _build_floor_scene(self, spec, room_count_range=None):
+        layout = spec.get("layout", "corridor")
+        stage = S.anomaly_stage(getattr(self, "anomaly_roll", S.ANOMALY_DEFAULT_STAGE),
+                                spec["key"])
+        self.anomaly_stage = stage
+
+        def build(seed):
+            if layout == "yard":
+                return Maze(w=S.YARD_W, h=S.YARD_H, seed=seed, layout="yard",
+                            anomaly=stage)
+            return Maze(seed=seed, wall_bias=spec["wall_bias"], template_floor=spec.get("floor_theme"),
+                         room_count_range=room_count_range or spec.get("room_count"),
+                         anomaly=stage)
+
+        min_cells = 0 if room_count_range else spec.get("min_cells", 0)
+        best = None
+        for _ in range(self._FLOOR_TRIES if min_cells else 1):
+            seed = random.randrange(1 << 30)
+            maze = build(seed)
+            size = len(maze.floor_cells())
+            if best is None or size > best[0]:
+                best = (size, seed, maze)
+            if size >= min_cells:
+                break
+        _size, seed, maze = best
+        self.floor_seed = seed
+        self.maze = maze
+        rng = random.Random(seed ^ 0x5EED)
+        if getattr(self.player, "has_map", False) and spec.get("n_maps"):
+            spec = dict(spec, n_maps=0)
+        if layout == "yard":
+            self.props, self.panel_prop, self.exit_prop, monster_cell, self.doors = populate_yard(
+                self.maze, spec, rng, stage=stage)
+        else:
+            self.props, self.panel_prop, self.exit_prop, monster_cell, self.doors = populate_level(
+                self.maze, spec, rng, stage=stage)
+        self._install_level(spec)
+
+        monster_blocked = cells_no_body_fits(
+            [p for p in self.props if not p.wall_mounted or p.kind == "locker"],
+            S.MONSTER_RADIUS)
+        lockers = [p for p in self.props if p.kind == "locker" and not p.locker_blocked]
         self.monster = Monster(
             monster_cell[0] + 0.5, monster_cell[1] + 0.5, self.maze,
             rng=random.Random(seed ^ 0xB0B0),
             speed_mult=spec["speed_mult"], vision_mult=spec["vision_mult"],
+            vision_light_norm=spec.get("vision_light_norm", S.MONSTER_VISION_LIGHT_NORM),
             blocked_cells=monster_blocked,
             lockers=lockers,
             doors=self.doors,
             blocked_prop_candidates=[p for p in self.props if not p.wall_mounted or p.kind == "locker"],
             dead_end_lockers=self.maze.dead_end_lockers(lockers),
+            exit_cell=self.exit_prop.interact_cell if self.exit_prop is not None else None,
         )
 
     def _load_menu_scene(self):
         self.floor_i = 0
-        self.spec = S.FLOOR_SPECS[0]
+        self.spec = dict(S.FLOOR_SPECS[0])
+        self.spec["broken_light_chance"] = S.MENU_BROKEN_LIGHT_CHANCE
         self._floor_music_pending = False
         self._build_floor_scene(self.spec, room_count_range=S.MENU_ROOM_COUNT)
+        self._menu_cam = self._pick_menu_camera()
+        self.player.x, self.player.y = self._menu_cam[0], self._menu_cam[1]
+        self.player.peek_x, self.player.peek_y = self.player.x, self.player.y
+        self.player.angle = self._menu_cam[2]
+        self.player.pitch = 0.0
+
+    def _pick_menu_camera(self):
+        maze, props = self.maze, self.props
+        lamps = [p for p in props if p.light_radius and not p.broken
+                 and p.kind in MENU_CAM_LAMP_KINDS]
+        if not lamps:
+            lamps = [p for p in props if p.light_radius and not p.broken
+                     and p.kind in MENU_CAM_LAMP_KINDS_FALLBACK]
+        if not lamps:
+            for p in props:
+                if p.light_radius and p.kind in MENU_CAM_LAMP_KINDS_FALLBACK:
+                    p.broken = False
+                    lamps = [p]
+                    break
+        cx, cy = maze.room_center_near((int(self.player.x), int(self.player.y)))
+        fallback = (cx + 0.5, cy + 0.5, self.player.angle)
+        if not lamps:
+            return fallback
+
+        tan_h = math.tan(math.radians(FOV_DEGREES) / 2.0) * (self.renderer.low_w / self.renderer.low_h)
+        off = math.atan(S.MENU_CAM_NDC_X * tan_h)
+        near, far = S.MENU_CAM_DIST
+        best, best_score = fallback, -1.0
+        for lamp in lamps:
+            lx, ly = lamp.x, lamp.y
+            for iy in range(int(ly - far), int(ly + far) + 1):
+                for ix in range(int(lx - far), int(lx + far) + 1):
+                    if not maze.is_walkable_cell(ix, iy):
+                        continue
+                    x, y = ix + 0.5, iy + 0.5
+                    dist = math.hypot(lx - x, ly - y)
+                    if not near <= dist <= far:
+                        continue
+                    if not maze.has_line_of_sight(x, y, lx, ly):
+                        continue
+                    yaw = math.atan2(ly - y, lx - x) - off
+                    if not self._menu_cam_fits(x, y, yaw):
+                        continue
+                    score = self._menu_shot_score(x, y, yaw)
+                    if score > best_score:
+                        best, best_score = (x, y, yaw), score
+        return best
+
+    def _menu_cam_fits(self, x, y, yaw):
+        r = S.PLAYER_RADIUS + 0.12
+        fx, fy = math.cos(yaw), math.sin(yaw)
+        d = S.MENU_CAM_DOLLY
+        for ox, oy in ((0.0, 0.0), (-fy * d, fx * d), (fy * d, -fx * d),
+                       (fx * d, fy * d), (-fx * d, -fy * d)):
+            if self.player._collides(self.maze, self.props, x + ox, y + oy, r):
+                return False
+        return True
+
+    def _menu_shot_score(self, x, y, yaw):
+        maze = self.maze
+        tan_h = math.tan(math.radians(FOV_DEGREES) / 2.0) * (self.renderer.low_w / self.renderer.low_h)
+        score, centre_reach = 0.0, 0.0
+        for ndc, weight in ((-0.2, 0.3), (0.25, 0.8), (0.6, 1.0), (0.9, 0.7)):
+            ang = yaw + math.atan(ndc * tan_h)
+            dx, dy = math.cos(ang), math.sin(ang)
+            reach = 0.0
+            for d in (0.8, 1.6, 2.4, 3.4, 4.6, 6.0, 7.5, 9.0):
+                px, py = x + dx * d, y + dy * d
+                if maze.blocks_sight(px, py):
+                    break
+                if line_blocked_by_cover(self.props, x, y, px, py, min_height=0.5):
+                    break
+                reach = d
+                if d <= 6.0:
+                    score += weight * self._light_level_at(px, py)
+            score += weight * reach * 0.05
+            if ndc == 0.25:
+                centre_reach = reach
+        if centre_reach < 2.2:
+            score -= 2.0
+        return score
+
+    def _sync_menu_player(self):
+        override = self._menu_camera_override()
+        if override is None:
+            return
+        (ex, ey, _ez), yaw, _pitch, _fov = override
+        p = self.player
+        p.x, p.y = ex, ey
+        p.peek_x, p.peek_y = ex, ey
+        p.angle = yaw
 
     def _load_floor(self, index):
+        t_load = time.perf_counter()
         spec = S.FLOOR_SPECS[index]
         self.floor_i = index
         self.spec = spec
         self._floor_music_pending = True
-        self._build_floor_scene(spec)
+        if self._debug_transition_test:
+            if spec.get("layout") == "yard":
+                self._build_micro_yard_scene(spec)
+            else:
+                self._build_micro_room_scene(spec)
+        else:
+            self._build_floor_scene(spec)
         self._door_break_sfx_timer = 0.0
         self.floor_elapsed = 0.0
-        self.floor_banner = self._spec_t("title")
+        self.floor_banner = self._spec_text("title")
         self.floor_banner_timer = 4.0
-        self.hint_text = self._spec_t("intro")
+        self.hint_text = self._spec_text("intro")
+        self.hint_timer = 6.0
+        if self._debug_transition_test:
+            self._apply_debug_transition_test_state()
+        self.floor_load_ms = (time.perf_counter() - t_load) * 1000.0
+
+    def _hatch_holes(self):
+        hatch = next((q for q in self.props if q.kind == "hatch"), None)
+        if hatch is not None:
+            return {"ceiling_hole": (hatch.x, hatch.y, R3D_HATCH_HALF), "sky": True}
+        arrival = next((q for q in self.props if q.kind == "hatch_arrival"), None)
+        if arrival is not None:
+            return {"floor_hole": (arrival.x, arrival.y, R3D_HATCH_HALF)}
+        return {}
+
+    def _build_micro_yard_scene(self, spec):
+        seed = random.randrange(1 << 30)
+        self.floor_seed = seed
+        self.maze = Maze(w=19, h=19, seed=seed, layout="micro_yard")
+        rng = random.Random(seed ^ 0x5EED)
+        self.props, self.panel_prop, self.exit_prop, monster_cell, self.doors = populate_micro_yard(self.maze, rng)
+        self._install_level(spec, "yard")
+
+        self.monster = self._inert_monster(monster_cell, seed)
+
+    def _build_micro_room_scene(self, spec):
+        seed = random.randrange(1 << 30)
+        self.floor_seed = seed
+        self.maze = Maze(w=11, h=11, seed=seed, layout="micro_room")
+        rng = random.Random(seed ^ 0x5EED)
+        self.props, self.panel_prop, self.exit_prop, monster_cell, self.doors = populate_micro_room(
+            self.maze, spec["exit_prop"], rng)
+        self._install_level(spec)
+
+        self.monster = self._inert_monster(monster_cell, seed)
+
+    def _apply_debug_transition_test_state(self):
+        if self.panel_prop is not None:
+            self.panel_prop.installed = self.spec.get("n_collectible", 0)
+            self.panel_prop.powered = True
+        if self.exit_prop is not None:
+            self.exit_prop.powered = True
+        p = self.player
+        p.battery = 100.0
+        if self.elevator_ride is None and self.hatch_climb is None:
+            p.flashlight_on = True
+        p.has_lighter = True
+        p.has_cutters = True
+        self.spec = dict(self.spec)
+        self.spec["no_threat"] = True
+
+    def _fly_move(self, dt, mouse_dx, mouse_dy):
+        p = self.player
+        p.angle = (p.angle + mouse_dx * S.MOUSE_SENSITIVITY) % (2 * math.pi)
+        p.pitch = max(-S.PITCH_LIMIT, min(S.PITCH_LIMIT, p.pitch - mouse_dy * S.MOUSE_SENSITIVITY_Y))
+        fast = self._binding_down("sprint")
+        speed = S.DEBUG_SPECTATOR_SPRINT if fast else S.DEBUG_SPECTATOR_SPEED
+        fwd = (1.0 if self._binding_down("forward") else 0.0) - (1.0 if self._binding_down("back") else 0.0)
+        side = (1.0 if self._binding_down("right") else 0.0) - (1.0 if self._binding_down("left") else 0.0)
+        if fwd or side:
+            n = math.hypot(fwd, side) or 1.0
+            fx, fy = math.cos(p.angle), math.sin(p.angle)
+            p.x += (fx * fwd - fy * side) / n * speed * dt
+            p.y += (fy * fwd + fx * side) / n * speed * dt
+        keys = pygame.key.get_pressed()
+        rise = ((1.0 if keys[pygame.K_SPACE] else 0.0)
+                - (1.0 if self._binding_down("crouch") else 0.0))
+        if rise:
+            p.fly_z = max(S.DEBUG_SPECTATOR_Z_MIN,
+                          min(S.DEBUG_SPECTATOR_Z_MAX, p.fly_z + rise * S.DEBUG_SPECTATOR_RISE * dt))
+        p.peek_x, p.peek_y = p.x, p.y
+        p.moved_this_frame = False
+        p.noise_radius = 0.0
+        p.lean_t = 0.0
+        p.is_crouching = False
+        p.is_sprinting = False
+        p.stamina = S.STAMINA_MAX
+        self._trip_cam_yaw, self._trip_cam_pitch = p.angle, p.pitch
+
+    def _start_spectator_level(self):
+        self._debug_spectator = True
+        self._load_floor(0)
+        self._begin_playing()
+        self.spec = dict(self.spec, ambient_level=S.DEBUG_SPECTATOR_AMBIENT,
+                         fog_dist=S.DEBUG_SPECTATOR_FOG, grace=0.0)
+        p = self.player
+        p.fly_z = 0.0
+        p.flashlight_on = False
+        p.lighter_on = False
+        p.map_open = False
+        p.active_held_item = None
+        p.equip_t = 0.0
+        p.sanity = S.SANITY_MAX
+        self.floor_banner = i18n.Text("debug.spectator_banner")
+        self.floor_banner_timer = 4.0
+        self.hint_text = i18n.Text("debug.spectator_hint")
+        self.hint_timer = 8.0
+
+    def _start_transition_test_level(self):
+        self._debug_transition_test = True
+        self._load_floor(0)
+        self._begin_playing()
+        self.floor_banner = i18n.Text("debug.transition_test_banner")
+        self.floor_banner_timer = 4.0
+        self.hint_text = i18n.Text("debug.transition_test_hint")
         self.hint_timer = 6.0
 
     def _start_debug_level(self):
+        self._build_debug_scene()
+        self._begin_playing()
+
+    def _build_debug_scene(self):
         self.player = Player(0.0, 0.0)
+        self._reset_map()
         seed = 424242
         self.floor_seed = seed
         self.floor_i = 0
@@ -530,7 +960,7 @@ class App:
         self.player.is_hiding = False
         self.player.hidden_in = None
 
-        debug_lockers = [p for p in self.props if p.kind == "locker"]
+        debug_lockers = [p for p in self.props if p.kind == "locker" and not p.locker_blocked]
         self.monster = Monster(
             monster_cell[0] + 0.5, monster_cell[1] + 0.5, self.maze,
             rng=random.Random(1), speed_mult=0.0, vision_mult=0.0,
@@ -541,29 +971,44 @@ class App:
         self.debug_demo_monsters = [
             _DemoMonster(**spec) for spec in getattr(self.maze, "demo_monster_spots", [])
         ]
+        self.debug_door_monster = None
+        self.debug_door_monster_door = None
+        self._debug_door_goal = None
+        self._debug_door_ends = None
+        self._debug_door_corridor_set = None
+        corridor = getattr(self.maze, "door_demo_corridor", None)
+        if corridor:
+            all_floor = set(self.maze.floor_cells())
+            corridor_set = set(corridor)
+            end_a, end_b = corridor[0], corridor[-1]
+            door_cell = corridor[len(corridor) // 2]
+            self.debug_door_monster_door = next(
+                (d for d in self.doors if d.cell == door_cell), None)
+            self._debug_door_ends = (end_a, end_b)
+            self._debug_door_corridor_set = corridor_set
+            self.debug_door_monster = Monster(
+                end_a[0] + 0.5, end_a[1] + 0.5, self.maze,
+                rng=random.Random(11), speed_mult=1.0, vision_mult=0.0,
+                blocked_cells=all_floor - corridor_set, lockers=[], doors=self.doors,
+                blocked_prop_candidates=[],
+            )
         self._door_break_sfx_timer = 0.0
         self.floor_elapsed = 0.0
         self.elapsed = 0.0
         self.dread = 0.0
         self.stats = {"notes": 0, "batteries": 0, "scares": 0}
-        self.install_hold_target = None
-        self.install_hold_t = 0.0
-        self.peek_hold_target = None
-        self.peek_hold_t = 0.0
-        self.is_peeking = False
-        self.peek_t = 0.0
-        self.peek_door = None
-        self.floor_banner = self._spec_t("title")
+        self._reset_interaction_state()
+        self.floor_banner = self._spec_text("title")
         self.floor_banner_timer = 4.0
-        self.hint_text = i18n.t("debug.hint")
+        self.hint_text = i18n.Text("debug.hint")
         self.hint_timer = 6.0
-        self._begin_playing()
 
     def _begin_playing(self):
         self.state = "playing"
         pygame.mouse.set_visible(False)
         pygame.event.set_grab(True)
         pygame.mouse.get_rel()
+        self._lean_input_grace = S.LEAN_INPUT_GRACE_SECONDS
         if not self.sounds.ch_ambient.get_busy():
             self.sounds.start_ambient()
 
@@ -574,6 +1019,12 @@ class App:
     def _release_mouse(self):
         pygame.mouse.set_visible(True)
         pygame.event.set_grab(False)
+
+    def _grab_mouse_for_play(self):
+        if self.state == "playing":
+            pygame.mouse.set_visible(False)
+            pygame.event.set_grab(True)
+            pygame.mouse.get_rel()
 
     def _quit(self):
         self.running = False
@@ -669,8 +1120,17 @@ class App:
         self._show_changelog = False
         self.sounds.play_ui()
 
+    def _in_debug_level(self):
+        return bool(self._in_debug_preview() or getattr(self, "_debug_spectator", False)
+                    or getattr(self, "_debug_transition_test", False)
+                    or (self.spec or {}).get("key") == "debug")
+
     def _in_debug_preview(self):
-        return bool(self.spec.get("no_threat")) and self.spec.get("key") != "debug"
+        return (bool(self.spec.get("no_threat")) and self.spec.get("key") != "debug"
+                and not self._debug_transition_test)
+
+    def _in_debug_showcase(self):
+        return self.spec.get("key") == "debug"
 
     def _to_menu(self):
         if self._in_debug_preview():
@@ -685,8 +1145,99 @@ class App:
         self.open_combo = None
         self._release_mouse()
 
+    def _open_gamma_calibration(self):
+        self.state = "gamma_calibration"
+        self.dragging_slider = None
+        self.sounds.play_ui()
+
+    def _close_gamma_calibration(self):
+        self.dragging_slider = None
+        self.state = "settings"
+        self._flush_pending_settings_save()
+        self.sounds.play_ui()
+
+    def _reset_gamma(self):
+        self.settings["gamma"] = 1.0
+        self.renderer.set_gamma(1.0)
+        self._settings_save_pending = True
+        self.sounds.play_ui()
+
+    _BAYER = (0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0,
+              3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0)
+
+    @staticmethod
+    def gamma_encode(level, gamma):
+        return int(round(255.0 * max(0.0, min(1.0, level)) ** (1.0 / max(gamma, 0.01))))
+
+    @classmethod
+    def gamma_symbol_pixel(cls, level, gamma, x, y):
+        from game.renderer3d import COLOR_QUANT_LEVELS
+        c = max(0.0, min(1.0, level)) ** (1.0 / max(gamma, 0.01))
+        c += (cls._BAYER[(y % 4) * 4 + (x % 4)] / 16.0 - 0.5) / 34.0
+        c = math.floor(c * COLOR_QUANT_LEVELS + 0.5) / COLOR_QUANT_LEVELS
+        return int(round(255.0 * max(0.0, min(1.0, c))))
+
+    def _gamma_layout(self):
+        cx = S.SCREEN_W // 2
+        slider = pygame.Rect(cx - 280, 500, 560, 16)
+        reset = self._button(pygame.Rect(cx - 250, 580, 230, 48), i18n.t("gamma.reset"), self._reset_gamma)
+        done = self._button(pygame.Rect(cx + 20, 580, 230, 48), i18n.t("gamma.done"), self._close_gamma_calibration)
+        return {"slider": slider, "buttons": [reset, done]}
+
+    def _draw_value_row(self, btn, value_text):
+        rect, hovered, border, col, text_x = self._draw_button_frame(btn)
+        vw = self.font_md.size(value_text)[0]
+        label = self._ellipsize(btn["label"], self.font_md, rect.right - 28 - vw - text_x)
+        self._text(self.font_md, label, col, topleft=(text_x, rect.centery - self.font_md.get_height() // 2),
+                   shadow=False)
+        self._text(self.font_md, value_text, col,
+                   topleft=(rect.right - 16 - vw, rect.centery - self.font_md.get_height() // 2), shadow=False)
+
+    def _draw_gamma_calibration(self):
+        from game.renderer3d import COLOR_QUANT_LEVELS
+        self.hud_surf.fill((0, 0, 0, 255))
+        gamma = self.settings["gamma"]
+        cx = S.SCREEN_W // 2
+        self._text(self.font_lg, i18n.t("gamma.title"), S.COL_TEXT, topleft=(90, 70))
+        words, lines, line = i18n.t("gamma.hint").split(), [], ""
+        for word in words:
+            trial = f"{line} {word}".strip()
+            if self.font_md.size(trial)[0] > 900 and line:
+                lines.append(line)
+                line = word
+            else:
+                line = trial
+        lines.append(line)
+        for i, text in enumerate(lines):
+            self._text(self.font_md, text, S.COL_UI_DIM, center=(cx, 175 + i * 32), shadow=False)
+        captions = ("gamma.invisible", "gamma.barely", "gamma.visible")
+        for i, (steps, caption) in enumerate(zip(GAMMA_SYMBOL_STEPS, captions)):
+            level = steps / COLOR_QUANT_LEVELS
+            sx = cx + (i - 1) * 270
+            eye = pygame.Rect(0, 0, 170, 86)
+            eye.center = (sx, 335)
+            mark = pygame.Surface(eye.size)
+            for yy in range(eye.h):
+                for xx in range(eye.w):
+                    v = self.gamma_symbol_pixel(level, gamma, eye.x + xx, eye.y + yy)
+                    mark.set_at((xx, yy), (v, v, v))
+            shape = pygame.Surface(eye.size, pygame.SRCALPHA)
+            pygame.draw.ellipse(shape, (255, 255, 255, 255), shape.get_rect())
+            pygame.draw.circle(shape, (0, 0, 0, 0), (eye.w // 2, eye.h // 2), 30)
+            pygame.draw.circle(shape, (255, 255, 255, 255), (eye.w // 2, eye.h // 2), 11)
+            mark.blit(shape, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+            self.hud_surf.blit(mark, eye.topleft)
+            self._text(self.font_sm, i18n.t(caption), (120, 112, 106), center=(sx, 410), shadow=False)
+        layout = self._gamma_layout()
+        lo, hi = SLIDER_SPECS["gamma"]
+        self._draw_slider(layout["slider"], (gamma - lo) / (hi - lo), i18n.t("gamma.label"), f"{gamma:.2f}",
+                          dragging=(self.dragging_slider == "gamma"))
+        for btn in layout["buttons"]:
+            self._draw_button(btn)
+
     def _close_settings(self):
         self.state = self.settings_return
+        self._flush_pending_settings_save()
         self.dragging_slider = None
         self.awaiting_bind = None
         self.open_combo = None
@@ -716,9 +1267,18 @@ class App:
         self.settings["mic_device"] = device_id
         self._save_settings()
         self.sounds.play_ui()
-        if self.mic.active:
-            self.mic.stop()
+        if self.settings.get("mic_enabled"):
             self._apply_mic_setting()
+
+    def _toggle_compass(self):
+        self.settings["compass"] = not self.settings.get("compass", True)
+        self._save_settings()
+        self.sounds.play_ui()
+
+    def _select_hud_style(self, style):
+        self.settings["hud_style"] = style
+        self._save_settings()
+        self.sounds.play_ui()
 
     def _select_language(self, code):
         i18n.set_language(code)
@@ -764,9 +1324,26 @@ class App:
             end_y = locker.y - math.sin(locker.facing) * locker.hd * 0.35
             end_angle = locker.facing
             end_pitch = -0.05
+            p.equip_t = 0.0
+            p.active_held_item = None
+            p.map_open = False
+            p._pre_map_light = None
+            p._pre_hide_light = tuple(
+                name for name, on in (("lighter", p.lighter_on),
+                                      ("flashlight", p.flashlight_on)) if on)
+            p.lighter_on = False
+            p.flashlight_on = False
         else:
             end_x, end_y, end_angle = self._hide_exit_target(locker)
             end_pitch = 0.0
+            was = p._pre_hide_light or ()
+            if isinstance(was, str):
+                was = (was,)
+            if "lighter" in was and p.has_lighter:
+                p.lighter_on = True
+            if "flashlight" in was and p.battery > 0.5:
+                p.flashlight_on = True
+            p._pre_hide_light = None
         self.hide_transition = {
             "t": 0.0, "duration": 0.5, "entering": entering, "locker": locker,
             "sx": p.x, "sy": p.y, "sa": p.angle, "sp": p.pitch,
@@ -776,6 +1353,7 @@ class App:
         p.moved_this_frame = False
         self.fx_shake.add(0.18)
         self.sounds.play_locker()
+        self.player.make_noise(S.NOISE_LOCKER)
 
     def _update_hide_transition(self, dt):
         ht = self.hide_transition
@@ -890,26 +1468,26 @@ class App:
         knob_x = track.right - knob_r - 3 if is_on else track.x + knob_r + 3
         pygame.draw.circle(self.hud_surf, (235, 228, 220), (knob_x, track.centery), knob_r)
 
-    def _draw_panel(self, rect, fill=(10, 9, 8, 165), border=(95, 88, 82), accent=(150, 55, 50),
-                     corner=20, target=None):
-        target = target if target is not None else self.hud_surf
-        surf = pygame.Surface(rect.size, pygame.SRCALPHA)
-        surf.fill(fill)
-        target.blit(surf, rect.topleft)
-        pygame.draw.rect(target, border, rect, width=1)
-        c = max(0, min(corner, rect.w // 2, rect.h // 2))
-        t = 2
-        x0, y0, x1, y1 = rect.left, rect.top, rect.right - 1, rect.bottom - 1
-        for hx, hy, vx, vy in (
-            (x0, y0, x0, y0),
-            (x1 - c + 1, y0, x1 - t + 1, y0),
-            (x0, y1 - t + 1, x0, y1 - c + 1),
-            (x1 - c + 1, y1 - t + 1, x1 - t + 1, y1 - c + 1),
-        ):
-            pygame.draw.rect(target, accent, (hx, hy, c, t))
-            pygame.draw.rect(target, accent, (vx, vy, t, c))
+    def _draw_panel(self, rect, fill=ui.PANEL_FILL, border=ui.PANEL_BORDER,
+                     accent=ui.PANEL_ACCENT, corner=20, target=None):
+        ui.draw_panel(target if target is not None else self.hud_surf, rect,
+                      fill=fill, border=border, accent=accent, corner=corner)
+
+    _WRAP_CACHE_MAX = 512
 
     def _wrap_text(self, text, font, max_width):
+        cache = self.__dict__.setdefault("_wrap_cache", {})
+        key = (text, font, max_width)
+        hit = cache.get(key)
+        if hit is not None:
+            return list(hit)
+        lines = self._wrap_text_uncached(text, font, max_width)
+        if len(cache) >= self._WRAP_CACHE_MAX:
+            cache.clear()
+        cache[key] = tuple(lines)
+        return lines
+
+    def _wrap_text_uncached(self, text, font, max_width):
         words = text.replace("\n", " ").split()
         lines = []
         cur = ""
@@ -925,10 +1503,8 @@ class App:
         return lines
 
     def _controls_hint_lines(self):
-        b = self.settings["bindings"]
-
         def k(action):
-            return pygame.key.name(b[action]).upper()
+            return self._binding_label(action)
 
         move_keys = "/".join(k(a) for a in ("forward", "left", "back", "right"))
         return [
@@ -1283,6 +1859,45 @@ class App:
             self._feedback_button(),
         ]
 
+    def _scroll_layer(self, viewport):
+        layer = self._scroll_surf
+        if layer is None or layer.get_size() != self.hud_surf.get_size():
+            layer = self._scroll_surf = pygame.Surface(self.hud_surf.get_size(), pygame.SRCALPHA)
+        layer.fill((0, 0, 0, 0), viewport)
+        layer.set_clip(viewport)
+        return layer
+
+    def _blit_scroll_layer(self, layer, viewport, scroll_px, max_scroll, band=30):
+        layer.set_clip(None)
+        band = max(0, min(band, viewport.h // 3))
+        if band:
+            alpha = pygame.surfarray.pixels_alpha(layer)
+            ramp = np.linspace(0.0, 1.0, band, dtype=np.float32)
+            x0, x1 = viewport.left, viewport.right
+            if scroll_px > 0:
+                top = viewport.top
+                strip = alpha[x0:x1, top:top + band].astype(np.float32) * ramp[None, :]
+                alpha[x0:x1, top:top + band] = strip.astype(np.uint8)
+            if scroll_px < max_scroll:
+                bot = viewport.bottom - band
+                strip = alpha[x0:x1, bot:bot + band].astype(np.float32) * ramp[::-1][None, :]
+                alpha[x0:x1, bot:bot + band] = strip.astype(np.uint8)
+            del alpha
+        self.hud_surf.blit(layer, viewport.topleft, viewport)
+
+    def _draw_scrollbar(self, viewport, scroll_px, max_scroll):
+        if max_scroll <= 0:
+            return
+        track = pygame.Rect(viewport.right + 14, viewport.top, 6, viewport.h)
+        pygame.draw.rect(self.hud_surf, (28, 26, 24), track, border_radius=3)
+        pygame.draw.rect(self.hud_surf, (70, 64, 58), track, width=1, border_radius=3)
+        content_h = viewport.h + max_scroll
+        thumb_h = max(28, int(viewport.h * viewport.h / content_h))
+        thumb_y = viewport.top + int((viewport.h - thumb_h) * (scroll_px / max_scroll))
+        thumb = pygame.Rect(track.x, thumb_y, track.w, thumb_h)
+        pygame.draw.rect(self.hud_surf, (110, 96, 62), thumb, border_radius=3)
+        pygame.draw.rect(self.hud_surf, (150, 130, 90), thumb, width=1, border_radius=3)
+
     def _settings_geom(self):
         left = 90
         top = 70
@@ -1312,23 +1927,26 @@ class App:
         w, h, gap, pad = content.w, 44, 10, 10
 
         if page == "graphics":
+            toggle_gap, slider_gap = 6, 28
             y = content.y + pad
             fs_rect = pygame.Rect(content.x, y, w, h)
-            y += h + 12
+            y += h + toggle_gap
             aa_rect = pygame.Rect(content.x, y, w, h)
-            y += h + 12
+            y += h + toggle_gap
             vs_rect = pygame.Rect(content.x, y, w, h)
-            y += h + 34
-            fps_rect = pygame.Rect(content.x, y, w - 170, 16)
-            y += 16 + 34
-            dist_rect = pygame.Rect(content.x, y, w - 170, 16)
-            y += 16 + 34
-            quality_rect = pygame.Rect(content.x, y, w - 170, 16)
+            y += h + toggle_gap
+            gamma_rect = pygame.Rect(content.x, y, w, h)
+            y += h + slider_gap
+            slider_keys = ("fps_limit", "view_distance", "quality_preset") + GFX_SLIDER_KEYS
+            sliders = {}
+            for key in slider_keys:
+                sliders[key] = pygame.Rect(content.x, y, w - 170, 16)
+                y += 16 + slider_gap
             fs_btn = self._button(fs_rect, i18n.t("settings.fullscreen"), self._toggle_fullscreen)
             aa_btn = self._button(aa_rect, i18n.t("settings.upscale_smoothing"), self._toggle_upscale_smoothing)
             vs_btn = self._button(vs_rect, i18n.t("settings.vsync"), self._toggle_vsync)
-            return {"sliders": {"fps_limit": fps_rect, "view_distance": dist_rect, "quality_preset": quality_rect},
-                    "buttons": [fs_btn, aa_btn, vs_btn]}
+            gamma_btn = self._button(gamma_rect, i18n.t("settings.gamma_row"), self._open_gamma_calibration)
+            return {"sliders": sliders, "buttons": [fs_btn, aa_btn, vs_btn, gamma_btn]}
 
         if page == "sound":
             y = content.y + pad
@@ -1362,11 +1980,10 @@ class App:
         if page == "controls":
             row_h, row_gap = 44, 10
             col_w = (content.w - 20) // 2
-            rows_h = 4 * (row_h + row_gap) - row_gap
-            y = content.y + pad
-            sens_x_rect = pygame.Rect(content.x, y, w - 170, 16)
-            y += 44
-            sens_y_rect = pygame.Rect(content.x, y, w - 170, 16)
+            n_rows = math.ceil(len(S.BINDING_ORDER) / 2)
+            rows_h = n_rows * (row_h + row_gap) - row_gap
+            y = content.y + pad + 26
+            sens_rect = pygame.Rect(content.x, y, w - 170, 16)
             y += 44
             rows = []
             for i, action in enumerate(S.BINDING_ORDER):
@@ -1376,13 +1993,35 @@ class App:
                 rows.append((action, pygame.Rect(rx, ry, col_w, row_h)))
             y += rows_h + 20
             reset_rect = pygame.Rect(content.centerx - 140, y, 280, 44)
+            total_h = (reset_rect.bottom + 34) - content.y
+            self._controls_max_scroll = max(0, total_h - content.h)
+            self._controls_scroll_px = max(0, min(self._controls_max_scroll,
+                                                   self._controls_scroll_px))
+            off = self._controls_scroll_px
+            if off:
+                sens_rect = sens_rect.move(0, -off)
+                rows = [(a, r.move(0, -off)) for a, r in rows]
+                reset_rect = reset_rect.move(0, -off)
             reset_btn = self._button(reset_rect, i18n.t("controls.reset"), self._reset_bindings)
-            return {"sliders": {"mouse_sensitivity": sens_x_rect, "mouse_sensitivity_y": sens_y_rect},
-                    "buttons": [reset_btn], "rows": rows, "msg_y": reset_rect.bottom + 24}
+            return {"sliders": {"mouse_sensitivity": sens_rect},
+                    "buttons": [reset_btn], "rows": rows, "msg_y": reset_rect.bottom + 24,
+                    "viewport": content}
 
-        if page == "language":
+        if page == "interface":
             y = content.y + pad + 26
-            lang_rect = pygame.Rect(content.x, y, w, h)
+            hud_rect = pygame.Rect(content.x, y, w, h)
+            styles = list(S.HUD_STYLES)
+            cur = self.settings.get("hud_style", styles[0])
+            hud_combo = {
+                "rect": hud_rect,
+                "options": [i18n.t("hud.style_" + k) for k in styles],
+                "selected_index": styles.index(cur) if cur in styles else 0,
+                "on_select": lambda i, ks=styles: self._select_hud_style(ks[i]),
+                "enabled": True,
+            }
+            comp_rect = pygame.Rect(content.x, hud_rect.bottom + 74, w, h)
+            comp_btn = self._button(comp_rect, i18n.t("settings.compass"), self._toggle_compass)
+            lang_rect = pygame.Rect(content.x, comp_rect.bottom + 48, w, h)
             labels = [i18n.LANGUAGE_NAMES[code] for code in i18n.LANGUAGES]
             current = i18n.get_language()
             selected = i18n.LANGUAGES.index(current) if current in i18n.LANGUAGES else 0
@@ -1391,12 +2030,14 @@ class App:
                 "on_select": lambda i: self._select_language(i18n.LANGUAGES[i]),
                 "enabled": True,
             }
-            return {"sliders": {}, "buttons": [], "combos": {"language": lang_combo}}
+            return {"sliders": {}, "buttons": [comp_btn],
+                    "combos": {"hud_style": hud_combo, "language": lang_combo},
+                    "blurb_y": hud_rect.bottom + 26}
 
         if page == "debug":
             y = content.y + pad
             rows = []
-            menu_only_ok = self.settings_return == "menu"
+            menu_only_ok = self.settings_return == "menu" or self._in_debug_level()
             for opt in DEBUG_HUD_OPTIONS:
                 enabled = menu_only_ok or opt not in MENU_ONLY_DEBUG_HUD_OPTIONS
                 rows.append(self._button((content.x, y, w, h), i18n.t(f"debug_hud.{opt}"),
@@ -1411,10 +2052,29 @@ class App:
         return i18n.t("settings.fps_unlimited") if v == 0 else str(v)
 
     def _apply_quality_preset(self, name):
-        preset = S.QUALITY_PRESETS.get(name, S.QUALITY_PRESETS["medium"])
-        low_w, low_h = preset["low_res"]
-        self.renderer.set_resolution(low_w, low_h, preset["snap_res"])
-        self.renderer.set_max_shadow_lights(preset["shadow_lights"])
+        preset = S.QUALITY_PRESETS.get(name)
+        if preset is not None:
+            self.settings.update(preset)
+        self._apply_graphics_settings()
+
+    def _apply_graphics_settings(self):
+        get = self.settings.get
+        self.renderer.set_gamma(get("gamma", 1.0))
+        scale = get("gfx_render_scale", "320p")
+        (low_w, low_h), snap = S.GFX_RENDER_SCALE_VALUES.get(
+            scale, S.GFX_RENDER_SCALE_VALUES["320p"])
+        self.renderer.set_resolution(low_w, low_h, snap)
+
+        shadow_res = get("gfx_shadow_res", "medium")
+        point_res, flash_res, moon_res = S.GFX_SHADOW_RES_VALUES.get(
+            shadow_res, S.GFX_SHADOW_RES_VALUES["medium"])
+        self.renderer.set_shadow_resolution(point_res, flash_res, moon_res)
+
+        self.renderer.set_shadow_quality(get("gfx_shadow_penumbra", "medium"))
+        self._sync_quality_preset_name()
+
+    def _sync_quality_preset_name(self):
+        self.settings["quality_preset"] = S.match_quality_preset(self.settings)
 
     def _toggle_upscale_smoothing(self):
         self.settings["upscale_smoothing"] = not self.settings["upscale_smoothing"]
@@ -1437,10 +2097,17 @@ class App:
         frac = max(0.0, min(1.0, (mouse_x - rect.x) / rect.w))
         if key in STEPPED_SLIDERS:
             options = STEPPED_SLIDERS[key]
-            idx = round(frac * (len(options) - 1)) if len(options) > 1 else 0
-            self.settings[key] = options[max(0, min(len(options) - 1, idx))]
             if key == "quality_preset":
-                self._apply_quality_preset(self.settings[key])
+                options = tuple(o for o in options if o in S.QUALITY_PRESETS)
+            idx = round(frac * (len(options) - 1)) if len(options) > 1 else 0
+            value = options[max(0, min(len(options) - 1, idx))]
+            if value == self.settings.get(key):
+                return
+            self.settings[key] = value
+            if key == "quality_preset":
+                self._apply_quality_preset(value)
+            elif key in S.GFX_SETTING_OPTIONS:
+                self._apply_graphics_settings()
         else:
             lo, hi = SLIDER_SPECS[key]
             self.settings[key] = lo + frac * (hi - lo)
@@ -1450,19 +2117,25 @@ class App:
                 self.sounds.set_sfx_volume(self.settings[key])
             elif key == "music_volume":
                 self.sounds.set_music_volume(self.settings[key])
-        self._save_settings()
+            elif key == "gamma":
+                self.renderer.set_gamma(self.settings[key])
+        self._settings_save_pending = True
+
+    def _flush_pending_settings_save(self):
+        if getattr(self, "_settings_save_pending", False):
+            self._settings_save_pending = False
+            self._save_settings()
 
     def _select_settings_tab(self, key):
         self.settings_page = key
+        self._flush_pending_settings_save()
         self.dragging_slider = None
         self.awaiting_bind = None
         self.open_combo = None
         if key == "sound":
+            self.mic.refresh_devices()
             if self.settings.get("mic_enabled") and self._mic_device_missing:
-                self.mic.stop()
                 self._apply_mic_setting()
-            else:
-                self.mic.refresh_devices()
         self.sounds.play_ui()
 
     def _handle_settings_click(self, pos):
@@ -1510,18 +2183,230 @@ class App:
                     return
         self._handle_button_click(layout["buttons"], pos)
 
-    def _resolve_bind(self, key):
+    def _binding_down(self, action):
+        kind, code = self.settings["bindings"][action]
+        if kind == "key":
+            return pygame.key.get_pressed()[code]
+        return pygame.mouse.get_pressed(num_buttons=5)[code - 1]
+
+    def _binding_matches_keydown(self, action, key):
+        kind, code = self.settings["bindings"][action]
+        return kind == "key" and code == key
+
+    def _binding_label(self, action):
+        kind, code = self.settings["bindings"][action]
+        if kind == "key":
+            return pygame.key.name(code).upper()
+        if code in (1, 2, 3):
+            return i18n.t(f"binding.mouse_{code}")
+        return i18n.t("binding.mouse_n", n=code)
+
+    def _prompt(self, key, **kwargs):
+        return i18n.t(key, interact=self._binding_label("interact"),
+                      alt_interact=self._binding_label("alt_interact"), **kwargs)
+
+
+    def _reset_map(self):
+        self.map_sheets = []
+        self.map_page = 0
+        self.map_cursor = [0.5, 0.5]
+        self._map_mode = False
+        self._map_drawing = False
+        self._map_dirty = True
+        self._map_ink_warned = False
+        self._map_turn = None
+        self._map_pencil_t = 0.0
+        self._map_help_shown = False
+        self._stamina_seen_t = 0.0
+        self._sheet_seed = random.randrange(1 << 30)
+        self._sheet_mark_list = None
+        self._clip_key = None
+        self._clip_surf = None
+        self._clip_raise = 0.0
+        self._clip_shade = None
+        self._clip_lit = -1.0
+        self._form_seen = None
+        self._form_lines = []
+        self._note_key = None
+        self._note_surf = None
+        self.note_back_text = None
+        self._form_key = None
+        self._form_surf = None
+        self._form_shade = None
+        self._form_lit = -1.0
+
+    def _add_map_sheet(self):
+        self.map_sheets.append(self._new_map_sheet(max(self.maze.w, self.maze.h) if self.maze else 40))
+        self._map_dirty = True
+        return len(self.map_sheets)
+
+    def _lean_taken_by_map(self, action):
+        if not self.player.map_open:
+            return False
+        b = self.settings["bindings"]
+        return b[action] == b["map_mode"] or (self._map_mode and b[action] == b["map_pencil"])
+
+    def _toggle_map_mode(self):
+        p = self.player
+        if p.map_open and p.active_held_item == "map" and not self.is_peeking and self.hide_transition is None:
+            self._map_mode = not self._map_mode
+            self._map_dirty = True
+
+    def _map_sync_floor(self):
+        if not self.map_sheets:
+            self._add_map_sheet()
+        self.map_page = max(0, min(len(self.map_sheets) - 1, self.map_page))
+
+    @staticmethod
+    def _new_map_sheet(meters):
+        size = S.MAP_TEXTURE_SIZE
+        surf = pygame.Surface((size, size))
+        surf.fill((214, 204, 176))
+        grid = (196, 188, 162)
+        for i in range(0, size, 16):
+            pygame.draw.line(surf, grid, (i, 0), (i, size - 1))
+            pygame.draw.line(surf, grid, (0, i), (size - 1, i))
+        return {"surf": surf, "meters": float(meters)}
+
+    def _flip_map_page(self, step):
+        self._map_sync_floor()
+        if len(self.map_sheets) < 2 or self._map_turn is not None:
+            return
+        d = 1 if step > 0 else -1
+        nxt = self.map_page + d
+        if not (0 <= nxt < len(self.map_sheets)):
+            return
+        if d > 0:
+            flat, moving = nxt, self.map_page
+        else:
+            flat, moving = self.map_page, nxt
+        self.map_page = nxt
+        self._map_turn = {"t": 0.0, "dir": d, "flat": flat, "moving": moving}
+        self._map_dirty = True
+        surf = self.map_sheets[moving]["surf"]
+        rgba = pygame.image.tostring(
+            surf.convert_alpha() if surf.get_bitsize() != 32 else surf, "RGBA", True)
+        self.renderer.set_map_turn_sheet(rgba, S.MAP_TEXTURE_SIZE)
+        self.sounds.play_page_turn()
+
+    def _update_map_turn(self, dt):
+        turn = self._map_turn
+        if turn is None:
+            self.renderer.map_turn = 0.0
+            return
+        turn["t"] += dt / S.MAP_PAGE_TURN_SECONDS
+        if turn["t"] >= 1.0:
+            self._map_turn = None
+            self.renderer.map_turn = 0.0
+            self._map_dirty = True
+            return
+        f = turn["t"]
+        f = f * f * (3.0 - 2.0 * f)
+        self.renderer.map_turn = f if turn["dir"] > 0 else 1.0 - f
+
+    def _update_map_drawing(self, mouse_dx, mouse_dy):
+        p = self.player
+        if not p.map_open or p.active_held_item != "map":
+            self._map_mode = False
+        drawing = self._map_mode and p.equip_t > 0.95 and self._map_turn is None
+        if drawing != self._map_drawing:
+            self._map_drawing = drawing
+            self._map_dirty = True
+        p.map_drawing = drawing
+        if not drawing:
+            return False
+        self._map_sync_floor()
+        sheet = self.map_sheets[self.map_page]
+        x0, y0 = self.map_cursor
+        x1 = min(0.98, max(0.02, x0 + mouse_dx * S.MAP_CURSOR_SPEED))
+        y1 = min(0.98, max(MAP_CURSOR_V_MIN, y0 + mouse_dy * S.MAP_CURSOR_SPEED))
+        seg = math.hypot(x1 - x0, y1 - y0)
+        if seg > 0.0 and self._binding_down("map_pencil"):
+            cost = seg
+            if p.pencil_ink <= 0.0:
+                if not self._map_ink_warned:
+                    self.hint_text = i18n.Text("hint.map_no_ink")
+                    self.hint_timer = 2.5
+                    self._map_ink_warned = True
+            else:
+                frac = min(1.0, p.pencil_ink / cost)
+                ex, ey = x0 + (x1 - x0) * frac, y0 + (y1 - y0) * frac
+                size = S.MAP_TEXTURE_SIZE
+                pygame.draw.line(sheet["surf"], (58, 56, 60), (x0 * size, y0 * size), (ex * size, ey * size),
+                                 S.MAP_LINE_WIDTH)
+                p.pencil_ink = max(0.0, p.pencil_ink - cost * frac)
+                if p.pencil_ink > 0.0:
+                    self._map_ink_warned = False
+        if seg > 0.0:
+            self.map_cursor = [x1, y1]
+            self._map_dirty = True
+        return True
+
+    def _sync_map_pencil(self, dt):
+        p = self.player
+        target = 1.0 if (self._map_mode and p.active_held_item == "map") else 0.0
+        self._map_pencil_t += (target - self._map_pencil_t) * min(1.0, dt * S.MAP_PENCIL_RAISE_RATE)
+        pencils = max(0.0, p.pencil_ink) / S.PENCIL_SHEETS
+        whole = int(math.ceil(pencils - 1e-6))
+        spares = max(0, whole - 1)
+        in_use = pencils - spares if pencils > 0.0 else 0.0
+        self.renderer.map_pencil = (in_use, spares, self._map_pencil_t,
+                                     self.map_cursor[0], self.map_cursor[1])
+
+    def _upload_map_sheet(self):
+        if self.player.active_held_item != "map":
+            return
+        behind = self.map_page
+        if self._map_turn is not None and self._map_turn["dir"] > 0:
+            behind -= 1
+        self.renderer.map_roll_pages = max(0, behind)
+        if not self._map_dirty:
+            return
+        self._map_sync_floor()
+        page = self._map_turn["flat"] if self._map_turn is not None else self.map_page
+        surf = self.map_sheets[page]["surf"]
+        if self._map_drawing:
+            surf = surf.copy()
+            size = S.MAP_TEXTURE_SIZE
+            cx, cy = int(self.map_cursor[0] * size), int(self.map_cursor[1] * size)
+            pygame.draw.circle(surf, (150, 30, 30), (cx, cy), 3, 1)
+        rgba = pygame.image.tostring(surf.convert_alpha() if surf.get_bitsize() != 32 else surf, "RGBA", True)
+        self.renderer.set_map_sheet(rgba, S.MAP_TEXTURE_SIZE)
+        self._map_dirty = False
+
+    def _resolve_lean_input(self, dt, suppress):
+        self._lean_input_grace = max(0.0, self._lean_input_grace - dt)
+        gated = suppress or self._lean_input_grace > 0.0
+        left_held = self._binding_down("lean_left") and not gated and not self._lean_taken_by_map("lean_left")
+        right_held = self._binding_down("lean_right") and not gated and not self._lean_taken_by_map("lean_right")
+
+        if left_held and not self._lean_prev_left:
+            self._lean_active_dir = -1
+        if right_held and not self._lean_prev_right:
+            self._lean_active_dir = 1
+        if self._lean_active_dir == -1 and not left_held:
+            self._lean_active_dir = 1 if right_held else 0
+        elif self._lean_active_dir == 1 and not right_held:
+            self._lean_active_dir = -1 if left_held else 0
+        elif not left_held and not right_held:
+            self._lean_active_dir = 0
+
+        self._lean_prev_left, self._lean_prev_right = left_held, right_held
+        return self._lean_active_dir == -1, self._lean_active_dir == 1
+
+    def _resolve_bind(self, binding):
         action = self.awaiting_bind
         self.awaiting_bind = None
-        if key == pygame.K_ESCAPE:
+        if binding == ("key", pygame.K_ESCAPE):
             return
-        conflict = next((a for a, k in self.settings["bindings"].items() if k == key and a != action), None)
+        conflict = next((a for a, b in self.settings["bindings"].items()
+                         if b == binding and a != action and frozenset((a, action)) not in S.SHARED_BINDINGS), None)
         if conflict is not None:
-            self.controls_msg = i18n.t("controls.key_taken", label=i18n.t(f"binding.{conflict}"))
+            self.controls_msg = i18n.Text("controls.key_taken", label=i18n.Text(f"binding.{conflict}"))
             self.controls_msg_timer = 3.0
             self.sounds.play_denied()
             return
-        self.settings["bindings"][action] = key
+        self.settings["bindings"][action] = binding
         self._save_settings()
         self.controls_msg = None
         self.sounds.play_ui()
@@ -1529,7 +2414,7 @@ class App:
     def _reset_bindings(self):
         self.settings["bindings"] = dict(S.DEFAULT_BINDINGS)
         self._save_settings()
-        self.controls_msg = i18n.t("controls.reset_done")
+        self.controls_msg = i18n.Text("controls.reset_done")
         self.controls_msg_timer = 2.5
         self.sounds.play_ui()
 
@@ -1544,6 +2429,7 @@ class App:
         if p.is_hiding:
             return "exit_hide", p.hidden_in
         best, best_d = None, 999.0
+        on_top = {}
         aim_half_angle = 0.5
         for prop in self.props:
             if prop.picked or prop.interactable is None:
@@ -1551,13 +2437,22 @@ class App:
             radius = 1.3 if prop.wall_mounted else 1.05
             dx, dy = prop.x - p.x, prop.y - p.y
             d = math.hypot(dx, dy)
-            if d >= radius or d >= best_d:
+            if d >= radius:
                 continue
             if d >= 0.45:
-                rel = (math.atan2(dy, dx) - p.angle + math.pi) % (2 * math.pi) - math.pi
+                rel = (math.atan2(dy, dx) - self._trip_cam_yaw + math.pi) % (2 * math.pi) - math.pi
                 if abs(rel) > aim_half_angle:
                     continue
+            if prop.interactable == "pickup":
+                on_top.setdefault((int(prop.x), int(prop.y)), []).append(prop)
+            if d >= best_d:
+                continue
             best, best_d = (prop.interactable, prop), d
+        if best is not None and best[0] != "pickup":
+            over = on_top.get((int(best[1].x), int(best[1].y)))
+            if over:
+                item = min(over, key=lambda q: math.hypot(q.x - p.x, q.y - p.y))
+                best, best_d = ("pickup", item), math.hypot(item.x - p.x, item.y - p.y)
         for door in self.doors:
             if door.is_broken:
                 continue
@@ -1570,41 +2465,71 @@ class App:
         key = self.spec.get(field, default_key)
         return i18n.t(key) if key else None
 
+    def _spec_text(self, field, default_key=None, capitalize=False):
+        key = self.spec.get(field, default_key)
+        return i18n.Text(key, capitalize=capitalize) if key else None
+
     def prompt_text(self, res):
         if res is None:
             return None
         kind, obj = res
         if kind == "exit_hide":
-            return i18n.t("prompt.exit_hide")
+            return self._prompt("prompt.exit_hide")
         if kind == "locker":
-            return i18n.t("prompt.hide")
+            return self._prompt("prompt.hide")
         if kind == "note":
-            return i18n.t("prompt.read_note")
+            return self._prompt("prompt.read_note")
+        if kind == "workbench":
+            if self.player.cutters_broken:
+                return self._prompt("prompt.repair_cutters")
+            return None
         if kind == "pickup":
             item = i18n.t(PICKUP_LABEL_KEYS[obj.kind]) if obj.kind in PICKUP_LABEL_KEYS else obj.kind
-            return i18n.t("prompt.pickup", item=item)
+            return self._prompt("prompt.pickup", item=item)
         if kind == "panel":
             panel_label = self._spec_t("panel_label")
             if obj.powered:
                 return i18n.t("hud.panel_status", label=panel_label, status=self._spec_t("panel_powered_text", "hud.powered"))
             if self.player.carried > 0:
-                return i18n.t("prompt.install_hold", label=self._spec_t("collectible_label"),
+                return self._prompt("prompt.install_hold", label=self._spec_t("collectible_label"),
                               have=obj.installed, need=self.spec["n_collectible"])
-            return i18n.t("prompt.panel_need", panel=panel_label, have=obj.installed,
+            return self._prompt("prompt.panel_need", panel=panel_label, have=obj.installed,
                           need=self.spec["n_collectible"], label=self._spec_t("collectible_label"))
         if kind == "exit":
             req = self.spec.get("exit_requires_item")
-            if req and not getattr(self.player, f"has_{req}", False):
+            if req and not self._player_has_exit_item(req):
                 return self._spec_t("exit_requires_label", "hint.something_missing")
             if obj.powered:
-                return i18n.t("prompt.exit_ready", label=self._spec_t("exit_label").capitalize())
-            return i18n.t("prompt.exit_no_power", label=self._spec_t("exit_label").capitalize())
+                if obj.kind == "elevator" and not self._in_debug_showcase():
+                    if not self.elevator_called:
+                        return self._prompt("prompt.elevator_call")
+                    if not self.elevator_arrived:
+                        return self._prompt("prompt.elevator_arriving")
+                    return self._prompt("prompt.elevator_enter")
+                if obj.kind == "hatch" and not self._in_debug_showcase():
+                    return self._prompt("prompt.hatch_turn")
+                if obj.kind == "fence_gap" and not self._in_debug_showcase():
+                    return self._prompt("prompt.fence_cut")
+                return self._prompt("prompt.exit_ready", label=self._spec_t("exit_label").capitalize())
+            return self._prompt("prompt.exit_no_power", label=self._spec_t("exit_label").capitalize())
         if kind == "door":
-            return i18n.t("prompt.door_close") if obj.is_open else i18n.t("prompt.door_open")
+            return self._prompt("prompt.door_close") if obj.is_open else self._prompt("prompt.door_open")
         if kind == "portal":
             target = i18n.t(PORTAL_LABEL_KEYS[obj.target_floor]) if obj.target_floor in PORTAL_LABEL_KEYS else "?"
-            return i18n.t("prompt.portal", target=target)
+            return self._prompt("prompt.portal", target=target)
         return None
+
+    def alt_prompt_text(self, res):
+        if res is None:
+            return None
+        kind, obj = res
+        if kind != "door" or obj.is_broken:
+            return None
+        if obj.is_open:
+            return self._prompt("prompt.door_close_and_lock")
+        if obj.is_latched:
+            return self._prompt("prompt.door_unlock")
+        return self._prompt("prompt.door_lock")
 
     def interact(self):
         if self.hide_transition is not None:
@@ -1618,8 +2543,8 @@ class App:
         elif kind == "locker":
             self._start_hide_transition(obj, entering=True)
         elif kind == "note":
-            self.note_text = i18n.t(obj.note_text)
-            self.note_timer = S.NOTE_DISPLAY_SECONDS
+            self._open_note(i18n.Text(obj.note_text), getattr(obj, "note_back", None),
+                            getattr(obj, "note_back_kind", None))
             self.stats["notes"] += 1
             self.sounds.play_note_pickup()
         elif kind == "door":
@@ -1627,21 +2552,49 @@ class App:
                 obj.toggle()
                 pan, vol = self._pan_vol_for(obj.x, obj.y)
                 self.sounds.play_door(pan, vol)
+                self.player.make_noise(S.NOISE_DOOR)
             else:
                 self.peek_hold_target = obj
                 self.peek_hold_t = 0.0
         elif kind == "pickup":
+            if obj.kind == "pencil" and self.player.pencil_ink >= S.PENCIL_MAX_CARRIED * S.PENCIL_SHEETS:
+                self.hint_text = i18n.Text("hint.pencils_full", n=S.PENCIL_MAX_CARRIED)
+                self.hint_timer = 2.5
+                self.sounds.play_denied()
+                return
             obj.picked = True
             if obj.kind == "battery":
                 self.player.add_battery()
                 self.stats["batteries"] += 1
             elif obj.kind == "cutters":
                 self.player.has_cutters = True
-                self.hint_text = i18n.t("hint.cutters_picked")
+                self.hint_text = i18n.Text("hint.cutters_picked")
+                self.hint_timer = 3.0
+            elif obj.kind == "lighter":
+                self.player.has_lighter = True
+                self.hint_text = i18n.Text("hint.lighter_picked")
+                self.hint_timer = 3.0
+            elif obj.kind == "paper_map":
+                self.player.has_map = True
+                self.player.pencil_ink = min(S.PENCIL_MAX_CARRIED * S.PENCIL_SHEETS,
+                                             self.player.pencil_ink + S.PENCIL_SHEETS)
+                self._add_map_sheet()
+                self.hint_text = i18n.Text("hint.map_picked", map=self._binding_label("map"),
+                                           mode=self._binding_label("map_mode"),
+                                           pencil=self._binding_label("map_pencil"))
+                self.hint_timer = 5.0
+            elif obj.kind == "pencil":
+                self.player.pencil_ink = min(S.PENCIL_MAX_CARRIED * S.PENCIL_SHEETS,
+                                             self.player.pencil_ink + S.PENCIL_SHEETS)
+                self.hint_text = i18n.Text("hint.pencil_picked")
+                self.hint_timer = 2.5
+            elif obj.kind == "map_sheet":
+                n = self._add_map_sheet()
+                self.hint_text = i18n.Text("hint.sheet_picked", pages=n)
                 self.hint_timer = 3.0
             elif obj.kind == "sanity_pill":
                 self.sanity_boost_timer = S.SANITY_PILL_DURATION
-                self.hint_text = i18n.t("hint.sanity_pill_used")
+                self.hint_text = i18n.Text("hint.sanity_pill_used")
                 self.hint_timer = 3.0
             else:
                 self.player.carried += 1
@@ -1651,28 +2604,63 @@ class App:
                 self.sounds.play_ui()
             elif self.player.carried <= 0:
                 self.sounds.play_denied()
-                self.hint_text = i18n.t("hint.need_collectible", label=self._spec_t("collectible_label"),
+                self.hint_text = i18n.Text("hint.need_collectible", label=self._spec_text("collectible_label"),
                                          have=obj.installed, need=self.spec["n_collectible"])
                 self.hint_timer = 2.5
         elif kind == "exit":
+            if self._in_debug_showcase():
+                return
             req = self.spec.get("exit_requires_item")
-            if req and not getattr(self.player, f"has_{req}", False):
+            if req and not self._player_has_exit_item(req):
                 self.sounds.play_denied()
-                self.hint_text = self._spec_t("exit_requires_label", "hint.something_missing")
+                self.hint_text = self._spec_text("exit_requires_label", "hint.something_missing")
                 self.hint_timer = 2.5
             elif obj.powered:
-                self._trigger_exit()
+                if obj.kind == "elevator":
+                    if not self.elevator_called:
+                        self._call_elevator()
+                    elif self.elevator_arrived:
+                        self._start_elevator_ride()
+                    else:
+                        self.sounds.play_denied()
+                elif obj.kind in ("hatch", "fence_gap"):
+                    pass
             else:
                 self.sounds.play_denied()
         elif kind == "portal":
             if obj.target_floor == "hub":
                 self._start_debug_level()
             else:
-                self._enter_debug_peek(obj.target_floor)
+                self._enter_debug_peek(obj.target_floor,
+                                        live=bool(getattr(obj, "portal_live", False)))
+
+    def interact_alt(self):
+        if self.hide_transition is not None or self.is_peeking:
+            return
+        res = self.find_interactable()
+        if res is None:
+            return
+        kind, obj = res
+        if kind != "door":
+            return
+        if obj.is_broken:
+            self.sounds.play_denied()
+            return
+        was_open = obj.is_open
+        obj.toggle_latch()
+        pan, vol = self._pan_vol_for(obj.x, obj.y)
+        if was_open:
+            self.sounds.play_door(pan, vol)
+            self.player.make_noise(S.NOISE_DOOR)
+        else:
+            self.sounds.play_latch(pan, vol)
+            self.player.make_noise(S.NOISE_LATCH)
 
     def _complete_install(self, obj):
         self.player.carried -= 1
         obj.installed += 1
+        if obj.kind == "shed_lock":
+            self._drop_padlock(obj, obj.installed - 1)
         self.sounds.play_unlock()
         self._start_interact_feedback()
         if obj.installed >= self.spec["n_collectible"]:
@@ -1681,8 +2669,19 @@ class App:
                 obj.swing_target = 1.0
             if self.exit_prop is not None:
                 self.exit_prop.powered = True
-            self.hint_text = i18n.t("hint.exit_powered", label=self._spec_t("exit_label").capitalize())
+            self.hint_text = i18n.Text("hint.exit_powered", label=self._spec_text("exit_label", capitalize=True))
             self.hint_timer = 3.5
+
+    def _drop_padlock(self, door, index):
+        fx, fy = math.cos(door.facing), math.sin(door.facing)
+        side = -0.40 + 0.26 * index
+        x = door.x + fx * 0.34 - fy * side
+        y = door.y + fy * 0.34 + fx * side
+        if self.maze.circle_hits_wall(x, y, 0.08):
+            x, y = door.x + fx * 0.22 - fy * side, door.y + fy * 0.22 + fx * side
+        lock = Prop("padlock_dropped", x, y, facing=random.uniform(0.0, math.tau))
+        self.props.append(lock)
+        self.props.sort(key=lambda q: (q.kind, q.texture or ""))
 
     def _update_install_hold(self, dt, interact_held):
         target = None
@@ -1693,17 +2692,59 @@ class App:
                 if kind == "panel" and not obj.powered and self.player.carried > 0:
                     target = obj
         if target is None:
+            if self.install_hold_target is not None:
+                self.install_hold_target.install_t = 0.0
             self.install_hold_target = None
             self.install_hold_t = 0.0
             return
         if target is not self.install_hold_target:
+            if self.install_hold_target is not None:
+                self.install_hold_target.install_t = 0.0
             self.install_hold_target = target
             self.install_hold_t = 0.0
         self.install_hold_t += dt
+        target.install_t = min(1.0, self.install_hold_t / S.INSTALL_HOLD_SECONDS)
         if self.install_hold_t >= S.INSTALL_HOLD_SECONDS:
             self._complete_install(target)
+            target.install_t = 0.0
             self.install_hold_target = None
             self.install_hold_t = 0.0
+
+    def _update_cutters_repair(self, dt, interact_held):
+        target = None
+        if interact_held and self.player.cutters_broken:
+            res = self.find_interactable()
+            if res is not None:
+                kind, obj = res
+                if kind == "workbench":
+                    target = obj
+        was_repairing = self.cutters_repair_target is not None
+        if target is None:
+            if was_repairing:
+                self.sounds.stop_action_loop()
+                self.cutters_repair_target.install_t = 0.0
+            self.cutters_repair_target = None
+            self.cutters_repair_t = 0.0
+            return
+        if target is not self.cutters_repair_target:
+            if self.cutters_repair_target is not None:
+                self.cutters_repair_target.install_t = 0.0
+            self.cutters_repair_target = target
+            self.cutters_repair_t = 0.0
+        if not was_repairing:
+            self.sounds.start_cutters_repair_loop()
+        self.cutters_repair_t += dt
+        target.install_t = min(1.0, self.cutters_repair_t / S.CUTTERS_REPAIR_SECONDS)
+        if self.cutters_repair_t >= S.CUTTERS_REPAIR_SECONDS:
+            self.player.cutters_broken = False
+            target.install_t = 0.0
+            self.cutters_repair_target = None
+            self.cutters_repair_t = 0.0
+            self._cutters_grace_remaining = S.CUTTERS_REPAIR_GRACE_SECONDS
+            self.sounds.stop_action_loop()
+            self.sounds.play_unlock()
+            self.hint_text = i18n.Text("hint.cutters_repaired")
+            self.hint_timer = 2.5
 
     def _update_peek_hold(self, dt, interact_held):
         if interact_held and self.peek_hold_target is not None:
@@ -1725,9 +2766,13 @@ class App:
         elif not interact_held:
             if self.peek_hold_target is not None and not self.is_peeking:
                 target = self.peek_hold_target
+                was_latched = target.is_latched
                 target.toggle()
                 pan, vol = self._pan_vol_for(target.x, target.y)
-                self.sounds.play_door(pan, vol)
+                if was_latched:
+                    self.sounds.play_latch(pan, vol)
+                else:
+                    self.sounds.play_door(pan, vol)
             self.peek_hold_target = None
             self.peek_hold_t = 0.0
             self.is_peeking = False
@@ -1760,53 +2805,865 @@ class App:
         fov = FOV_DEGREES + (S.PEEK_FOV_DEGREES - FOV_DEGREES) * ease
         return eye, yaw, 0.0, fov
 
-    def _trigger_exit(self):
-        if self._in_debug_preview():
-            self._start_transition()
-        elif self.floor_i >= len(S.FLOOR_SPECS) - 1:
-            self._start_win_sequence()
+    def _update_fence_cut(self, dt, interact_held):
+        target = None
+        if interact_held and self.fence_escape is None and self.angel_seq is None:
+            res = self.find_interactable()
+            if res is not None:
+                kind, obj = res
+                if kind == "exit" and obj.kind == "fence_gap" and obj.powered:
+                    req = self.spec.get("exit_requires_item")
+                    if not req or self._player_has_exit_item(req):
+                        target = obj
+        was_cutting = self.fence_cutting
+        self.fence_cutting = target is not None
+        if self.fence_cutting and not was_cutting:
+            self.sounds.start_fence_cut_loop()
+        elif was_cutting and not self.fence_cutting:
+            self.sounds.stop_action_loop()
+        if target is None:
+            return
+        self.player.make_noise(S.NOISE_CUTTERS)
+        self.fence_cut_progress += dt / S.FENCE_CUT_SECONDS
+        target.cut_stage = min(2, int(self.fence_cut_progress * 3.0))
+        if self._cutters_grace_remaining > 0.0:
+            self._cutters_grace_remaining -= dt
+            self._cutters_break_timer = 0.0
+        elif self._cutters_break_count >= S.CUTTERS_BREAK_MAX_PER_CUT:
+            pass
+        elif not any(q.kind == "workbench" for q in self.props):
+            pass
         else:
-            self._start_transition()
+            self._cutters_break_timer += dt
+            if self._cutters_break_timer >= 1.0:
+                self._cutters_break_timer -= 1.0
+                chance = S.CUTTERS_BREAK_CHANCE_BASE + S.CUTTERS_BREAK_CHANCE_PROGRESS_SCALE * self.fence_cut_progress
+                if random.random() < chance:
+                    self._cutters_break_count += 1
+                    self.player.cutters_broken = True
+                    self.fence_cutting = False
+                    self.sounds.stop_action_loop(fade_ms=0)
+                    self.sounds.play_cutters_snap()
+                    self.hint_text = i18n.Text("hint.cutters_broke")
+                    self.hint_timer = 3.0
+                    return
+        if not self._angel_roll_done and self.fence_cut_progress >= S.ANGEL_TRIGGER_PROGRESS:
+            self._angel_roll_done = True
+            if random.random() < S.ANGEL_EVENT_CHANCE:
+                self.sounds.stop_action_loop()
+                self._start_angel_sequence()
+                return
+        if self.fence_cut_progress >= 1.0:
+            self.fence_cutting = False
+            self.fence_cut_progress = 0.0
+            self._cutters_break_count = 0
+            self.sounds.stop_action_loop()
+            target.cut = True
+            self.fx_shake.add(0.3)
+            self.sounds.play_bang()
+            self._start_fence_escape(cut_gap=target)
 
-    def _enter_debug_peek(self, target_floor):
+    def _build_forest_run_scene(self):
+        seed = random.randrange(1 << 30)
+        self.floor_seed = seed
+        period = S.FOREST_RUN_PERIOD
+        self.maze = Maze(w=17, h=int(period * 25), seed=seed, layout="forest_run")
+        rng = random.Random(seed ^ 0x5EED)
+        self.props, self.panel_prop, self.exit_prop, monster_cell, self.doors = populate_forest_run(self.maze, rng)
+        self.props.sort(key=lambda p: (p.kind, p.texture or ""))
+        self.renderer.build_level(self.maze, theme="yard")
+        self.spec = dict(self.spec, ambient_level=S.FOREST_RUN_AMBIENT,
+                         moon_strength=S.FOREST_RUN_MOON, fog_dist=S.FOREST_RUN_FOG_DIST,
+                         fog_color=S.FOREST_RUN_FOG_COLOR,
+                         ground_haze=S.FOREST_HAZE, haze_height=S.FOREST_HAZE_HEIGHT)
+        sx, _ = self.maze.start
+        self.player.x, self.player.y = sx, S.FOREST_RUN_START
+        self.player.angle = math.pi / 2
+        self.player.pitch = 0.0
+        self._forest_run_cx = sx
+
+    def _ensure_forest_run_scene(self):
+        if self.maze is not None and self.maze.layout == "forest_run":
+            return
+        self._build_forest_run_scene()
+        p = self.player
+        p.moved_this_frame = False
+        p.noise_radius = 0.0
+        p.lean_t = 0.0
+        p.peek_x, p.peek_y = p.x, p.y
+        p.flashlight_on = False
+        p.lighter_on = False
+        p.active_held_item = None
+        p.equip_t = 0.0
+        p.is_sprinting = True
+        self.monster = Monster(
+            self.player.x, self.player.y - 3.0, self.maze,
+            rng=random.Random(self.floor_seed ^ 0xB0B0),
+            speed_mult=0.0, vision_mult=0.0,
+            blocked_cells=set(), lockers=[], doors=[],
+            blocked_prop_candidates=[], dead_end_lockers=[],
+        )
+
+    def _start_fence_escape(self, cut_gap=None):
+        p = self.player
+        rel_f, rel_r, look_err, rel_pitch = 0.9, 0.0, 0.0, p.pitch
+        if cut_gap is not None:
+            gfx, gfy = math.cos(cut_gap.facing), math.sin(cut_gap.facing)
+            dx, dy = p.x - cut_gap.x, p.y - cut_gap.y
+            rel_f = dx * gfx + dy * gfy
+            rel_r = -dx * gfy + dy * gfx
+            look_err = _wrap_angle(p.angle - math.atan2(cut_gap.y - p.y, cut_gap.x - p.x))
+        light0 = (self.spec.get("ambient_level", 0.06), self._moon_strength(),
+                  self.spec.get("fog_dist", 12.5), tuple(self.spec.get("fog_color", S.COL_FOG)))
+        self._ensure_forest_run_scene()
+        gap = next((q for q in self.props if q.kind == "fence_gap"), None)
+        gx, gy = (gap.x, gap.y) if gap is not None else (p.x, p.y - 1.0)
+        sx, sy = gx + rel_r, gy - max(0.35, rel_f)
+        start_yaw = math.atan2(gy - sy, gx - sx) + look_err
+        self._run_speed_t = 0.0
+        self.fence_escape = {"t": 0.0, "gx": gx, "gy": gy,
+                             "sx": sx, "sy": sy, "sa": start_yaw,
+                             "sp": rel_pitch, "light0": light0}
+        p.x, p.y = sx, sy
+        p.peek_x, p.peek_y = p.x, p.y
+        p.angle, p.pitch = start_yaw, rel_pitch
+        p.is_sprinting = True
+        self.sounds.set_growl(False)
+        self._release_mouse()
+        self.state = "fence_escape"
+
+    def _fence_escape_camera_override(self):
+        fe = self.fence_escape
+        if fe is None:
+            return None
+        u = min(1.0, fe["t"] / S.FENCE_ESCAPE_SECONDS)
+        ease = u * u * (3.0 - 2.0 * u)
+        duck = math.sin(min(1.0, max(0.0, (u - 0.18) / 0.58)) * math.pi)
+        blend = min(1.0, u / 0.28)
+        blend = blend * blend * (3.0 - 2.0 * blend)
+        px = fe["gx"] + (fe["sx"] - fe["gx"]) * (1.0 - blend)
+        py_path = fe["sy"] + (fe["gy"] + 1.8 - fe["sy"]) * ease
+        py = py_path
+        z = EYE_HEIGHT - S.FENCE_ESCAPE_DUCK * duck
+        yaw_path = math.pi / 2
+        yaw = yaw_path + _wrap_angle(fe["sa"] - yaw_path) * (1.0 - blend)
+        pitch_path = -0.20 * duck + 0.08 * ease
+        pitch = pitch_path + (fe["sp"] - pitch_path) * (1.0 - blend)
+        life_yaw, life_pitch = self._cam_life(self.anim_t, 0.7 + duck)
+        bob = math.sin(u * 26.0) * 0.010 * (0.3 + ease)
+        return ((px, py, z + bob), yaw + life_yaw, pitch + life_pitch, FOV_DEGREES)
+
+    def _cam_life(self, t, amount=1.0):
+        yaw = (math.sin(t * 1.7) * 0.011 + math.sin(t * 0.63 + 1.1) * 0.017) * amount
+        pitch = (math.sin(t * 1.29 + 0.4) * 0.009 + math.sin(t * 2.87) * 0.005) * amount
+        return yaw, pitch
+
+    def _update_forest_run_motion(self, dt):
+        p = self.player
+        p.moved_this_frame = False
+        p.noise_radius = 0.0
+        self._update_forest_echoes()
+        self._run_speed_t = min(1.0, getattr(self, "_run_speed_t", 0.0) + dt / S.FOREST_RUN_PICKUP)
+        ramp = self._run_speed_t * self._run_speed_t * (3.0 - 2.0 * self._run_speed_t)
+        speed = S.FOREST_RUN_CRAWL_SPEED + (S.FOREST_RUN_SPEED - S.FOREST_RUN_CRAWL_SPEED) * ramp
+        p.y += speed * dt
+        if p.y >= S.FOREST_RUN_START + S.FOREST_RUN_LOOP:
+            p.y -= S.FOREST_RUN_LOOP
+        p.bob_phase += dt * speed * 6.0
+        p.x = self._forest_run_cx + math.sin(self.anim_t * 1.7) * 0.16
+        p.peek_x, p.peek_y = p.x, p.y
+
+    def _update_forest_echoes(self):
+        p = self.player
+        for q in self.props:
+            if q.kind != "asylum_echo":
+                continue
+            ahead = q.y - p.y
+            thin = (ahead - S.FOREST_ECHO_VANISH) / max(0.01, S.FOREST_ECHO_FADE)
+            q.ghost_alpha = S.FOREST_ECHO_ALPHA * max(0.0, min(1.0, thin))
+
+    def _update_fence_escape(self, dt):
+        fe = self.fence_escape
+        fe["t"] += dt
+        p = self.player
+        p.moved_this_frame = False
+        p.noise_radius = 0.0
+        cam = self._fence_escape_camera_override()
+        if cam is not None:
+            p.x, p.y = cam[0][0], cam[0][1]
+            p.peek_x, p.peek_y = p.x, p.y
+            p.bob_phase += dt * 6.0
+        self._update_forest_echoes()
+        if fe["t"] >= S.FENCE_ESCAPE_SECONDS:
+            self.fence_escape = None
+            self.player.pitch = 0.0
+            self.player.angle = math.pi / 2
+            self._trip_cam_yaw, self._trip_cam_pitch = self.player.angle, 0.0
+            self._trip_target_unwrapped = self._trip_follower_unwrapped = self.player.angle
+            self._trip_prev_player_angle = self.player.angle
+            if self._in_debug_preview():
+                self._start_debug_level()
+            else:
+                self._start_win_sequence()
+
+    def _update_win(self, dt):
+        self._update_forest_run_motion(dt)
+
+    def _start_angel_sequence(self):
+        p = self.player
+        ax, ay = self.maze.w / 2.0, self.maze.h / 2.0
+        az = S.ANGEL_HEIGHT
+        dx, dy, dz = ax - p.x, ay - p.y, az - EYE_HEIGHT
+        target_yaw = math.atan2(dy, dx)
+        target_pitch = max(-1.45, min(1.45, math.atan2(dz, math.hypot(dx, dy))))
+        self.angel_seq = {
+            "phase": "notice", "t": 0.0,
+            "start_yaw": p.angle, "start_pitch": p.pitch,
+            "yaw": p.angle, "pitch": p.pitch,
+            "target_yaw": target_yaw, "target_pitch": target_pitch,
+            "flood_t": 0.0, "pos": (ax, ay, az),
+            "burn": 0.0, "ray": 0.0,
+            "reach": math.hypot(math.hypot(ax, ay), az) * S.ANGEL_BURN_REACH,
+        }
+        p.moved_this_frame = False
+        p.noise_radius = 0.0
+        p.lean_t = 0.0
+        p.peek_x, p.peek_y = p.x, p.y
+        self.sounds.set_growl(False)
+        self.sounds.play_angel_stinger()
+        self.sounds.start_angel_choir()
+        self._release_mouse()
+        self.state = "angel_seq"
+
+    def _update_angel_sequence(self, dt):
+        a = self.angel_seq
+        a["t"] += dt
+        p = self.player
+        ax, ay, az = a["pos"]
+        ang_to = math.atan2(ay - p.y, ax - p.x)
+        rel = (ang_to - a["yaw"] + math.pi) % (2 * math.pi) - math.pi
+        self.sounds.update_angel_voice(max(-1.0, min(1.0, math.sin(rel))), a["flood_t"])
+        p.moved_this_frame = False
+        p.noise_radius = 0.0
+        if a["phase"] == "notice":
+            frac = min(1.0, a["t"] / S.ANGEL_NOTICE_SECONDS)
+            a["flood_t"] = 0.16 * frac
+            if frac >= 1.0:
+                a["phase"], a["t"] = "turn", 0.0
+        elif a["phase"] == "turn":
+            frac = min(1.0, a["t"] / S.ANGEL_TURN_SECONDS)
+            ease = frac * frac * (3.0 - 2.0 * frac)
+            da = (a["target_yaw"] - a["start_yaw"] + math.pi) % (2 * math.pi) - math.pi
+            a["yaw"] = (a["start_yaw"] + da * ease) % math.tau
+            a["pitch"] = a["start_pitch"] + (a["target_pitch"] - a["start_pitch"]) * ease
+            a["flood_t"] = 0.16 + 0.64 * ease
+            if frac >= 1.0:
+                a["yaw"], a["pitch"], a["flood_t"] = a["target_yaw"], a["target_pitch"], 0.8
+                a["phase"], a["t"] = "reveal", 0.0
+        elif a["phase"] == "reveal":
+            a["flood_t"] = min(0.92, 0.8 + 0.12 * (a["t"] / 0.6))
+            a["ray"] = S.ANGEL_RAY_STRENGTH * min(1.0, a["t"] / max(0.01, S.ANGEL_LOOK_SECONDS))
+            if a["t"] >= S.ANGEL_LOOK_SECONDS:
+                a["phase"], a["t"] = "burn", 0.0
+        elif a["phase"] == "burn":
+            frac = min(1.0, a["t"] / S.ANGEL_BURN_SECONDS)
+            a["burn"] = a["reach"] * (frac ** 2.0)
+            a["ray"] = S.ANGEL_RAY_STRENGTH * (1.0 + frac * 0.6)
+            a["flood_t"] = 0.92 + 0.08 * frac
+            if frac >= 1.0:
+                a["phase"], a["t"] = "whiteout", 0.0
+        elif a["phase"] == "whiteout":
+            a["flood_t"] = 1.0
+            a["burn"] = a["reach"]
+            if a["t"] >= S.ANGEL_WHITEOUT_SECONDS:
+                self._start_angel_end()
+        p.peek_x, p.peek_y = p.x, p.y
+
+    def _angel_camera_override(self):
+        if self.angel_seq is None:
+            return None
+        p = self.player
+        eye = (p.x, p.y, EYE_HEIGHT)
+        return eye, self.angel_seq["yaw"], self.angel_seq["pitch"], FOV_DEGREES
+
+    def _start_angel_end(self):
+        self.angel_seq = None
+        self.state = "angel_end"
+        self.catch_timer = 0.0
+        self.sounds.set_growl(False)
+        self.sounds.stop_angel_choir()
+        self._release_mouse()
+
+    def _update_angel_end(self, dt):
+        self.catch_timer += dt
+
+    def _call_elevator(self):
+        self.elevator_called = True
+        self.elevator_call_t = 0.0
+        self.elevator_arrived = False
+        self.elevator_guard_idle_t = 0.0
+        self._elevator_lit_index = 0
+        self.monster.guard_mode = True
+        if self.monster.state not in (Monster.HUNT, Monster.STALK):
+            self._teleport_monster_if_far(self.exit_prop.x, self.exit_prop.y, S.MONSTER_GUARD_RADIUS)
+        if self.monster.state == Monster.PATROL:
+            self.monster._enter_patrol()
+        self.hint_text = i18n.Text("hint.elevator_called")
+        self.hint_timer = 3.0
+        self.sounds.play_ui()
+
+    def _update_elevator_call(self, dt):
+        if not self.elevator_called:
+            return
+        if not self.elevator_arrived:
+            self.elevator_call_t += dt
+            idx = self._elevator_active_light_index()
+            if idx != self._elevator_lit_index:
+                self._elevator_lit_index = idx
+                self.sounds.play_elevator_floor_ding()
+            if self.elevator_call_t >= S.ELEVATOR_ARRIVE_SECONDS:
+                self.elevator_arrived = True
+                self.elevator_guard_idle_t = 0.0
+                self.hint_text = i18n.Text("hint.elevator_arrived")
+                self.hint_timer = 3.0
+                self.sounds.play_unlock()
+        else:
+            self.elevator_guard_idle_t += dt
+            if self.elevator_guard_idle_t >= S.ELEVATOR_GUARD_TIMEOUT_SECONDS:
+                self.elevator_called = False
+                self.elevator_arrived = False
+                self.elevator_call_t = 0.0
+                self.elevator_guard_idle_t = 0.0
+                self._elevator_lit_index = 0
+                self.monster.guard_mode = False
+                pan, vol = self._pan_vol_for(self.exit_prop.x, self.exit_prop.y)
+                self.sounds.play_door(pan, vol)
+
+
+    CABIN_KINDS = ("elevator", "elevator_arrival")
+
+    @staticmethod
+    def _cabin_point(prop, forward, right=0.0):
+        fx, fy = math.cos(prop.facing), math.sin(prop.facing)
+        wall = prop.hd + 0.005
+        return (prop.x + fx * (forward - wall) - fy * right, prop.y + fy * (forward - wall) + fx * right)
+
+    def _sync_wall_holes(self):
+        key = (id(self.props), len(self.props))
+        if getattr(self, "_wall_holes_key", None) == key:
+            return
+        self._wall_holes_key = key
+        holes = []
+        for p in self.props:
+            if p.kind not in self.CABIN_KINDS:
+                continue
+            fx, fy = math.cos(p.facing), math.sin(p.facing)
+            wx, wy = self._cabin_point(p, 0.0)
+            if abs(fx) > abs(fy):
+                holes.append((wx, p.y, R3D_ELEVATOR_OPENING_HALF, 0.0))
+            else:
+                holes.append((wy, p.x, R3D_ELEVATOR_OPENING_HALF, 1.0))
+        self.renderer.set_wall_holes(holes)
+
+    def _set_cabin_door(self, prop, door_t):
+        prop.door_t = door_t
+        open_frac = 1.0 - door_t
+        if open_frac > 0.02:
+            prop.light_radius = S.ELEVATOR_CABIN_LIGHT_RADIUS
+            prop.light_color = tuple(c * open_frac for c in S.ELEVATOR_CABIN_LIGHT_COLOR)
+        else:
+            prop.light_radius = None
+
+    def _update_elevator_doors(self, dt):
+        if self.elevator_ride is not None:
+            return
+        step = dt / S.ELEVATOR_DOOR_SWING_SECONDS
+        for p in self.props:
+            if p.kind not in self.CABIN_KINDS:
+                continue
+            target = 0.0 if (p is self.exit_prop and self.elevator_arrived) else 1.0
+            cur = getattr(p, "door_t", 1.0)
+            if cur != target:
+                cur = min(target, cur + step) if target > cur else max(target, cur - step)
+                self._set_cabin_door(p, cur)
+
+    def _start_elevator_ride(self):
+        p = self.player
+        panel = self.exit_prop
+        self.elevator_called = False
+        self.elevator_arrived = False
+        self.monster.guard_mode = False
+        self.elevator_ride = {
+            "phase": "enter", "t": 0.0, "cabin": panel,
+            "sx": p.x, "sy": p.y, "sa": p.angle, "sp": p.pitch,
+            "flashlight_was_on": p.flashlight_on, "lighter_was_on": p.lighter_on,
+            "swapped": False,
+        }
+        p.moved_this_frame = False
+        p.noise_radius = 0.0
+        p.lean_t = 0.0
+        p.peek_x, p.peek_y = p.x, p.y
+        p.map_open = False
+        self.sounds.set_growl(False)
+        self._battery_warned = False
+        self.state = "elevator_ride"
+
+    def _load_floor_for_elevator_arrival(self):
+        r = self.elevator_ride
+        if self._in_debug_preview():
+            self._build_debug_scene()
+            arrival = None
+        else:
+            self._load_floor(self.floor_i + 1)
+            rng = random.Random(self.floor_seed ^ 0xE1EA)
+            used_cells = {p.interact_cell for p in self.props if getattr(p, "interact_cell", None) is not None}
+            arrival = place_arrival_prop(self.maze, "elevator_arrival", rng, used=used_cells)
+        p = self.player
+        if arrival is not None:
+            self.props.append(arrival)
+            self._set_cabin_door(arrival, 1.0)
+            p.x, p.y = self._cabin_point(arrival, -S.ELEVATOR_CABIN_STAND)
+            p.angle = arrival.facing % math.tau
+        else:
+            p.x, p.y = self.maze.start
+        p.pitch = 0.0
+        r["cabin"] = arrival
+
+    def _update_elevator_ride(self, dt):
+        r = self.elevator_ride
+        r["t"] += dt
+        p = self.player
+        phase = r["phase"]
+        cabin = r["cabin"]
+        p.moved_this_frame = False
+        p.noise_radius = 0.0
+        p.update_held_item(dt, force_stow=True)
+
+        def ease(f):
+            f = max(0.0, min(1.0, f))
+            return f * f * (3.0 - 2.0 * f)
+
+        def turn_to(a0, a1, f):
+            da = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi
+            return (a0 + da * f) % math.tau
+
+        if phase == "enter":
+            frac = min(1.0, r["t"] / S.ELEVATOR_RIDE_ENTER_SECONDS)
+            w1 = self._cabin_point(cabin, S.ELEVATOR_DOORWAY_STEP)
+            w2 = self._cabin_point(cabin, -S.ELEVATOR_CABIN_STAND)
+            inward = (cabin.facing + math.pi) % math.tau
+            if frac < 0.45:
+                f = ease(frac / 0.45)
+                p.x, p.y = r["sx"] + (w1[0] - r["sx"]) * f, r["sy"] + (w1[1] - r["sy"]) * f
+                p.angle = turn_to(r["sa"], inward, f)
+                p.pitch = r["sp"] * (1.0 - f)
+            elif frac < 0.75:
+                f = ease((frac - 0.45) / 0.30)
+                p.x, p.y = w1[0] + (w2[0] - w1[0]) * f, w1[1] + (w2[1] - w1[1]) * f
+                p.angle, p.pitch = inward, 0.0
+            else:
+                p.x, p.y = w2
+                p.angle = turn_to(inward, cabin.facing, ease((frac - 0.75) / 0.25))
+            if frac >= 1.0:
+                p.angle = cabin.facing % math.tau
+                r["phase"], r["t"] = "closing", 0.0
+                self.sounds.play_elevator_door()
+        elif phase == "closing":
+            frac = min(1.0, r["t"] / S.ELEVATOR_DOOR_SWING_SECONDS)
+            self._set_cabin_door(cabin, ease(frac))
+            if frac >= 1.0:
+                r["phase"], r["t"] = "ride", 0.0
+                self.sounds.start_elevator_hum()
+        elif phase == "ride":
+            if not r["swapped"] and r["t"] >= S.ELEVATOR_DESCEND_HOLD_SECONDS * S.ELEVATOR_SWAP_FRAC:
+                r["swapped"] = True
+                self._load_floor_for_elevator_arrival()
+                cabin = r["cabin"]
+            if r["t"] >= S.ELEVATOR_DESCEND_HOLD_SECONDS:
+                self.sounds.stop_elevator_hum()
+                if cabin is None:
+                    self.elevator_ride = None
+                    p.flashlight_on = r["flashlight_was_on"]
+                    p.lighter_on = r["lighter_was_on"]
+                    self._begin_playing()
+                    return
+                r["phase"], r["t"] = "opening", 0.0
+                self.sounds.play_elevator_door()
+        elif phase == "opening":
+            frac = min(1.0, r["t"] / S.ELEVATOR_DOOR_SWING_SECONDS)
+            self._set_cabin_door(cabin, 1.0 - ease(frac))
+            if frac >= 1.0:
+                r["phase"], r["t"] = "exit", 0.0
+        elif phase == "exit":
+            frac = min(1.0, r["t"] / S.ELEVATOR_RIDE_EXIT_SECONDS)
+            w0 = self._cabin_point(cabin, -S.ELEVATOR_CABIN_STAND)
+            w1 = self._cabin_point(cabin, S.ELEVATOR_EXIT_STEP_DIST)
+            f = ease(frac)
+            p.x, p.y = w0[0] + (w1[0] - w0[0]) * f, w0[1] + (w1[1] - w0[1]) * f
+            if frac >= 1.0:
+                p.flashlight_on = r["flashlight_was_on"]
+                p.lighter_on = r["lighter_was_on"]
+                self.elevator_ride = None
+                self._begin_playing()
+        p.peek_x, p.peek_y = p.x, p.y
+
+    def _elevator_camera_override(self):
+        r = self.elevator_ride
+        if r is None:
+            return None
+        p = self.player
+        life_yaw, life_pitch = self._cam_life(self.anim_t, 0.8)
+        if r["phase"] != "ride":
+            return ((p.x, p.y, EYE_HEIGHT), p.angle + life_yaw, p.pitch + life_pitch, FOV_DEGREES)
+        t = self.anim_t
+        k = S.ELEVATOR_SHAKE * max(0.0, min(1.0, r["t"] / 0.3, (S.ELEVATOR_DESCEND_HOLD_SECONDS - r["t"]) / 0.3))
+        eye = (p.x + math.sin(t * 37.0) * k, p.y + math.sin(t * 29.0 + 1.3) * k,
+               EYE_HEIGHT + math.sin(t * 43.0 + 0.7) * k)
+        return (eye, p.angle + life_yaw, p.pitch + life_pitch + math.sin(t * 23.0) * k * 0.4,
+                FOV_DEGREES)
+
+    def _update_hatch_turn(self, dt, interact_held):
+        target = None
+        if interact_held and self.hatch_climb is None and self.elevator_ride is None:
+            res = self.find_interactable()
+            if res is not None:
+                kind, obj = res
+                if kind == "exit" and obj.kind == "hatch" and obj.powered and not self._in_debug_showcase():
+                    target = obj
+        was_turning = self.hatch_turning
+        self.hatch_turning = target is not None
+        if self.hatch_turning and not was_turning:
+            self.sounds.start_hatch_turn_loop()
+        elif was_turning and not self.hatch_turning:
+            self.sounds.stop_action_loop()
+        hatch = target
+        if hatch is None:
+            hatch = next((q for q in self.props if q.kind == "hatch"), None)
+        if hatch is not None:
+            rate = S.HATCH_WHEEL_TURNS * math.tau / S.HATCH_TURN_SECONDS
+            spin = getattr(hatch, "wheel_spin", 0.0)
+            if target is None:
+                hatch.wheel_spin = spin + self._hatch_wheel_coast * dt
+                self._hatch_wheel_coast *= max(0.0, 1.0 - dt * S.HATCH_WHEEL_EASE)
+            else:
+                self._hatch_wheel_coast = rate
+                hatch.wheel_spin = spin + rate * dt
+        if target is None:
+            return
+        self.hatch_turn_progress += dt / S.HATCH_TURN_SECONDS
+        self._hatch_creak_timer += dt
+        if self._hatch_creak_timer >= 1.0:
+            self._hatch_creak_timer -= 1.0
+            if random.random() < S.HATCH_CREAK_CHANCE_PER_SEC:
+                self._play_hatch_creak(target)
+        if self.hatch_turn_progress >= 1.0:
+            self.hatch_turn_progress = 1.0
+            self.hatch_turning = False
+            self.sounds.stop_action_loop()
+            self._start_hatch_climb()
+
+    def _play_hatch_creak(self, hatch):
+        pan, vol = self._pan_vol_for(hatch.x, hatch.y)
+        self.sounds.play_door(pan, vol)
+        self.hint_text = i18n.Text("hint.hatch_creaking")
+        self.hint_timer = 2.5
+        if self.monster.state not in (Monster.HUNT, Monster.STALK):
+            self._teleport_monster_if_far(hatch.x, hatch.y, S.MONSTER_GUARD_RADIUS)
+            self.monster.notify_global_noise(self.maze, hatch.interact_cell)
+
+    def _start_hatch_climb(self):
+        p = self.player
+        hatch = self.exit_prop
+        walk = math.hypot(hatch.x - p.x, hatch.y - p.y)
+        self.hatch_climb = {
+            "phase": "approach" if walk > 0.2 else "open", "t": 0.0,
+            "walk_t": walk / S.HATCH_WALK_SPEED,
+            "sx": p.x, "sy": p.y, "sa": p.angle, "sp": p.pitch,
+            "hx": hatch.x, "hy": hatch.y, "facing": hatch.facing,
+            "ax": hatch.x, "ay": hatch.y,
+            "step_x": None, "step_y": None,
+            "yaw": p.angle, "pitch": p.pitch, "z": EYE_HEIGHT, "moon": 0.0,
+            "swapped": False,
+            "flashlight_was_on": p.flashlight_on, "lighter_was_on": p.lighter_on,
+        }
+        hatch.hatch_open_t = 0.0
+        hatch.light_color = S.HATCH_SKY_LIGHT_COLOR
+        hatch.light_at = (0.0, 0.0, R3D_HATCH_SHAFT_RISE * 0.55)
+        hatch.light_lobe = (0.0, 0.0, -1.0, -0.15, 0.75, 0.0)
+        hatch.light_radius = 0.0
+        p.moved_this_frame = False
+        p.noise_radius = 0.0
+        p.lean_t = 0.0
+        p.peek_x, p.peek_y = p.x, p.y
+        self.sounds.set_growl(False)
+        self.sounds.play_elevator_door()
+        self._battery_warned = False
+        self.state = "hatch_climb"
+
+    def _load_floor_for_hatch_arrival(self, facing=0.0):
+        if self._in_debug_preview():
+            self._build_debug_scene()
+        else:
+            self._load_floor(self.floor_i + 1)
+        sx, sy = self.maze.start
+        arrival = Prop("hatch_arrival", sx, sy, facing=facing)
+        arrival.hatch_open_t = 1.0
+        self.props = [q for q in self.props
+                      if q.wall_mounted or math.hypot(q.x - sx, q.y - sy) > 0.75]
+        self.props.append(arrival)
+        self.renderer.rebuild_floor(self.maze, (arrival.x, arrival.y, R3D_HATCH_HALF))
+        return arrival
+
+    def _hatch_step_off(self, arrival):
+        cx, cy = int(arrival.x), int(arrival.y)
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1), (1, -1), (-1, -1)):
+            nx, ny = cx + dx, cy + dy
+            if self.maze.is_walkable_cell(nx, ny) and not self.maze.circle_hits_wall(
+                    nx + 0.5, ny + 0.5, S.PLAYER_RADIUS):
+                return nx + 0.5, ny + 0.5
+        return arrival.x, arrival.y
+
+    HATCH_YARD_Z = S.WALL_HEIGHT + R3D_HATCH_SHAFT_RISE
+
+    def _update_hatch_climb(self, dt):
+        hc = self.hatch_climb
+        hc["t"] += dt
+        p = self.player
+        phase = hc["phase"]
+        p.moved_this_frame = False
+        p.noise_radius = 0.0
+        p.update_held_item(dt)
+        hatch = self.exit_prop
+        if phase == "approach":
+            frac = min(1.0, hc["t"] / max(0.2, hc["walk_t"]))
+            ease = frac * frac * (3.0 - 2.0 * frac)
+            look = math.atan2(hc["hy"] - hc["sy"], hc["hx"] - hc["sx"])
+            hc["yaw"] = hc["sa"] + _wrap_angle(look - hc["sa"]) * min(1.0, frac * 2.0)
+            hc["pitch"] = hc["sp"] * (1.0 - ease)
+            hc["walk"] = ease
+            if frac >= 1.0:
+                hc["sx"], hc["sy"] = hc["hx"], hc["hy"]
+                hc["sa"], hc["sp"] = hc["yaw"], hc["pitch"]
+                hc["phase"], hc["t"] = "open", 0.0
+        elif phase == "open":
+            frac = min(1.0, hc["t"] / S.HATCH_OPEN_SECONDS)
+            ease = frac * frac * (3.0 - 2.0 * frac)
+            lid = max(0.0, (frac - 0.38) / 0.62)
+            lid = lid * lid * (3.0 - 2.0 * lid)
+            if hatch is not None and hatch.kind == "hatch":
+                hatch.hatch_open_t = lid
+                hatch.light_radius = S.HATCH_SKY_LIGHT_RADIUS * lid
+            look = math.atan2(hc["hy"] - hc["sy"], hc["hx"] - hc["sx"])
+            hc["yaw"] = hc["sa"] + _wrap_angle(look - hc["sa"]) * ease
+            hc["pitch"] = hc["sp"] + (S.HATCH_LOOK_PITCH - hc["sp"]) * ease
+            hc["moon"] = S.HATCH_CLIMB_MOON * lid
+            if frac >= 1.0:
+                hc["phase"], hc["t"] = "climb", 0.0
+        elif phase == "climb":
+            frac = min(1.0, hc["t"] / S.HATCH_CLIMB_SECONDS)
+            ease = frac * frac * (3.0 - 2.0 * frac)
+            rungs = S.HATCH_CLIMB_RUNGS
+            step = math.sin(ease * rungs * math.tau) * S.HATCH_CLIMB_RUNG_RISE
+            sway = math.sin(ease * rungs * math.pi + 0.7) * S.HATCH_CLIMB_RUNG_SWAY
+            hc["z"] = EYE_HEIGHT + self.HATCH_YARD_Z * ease + step
+            hc["sway"] = sway
+            hc["pitch"] = S.HATCH_LOOK_PITCH * (1.0 - min(1.0, max(0.0, (frac - 0.55) / 0.45)) ** 2)
+            hc["moon"] = S.HATCH_CLIMB_MOON
+            hc["out"] = max(0.0, (frac - 0.72) / 0.28) ** 2
+            if not hc["swapped"] and frac >= S.HATCH_SWAP_FRAC:
+                arrival = self._load_floor_for_hatch_arrival(hc["facing"])
+                hc["ax"], hc["ay"] = arrival.x, arrival.y
+                hc["step_x"], hc["step_y"] = self._hatch_step_off(arrival)
+                hc["swapped"] = True
+            if frac >= 1.0:
+                hc["phase"], hc["t"] = "step", 0.0
+                if hc["step_x"] is None:
+                    hc["step_x"], hc["step_y"] = p.x, p.y
+        elif phase == "step":
+            frac = min(1.0, hc["t"] / S.HATCH_STEP_SECONDS)
+            ease = frac * frac * (3.0 - 2.0 * frac)
+            hc["pitch"] = hc["pitch"] * (1.0 - ease)
+            hc["moon"] = S.HATCH_CLIMB_MOON * (1.0 - ease)
+            if frac >= 1.0:
+                p.x, p.y = hc["step_x"], hc["step_y"]
+                p.pitch = 0.0
+                p.angle = hc["yaw"]
+                self._trip_cam_yaw, self._trip_cam_pitch = p.angle, 0.0
+                self._trip_target_unwrapped = self._trip_follower_unwrapped = p.angle
+                self._trip_prev_player_angle = p.angle
+                p.flashlight_on = hc["flashlight_was_on"]
+                p.lighter_on = hc["lighter_was_on"]
+                self.hatch_climb = None
+                self._begin_playing()
+                return
+        p.peek_x, p.peek_y = p.x, p.y
+
+    def _hatch_camera_override(self):
+        if self.hatch_climb is None:
+            return None
+        hc = self.hatch_climb
+        z = hc["z"]
+        if hc["swapped"]:
+            z -= self.HATCH_YARD_Z
+            bx, by = hc["ax"], hc["ay"]
+        else:
+            bx, by = hc["hx"], hc["hy"]
+        if hc["phase"] == "approach":
+            w = hc.get("walk", 0.0)
+            x = hc["sx"] + (hc["hx"] - hc["sx"]) * w
+            y = hc["sy"] + (hc["hy"] - hc["sy"]) * w
+            z += math.sin(hc["t"] * 9.0) * 0.012
+        elif hc["phase"] == "open":
+            x, y = hc["sx"], hc["sy"]
+        elif hc["phase"] == "climb":
+            out = hc.get("out", 0.0)
+            if out > 0.0 and hc["step_x"] is not None:
+                x = bx + (hc["step_x"] - bx) * out
+                y = by + (hc["step_y"] - by) * out
+            else:
+                x, y = bx, by
+            sway = hc.get("sway", 0.0)
+            if sway:
+                sx_, sy_ = -math.sin(hc["yaw"]), math.cos(hc["yaw"])
+                x += sx_ * sway
+                y += sy_ * sway
+        else:
+            x, y = hc["step_x"], hc["step_y"]
+        amount = 1.0 if hc["phase"] in ("approach", "climb") else 0.6
+        life_yaw, life_pitch = self._cam_life(self.anim_t, amount)
+        return (x, y, z), hc["yaw"] + life_yaw, hc["pitch"] + life_pitch, FOV_DEGREES
+
+    def _menu_scene_active(self):
+        if self.state in ("menu", "credits", "warning", "update_prompt", "update_downloading"):
+            return True
+        if self.state in ("settings", "gamma_calibration") and self.settings_return == "menu":
+            return True
+        return self.state == "confirm_quit" and self.confirm_return == "menu"
+
+    def _menu_camera_override(self):
+        cam = getattr(self, "_menu_cam", None)
+        if cam is None:
+            return None
+        x, y, yaw0 = cam
+        ph = self.anim_t * S.MENU_CAM_RATE
+        yaw = yaw0 + math.sin(ph) * S.MENU_CAM_SWAY
+        fx, fy = math.cos(yaw0), math.sin(yaw0)
+        side = math.sin(ph * 0.73 + 1.2) * S.MENU_CAM_DOLLY
+        fwd = math.sin(ph * 0.41) * S.MENU_CAM_DOLLY * 0.6
+        eye = (x - fy * side + fx * fwd, y + fx * side + fy * fwd,
+               EYE_HEIGHT + math.sin(ph * 0.6 + 0.4) * 0.035)
+        pitch = -0.02 + math.sin(ph * 0.53) * 0.02
+        return (eye, yaw, pitch, FOV_DEGREES)
+
+    def _active_camera_override(self):
+        if self._menu_scene_active():
+            return self._menu_camera_override()
+        if self.fence_escape is not None:
+            return self._fence_escape_camera_override()
+        if self.hatch_climb is not None:
+            return self._hatch_camera_override()
+        if self.elevator_ride is not None:
+            override = self._elevator_camera_override()
+            if override is not None:
+                return override
+        if self.angel_seq is not None:
+            return self._angel_camera_override()
+        if self.state in ("catch", "dead_caught"):
+            override = self._catch_camera_override()
+            if override is not None:
+                return override
+        return self._peek_camera_override()
+
+    def _enter_debug_peek(self, target_floor, live=False):
         self._load_floor(target_floor)
         self.spec = dict(self.spec)
-        self.spec["no_threat"] = True
-        self.monster.speed_mult = 0.0
-        self.monster.vision_mult = 0.0
-        self.player.sanity = S.SANITY_MAX
+        self.spec["no_threat"] = not live
+        if not live:
+            self.monster.speed_mult = 0.0
+            self.monster.vision_mult = 0.0
+            self.player.sanity = S.SANITY_MAX
         self.debug_demo_monsters = []
+        self.debug_door_monster = None
+        self.debug_door_monster_door = None
+        self._debug_door_goal = None
+        self._debug_door_ends = None
+        self._debug_door_corridor_set = None
         sx, sy = self.maze.start
         ret = make_prop("portal", (int(sx), int(sy)), facing=0.0)
         ret.target_floor = "hub"
+        ret.portal_live = False
         self.props.append(ret)
-        self.floor_banner = i18n.t("debug.peek_banner", title=self._spec_t("title"))
+        self.floor_banner = i18n.Text("debug.peek_banner_live" if live else "debug.peek_banner",
+                                       title=self._spec_text("title"))
         self.floor_banner_timer = 4.0
-        self.hint_text = i18n.t("debug.peek_hint")
+        self.hint_text = i18n.Text("debug.peek_hint")
         self.hint_timer = 6.0
         self.sounds.play_ui()
 
     def update(self, dt):
         dt = min(dt, 0.05)
         self.anim_t += dt
+        self.frame_dt = dt
+        self._stamina_seen_t = max(0.0, getattr(self, "_stamina_seen_t", 0.0) - dt)
+        target = 1.0 if self._status_held() else 0.0
+        self._clip_raise += (target - self._clip_raise) * min(1.0, dt * 11.0)
+        self._update_map_turn(dt)
+        self._sync_map_pencil(dt)
+        if self.console.open:
+            self.console.tick(dt)
+            return
+        dt *= self.console.time_scale
+        if self.state == "note":
+            step = dt / max(0.01, S.NOTE_FADE_SECONDS)
+            if self._note_closing:
+                self._note_fade = max(0.0, self._note_fade - step)
+                if self._note_fade <= 0.0:
+                    self._finish_close_note()
+                return
+            self._note_fade = min(1.0, self._note_fade + step)
+            mouse_dx, mouse_dy = pygame.mouse.get_rel()
+            if self._binding_down("map_pencil"):
+                self._note_settling = False
+                self._turn_note(mouse_dx, mouse_dy)
+            elif self._note_settling:
+                rate = min(1.0, dt * S.NOTE_SETTLE_RATE)
+                done = True
+                for i in (0, 1):
+                    a = (self.note_spin[i] + math.pi) % math.tau - math.pi
+                    a -= a * rate
+                    self.note_spin[i] = 0.0 if abs(a) < 0.004 else a
+                    done = done and self.note_spin[i] == 0.0
+                self.renderer.note_spin = (self.note_spin[0], self.note_spin[1])
+                self._note_settling = not done
+            return
         if self.state == "splash":
             self._update_splash(dt)
         elif self.state in ("menu", "credits", "warning"):
-            self.player.angle = (self.player.angle + dt * 0.06) % math.tau
+            self._sync_menu_player()
             self.sounds.set_ambient_volume(0.13)
         elif self.state == "playing":
             self._update_playing(dt)
+        elif self.state == "elevator_ride":
+            self._update_elevator_ride(dt)
+        elif self.state == "hatch_climb":
+            self._update_hatch_climb(dt)
+        elif self.state == "fence_escape":
+            self._update_fence_escape(dt)
+        elif self.state == "angel_seq":
+            self._update_angel_sequence(dt)
         elif self.state == "catch":
             self._update_catch(dt)
         elif self.state == "catch_sanity":
             self._update_sanity_death(dt)
         elif self.state == "win_seq":
             self._update_win_seq(dt)
-        elif self.state == "transition":
-            self._update_transition(dt)
+        elif self.state == "win":
+            self._update_win(dt)
+        elif self.state == "angel_end":
+            self._update_angel_end(dt)
         elif self.state == "settings":
             if self.settings_return == "menu":
-                self.player.angle = (self.player.angle + dt * 0.06) % math.tau
+                self._sync_menu_player()
                 self.sounds.set_ambient_volume(0.13)
             if self.controls_msg_timer > 0:
                 self.controls_msg_timer -= dt
@@ -1825,10 +3682,7 @@ class App:
                 self._update_prompt_seen = True
                 self.state = "update_prompt"
 
-        want_menu_music = self.state in ("menu", "credits", "warning", "update_prompt", "update_downloading") or (
-            self.state == "settings" and self.settings_return == "menu") or (
-            self.state == "confirm_quit" and self.confirm_return == "menu")
-        if want_menu_music:
+        if self._menu_scene_active():
             self.sounds.play_menu_music()
         elif self._floor_music_pending:
             self.sounds.play_floor_music()
@@ -1842,43 +3696,68 @@ class App:
             self._update_hide_transition(dt)
             self._update_install_hold(dt, False)
             self._update_peek_hold(dt, False)
+            self._update_hatch_turn(dt, False)
+            self._update_fence_cut(dt, False)
+            self._update_cutters_repair(dt, False)
+            self.player.update_lean(dt, False, False, self.maze, self.props + self.doors)
+            self._resolve_lean_input(dt, suppress=True)
         else:
             keys = pygame.key.get_pressed()
-            b = self.settings["bindings"]
+            blockers = self.props + self.doors
             if self.is_peeking:
                 self.player.moved_this_frame = False
                 self.player.noise_radius = 0.0
+                self._resolve_lean_input(dt, suppress=True)
+                self.player.update_lean(dt, False, False, self.maze, blockers)
             else:
                 keys_down = {
-                    "forward": keys[b["forward"]] or keys[pygame.K_UP],
-                    "back": keys[b["back"]] or keys[pygame.K_DOWN],
-                    "left": keys[b["left"]],
-                    "right": keys[b["right"]],
-                    "sprint": keys[b["sprint"]],
+                    "forward": self._binding_down("forward") or keys[pygame.K_UP],
+                    "back": self._binding_down("back") or keys[pygame.K_DOWN],
+                    "left": self._binding_down("left"),
+                    "right": self._binding_down("right"),
+                    "sprint": self._binding_down("sprint"),
                 }
                 turn_left = keys[pygame.K_LEFT]
                 turn_right = keys[pygame.K_RIGHT]
-                crouch_held = keys[b["crouch"]]
-                sens = self.settings["mouse_sensitivity"]
-                sens_y = self.settings["mouse_sensitivity_y"]
-                self.player.update_movement(
-                    dt, keys_down, mouse_dx * sens, mouse_dy * sens_y, self.maze, self.props + self.doors,
-                    turn_left, turn_right, crouch_held=crouch_held,
-                    infinite_stamina=self.spec.get("no_threat", False),
-                )
-            self._update_install_hold(dt, keys[b["interact"]])
-            self._update_peek_hold(dt, keys[b["interact"]])
+                crouch_held = self._binding_down("crouch")
+                if self._update_map_drawing(mouse_dx, mouse_dy):
+                    mouse_dx = mouse_dy = 0
+                sens = sens_y = self.settings["mouse_sensitivity"]
+                if self._debug_spectator:
+                    self._fly_move(dt, mouse_dx * sens, mouse_dy * sens_y)
+                else:
+                    self.player.update_movement(
+                        dt, keys_down, mouse_dx * sens, mouse_dy * sens_y, self.maze, blockers,
+                        turn_left, turn_right, crouch_held=crouch_held,
+                        infinite_stamina=self.spec.get("no_threat", False),
+                        effective_facing=self._trip_cam_yaw,
+                        comedown_intensity=self.comedown_intensity,
+                    )
+                    lean_left, lean_right = self._resolve_lean_input(dt, suppress=self.player.is_hiding)
+                    self.player.update_lean(dt, lean_left, lean_right, self.maze, blockers)
+            held = self._binding_down("interact") and not self._debug_spectator
+            self._update_install_hold(dt, held)
+            self._update_peek_hold(dt, held)
+            self._update_hatch_turn(dt, held)
+            self._update_fence_cut(dt, held)
+            self._update_cutters_repair(dt, held)
+        self._update_elevator_call(dt)
+        self._update_elevator_doors(dt)
         if not self.spec.get("no_threat"):
-            self.player.update_flashlight(dt)
+            if self.player.update_flashlight(dt) and self.player.has_lighter:
+                self.hint_text = i18n.Text("hint.lighter_no_battery")
+                self.hint_timer = 3.0
+        self.player.update_held_item(dt, force_stow=self.hide_transition is not None)
         self._update_player_lit()
 
         fade_dir = 1.0 if self.player.is_hiding else -1.0
         self.hide_vignette_t = max(0.0, min(S.HIDE_VIGNETTE_FADE,
                                              self.hide_vignette_t + fade_dir * dt))
 
+        self.player.tick_noise(dt)
         gated = self._update_mic_level(dt)
         if gated > 0.0:
-            self.player.noise_radius = max(self.player.noise_radius, gated * S.MONSTER_HEARING_RANGE_SPRINT)
+            self.player.noise_radius = max(self.player.noise_radius, gated * S.NOISE_SPRINT)
 
         if not self.player.is_hiding and self.player.moved_this_frame and self.player.consume_step():
             surface = FLOOR_THEME_SURFACE.get(self.spec.get("floor_theme"), "tile")
@@ -1892,9 +3771,16 @@ class App:
 
         for door in self.doors:
             door.update(dt)
-        shed_lock_barrier = (self.panel_prop,) if (
-            self.panel_prop is not None and self.panel_prop.kind == "shed_lock") else ()
-        self.renderer.sync_door_mask(self.doors, extra_barriers=shed_lock_barrier)
+            if door.just_landed:
+                pan, vol = self._pan_vol_for(door.x, door.y)
+                self.sounds.play_bang(pan, vol)
+                self.fx_shake.add(0.55)
+            if door.just_auto_opened:
+                pan, vol = self._pan_vol_for(door.x, door.y)
+                self.sounds.play_door(pan, vol)
+            if door.just_auto_latched:
+                pan, vol = self._pan_vol_for(door.x, door.y)
+                self.sounds.play_latch(pan, vol)
 
         if self.panel_prop is not None and hasattr(self.panel_prop, "swing_target"):
             sw = getattr(self.panel_prop, "swing", 0.0)
@@ -1914,10 +3800,53 @@ class App:
 
         if not self.spec.get("no_threat"):
             grace = self.floor_elapsed < self.spec["grace"]
-            self.monster.update(dt, self.maze, self.player, self.dread, self.props, grace=grace)
+            self.monster.update(dt, self.maze, self.player, self.dread, self.props, grace=grace,
+                                blind=self._debug_spectator)
             if self.monster.just_noticed:
                 self.sounds.play_alert()
                 self.fx_shake.add(0.25)
+            if self.monster.just_opened_door is not None:
+                d = self.monster.just_opened_door
+                pan, vol = self._pan_vol_for(d.x, d.y)
+                self.sounds.play_door(pan, vol)
+            if self.monster.just_closed_door is not None:
+                d = self.monster.just_closed_door
+                pan, vol = self._pan_vol_for(d.x, d.y)
+                self.sounds.play_door(pan, vol)
+        if self.debug_door_monster is not None:
+            dm = self.debug_door_monster
+            dm.update(dt, self.maze, self.player, 0.0, [], grace=False)
+            if dm.just_opened_door is not None:
+                d = dm.just_opened_door
+                pan, vol = self._pan_vol_for(d.x, d.y)
+                self.sounds.play_door(pan, vol)
+            if dm.just_closed_door is not None:
+                d = dm.just_closed_door
+                pan, vol = self._pan_vol_for(d.x, d.y)
+                self.sounds.play_door(pan, vol)
+            end_a, end_b = self._debug_door_ends
+            if dm.cell not in self._debug_door_corridor_set:
+                nearest = min((end_a, end_b), key=lambda c: (c[0] - dm.x) ** 2 + (c[1] - dm.y) ** 2)
+                dm.x, dm.y = nearest[0] + 0.5, nearest[1] + 0.5
+                dm.path = []
+                self._debug_door_goal = None
+            if self._debug_door_goal is None:
+                self._debug_door_goal = end_b
+            if not dm.path:
+                if dm.cell == self._debug_door_goal:
+                    self._debug_door_goal = end_a if self._debug_door_goal == end_b else end_b
+                dm.target_cell = self._debug_door_goal
+                dm._replan(self.maze, self._debug_door_goal)
+            door = self.debug_door_monster_door
+            if door is not None and door.is_broken:
+                door.is_broken = False
+                door.is_open = False
+                door.is_latched = False
+                door._pending_latch = False
+                door.swing = 0.0
+                door._swing_target = 0.0
+                door.break_askew = 0.0
+                door.base_color = (96, 64, 40)
         self._update_door_break_feedback(dt)
 
         self._update_sanity(dt)
@@ -1925,8 +3854,6 @@ class App:
         self._update_scares(dt)
         self._update_hallucinations(dt)
 
-        if self.note_timer > 0:
-            self.note_timer -= dt
         if self.hint_timer > 0:
             self.hint_timer -= dt
         if self.floor_banner_timer > 0:
@@ -1937,8 +3864,9 @@ class App:
             self.interact_feedback_timer -= dt
         if self.sanity_boost_timer > 0:
             self.sanity_boost_timer -= dt
+        self._update_pill_trip(dt)
 
-        if self.monster.caught_player:
+        if self.monster.caught_player and not self.console.god:
             self._start_catch_sequence()
         elif self.player.sanity <= 0:
             self._start_sanity_death()
@@ -1957,18 +3885,25 @@ class App:
             pan, vol = self._pan_vol_for(d.x, d.y)
             self.sounds.play_bang(pan, vol)
             self.fx_shake.add(0.4)
+            d.take_hit(from_xy=(self.monster.x, self.monster.y),
+                       progress=self.monster.break_timer / S.DOOR_BREAK_SECONDS)
             self._door_break_sfx_timer = 0.4
 
     def _update_sanity(self, dt):
         if self.spec.get("no_threat"):
             return
+        if self._debug_spectator:
+            self.player.sanity = S.SANITY_MAX
+            return
         p, m = self.player, self.monster
         dist = math.hypot(m.x - p.x, m.y - p.y)
-        vision = (S.MONSTER_VISION_RANGE_LIT if p.flashlight_on else S.MONSTER_VISION_RANGE) * m.vision_mult
+        vision = monster_vision_base(p.light_level, m.vision_light_norm) * m.vision_mult
+        vision *= self.maze.sight_transmission(m.x, m.y, p.x, p.y)
         covered = dist < vision and p.is_crouching and line_blocked_by_cover(self.props, m.x, m.y, p.x, p.y)
-        visible = (not p.is_hiding) and dist < vision and not covered and self.maze.has_line_of_sight(p.x, p.y, m.x, m.y)
-        near_range = S.MONSTER_HEARING_RANGE * 1.4
+        visible = (not p.is_hiding) and dist < vision and not covered
+        near_range = S.SANITY_NEAR_RANGE
         proximity_dread = 0.0 if p.is_hiding else max(0.0, 1.0 - dist / near_range)
+        in_dark_drain = False
         if visible:
             proximity = max(0.0, 1.0 - dist / vision)
             p.apply_sanity(-S.SANITY_MONSTER_DRAIN * proximity * dt)
@@ -1979,15 +3914,64 @@ class App:
                 p.apply_sanity(S.SANITY_HIDE_LIT_REGEN * dt)
             else:
                 crouch_mult = S.SANITY_HIDE_CROUCH_MULT if p.is_crouching else 1.0
-                p.apply_sanity(-S.SANITY_HIDE_DRAIN * crouch_mult * dt)
+                drain_mult = S.LIGHTER_DARK_DRAIN_MULT if p.lighter_on else 1.0
+                p.apply_sanity(-S.SANITY_HIDE_DRAIN * crouch_mult * drain_mult * dt)
         else:
             boosted = self.sanity_boost_timer > 0.0
             if boosted or p.is_lit:
-                if dist > S.MONSTER_HEARING_RANGE * 1.5:
+                if dist > S.SANITY_SAFE_RANGE:
                     regen_rate = S.SANITY_REGEN * (S.SANITY_PILL_REGEN_MULT if boosted else 1.0)
                     p.apply_sanity(regen_rate * dt)
-            elif dist > S.MONSTER_HEARING_RANGE:
-                p.apply_sanity(-S.SANITY_DARK_DRAIN * dt)
+            elif dist > S.SANITY_DARK_RANGE:
+                in_dark_drain = True
+                drain_mult = S.LIGHTER_DARK_DRAIN_MULT if p.lighter_on else 1.0
+                ramp = self._dark_time_t / S.SANITY_DARK_DRAIN_RAMP_SECONDS
+                drain_mult *= min(S.SANITY_DARK_DRAIN_MAX_MULT, 1.0 + ramp * (S.SANITY_DARK_DRAIN_MAX_MULT - 1.0))
+                p.apply_sanity(-S.SANITY_DARK_DRAIN * drain_mult * dt)
+        self._dark_time_t = self._dark_time_t + dt if in_dark_drain else 0.0
+
+    @staticmethod
+    def _smoothstep(t):
+        t = max(0.0, min(1.0, t))
+        return t * t * (3.0 - 2.0 * t)
+
+    def _update_pill_trip(self, dt):
+        if self.sanity_boost_timer > 0.0:
+            elapsed = S.SANITY_PILL_DURATION - self.sanity_boost_timer
+            fade_in = self._smoothstep(elapsed / S.PILL_TRIP_FADE_IN_SECONDS)
+            fade_out = self._smoothstep(self.sanity_boost_timer / S.PILL_TRIP_FADE_OUT_SECONDS)
+            self.trip_intensity = max(0.0, min(fade_in, fade_out))
+            self._comedown_remaining = S.PILL_COMEDOWN_SECONDS * fade_in * (1.0 - fade_out)
+            self.comedown_intensity = fade_in * (1.0 - fade_out)
+            self.sounds.update_trip(self.trip_intensity)
+            self.sounds.update_comedown(self.comedown_intensity)
+        else:
+            self.trip_intensity = 0.0
+            if self._comedown_remaining > 0.0:
+                self._comedown_remaining = max(0.0, self._comedown_remaining - dt)
+            self.comedown_intensity = self._smoothstep(
+                self._comedown_remaining / S.PILL_COMEDOWN_SECONDS)
+            self.sounds.update_trip(0.0)
+            self.sounds.update_comedown(self.comedown_intensity)
+        self._update_trip_cam_lag(dt)
+
+    def _update_trip_cam_lag(self, dt):
+        p = self.player
+        raw_delta = (p.angle - self._trip_prev_player_angle + math.pi) % math.tau - math.pi
+        self._trip_prev_player_angle = p.angle
+        self._trip_target_unwrapped += raw_delta
+
+        drag = self.trip_intensity + self.comedown_intensity * S.PILL_COMEDOWN_CAM_LAG_FRAC
+        tau = drag * S.PILL_TRIP_CAM_LAG_SECONDS
+        if tau <= 0.0:
+            self._trip_follower_unwrapped = self._trip_target_unwrapped
+            self._trip_cam_pitch = p.pitch
+        else:
+            alpha = 1.0 - math.exp(-dt / tau)
+            gap = self._trip_target_unwrapped - self._trip_follower_unwrapped
+            self._trip_follower_unwrapped += gap * alpha
+            self._trip_cam_pitch += (p.pitch - self._trip_cam_pitch) * alpha
+        self._trip_cam_yaw = self._trip_follower_unwrapped % math.tau
 
     def _pan_vol_for(self, wx, wy, falloff=8.0):
         p = self.player
@@ -2034,15 +4018,6 @@ class App:
         pan, vol, _dist = self._scare_pan_vol()
         self.sounds.set_scare_pan(pan, vol)
 
-    @staticmethod
-    def _point_light_atten(dist, radius):
-        lt = max(0.0, min(1.0, dist / max(radius, 0.001)))
-        tail = 1.0
-        if lt > 0.85:
-            tt = (lt - 0.85) / 0.15
-            tail = 1.0 - tt * tt * (3.0 - 2.0 * tt)
-        return (1.0 - lt) * tail
-
     _FLASHLIGHT_USEFUL_RANGE = 8.0
 
     def _flashlight_lights_something(self):
@@ -2056,27 +4031,87 @@ class App:
                 return True
         return False
 
+    def _player_has_exit_item(self, req):
+        if not getattr(self.player, f"has_{req}", False):
+            return False
+        if req == "cutters" and self.player.cutters_broken:
+            return False
+        return True
+
+    def _player_can_see_point(self, x, y):
+        p = self.player
+        dist = math.hypot(x - p.x, y - p.y)
+        if dist > self.spec.get("fog_dist", 12.5):
+            return False
+        ang_to_point = math.atan2(y - p.y, x - p.x)
+        rel = (ang_to_point - p.angle + math.pi) % (2 * math.pi) - math.pi
+        if abs(rel) > math.radians(FOV_DEGREES) / 2:
+            return False
+        return self.maze.has_line_of_sight(p.x, p.y, x, y)
+
+    def _teleport_monster_if_far(self, ax, ay, guard_radius):
+        m = self.monster
+        if math.hypot(m.x - ax, m.y - ay) <= guard_radius:
+            return
+        p = self.player
+        candidates = [c for c in self.maze.floor_cells()
+                      if not self._player_can_see_point(c[0] + 0.5, c[1] + 0.5)]
+        if not candidates:
+            return
+        candidates.sort(key=lambda c: abs(math.hypot(c[0] + 0.5 - p.x, c[1] + 0.5 - p.y)
+                                           - S.MONSTER_TELEPORT_DIST))
+        tx, ty = candidates[0]
+        m.x, m.y = tx + 0.5, ty + 0.5
+        m.path = []
+        m.target_cell = None
+
+    def _flashlight_lights_point(self, x, y):
+        p = self.player
+        if not p.flashlight_on:
+            return False
+        dist = math.hypot(x - p.x, y - p.y)
+        if dist < 1e-4 or dist > self._FLASHLIGHT_USEFUL_RANGE:
+            return False
+        ang_to_point = math.atan2(y - p.y, x - p.x)
+        rel = (ang_to_point - p.angle + math.pi) % (2 * math.pi) - math.pi
+        if abs(rel) > 0.55:
+            return False
+        return self.maze.has_line_of_sight(p.x, p.y, x, y)
+
+    def _light_occluded(self, light, point):
+        x, y = point[0], point[1]
+        if light.shape == SHAPE_DIRECTIONAL:
+            return not self.maze.moon_reaches(x, y)
+        lx, ly = light.pos[0], light.pos[1]
+        if not self.maze.has_line_of_sight(x, y, lx, ly):
+            return True
+        return line_blocked_by_cover(self.doors, x, y, lx, ly, min_height=0.1)
+
+    def _light_level_at(self, x, y):
+        point = (x, y, GAMEPLAY_RECEIVER_HEIGHT)
+        lights = gameplay_lights(self.props, point, self.anim_t, self._moon_strength())
+        return light_level_at(point, lights, self.spec.get("ambient_level", 0.0), self._light_occluded)
+
     _IS_LIT_THRESHOLD = 0.12
 
     def _update_player_lit(self):
         p = self.player
-        level = self.spec.get("ambient_level", 0.0)
-        for obj in self.props:
-            radius = getattr(obj, "light_radius", None)
-            if not radius or obj.picked:
-                continue
-            if not self.maze.has_line_of_sight(p.x, p.y, obj.x, obj.y):
-                continue
-            if line_blocked_by_cover(self.doors, p.x, p.y, obj.x, obj.y, min_height=0.1):
-                continue
-            level += self._point_light_atten(math.hypot(p.x - obj.x, p.y - obj.y), radius)
+        point = (p.x, p.y, GAMEPLAY_RECEIVER_HEIGHT)
+        carried = []
         if self._flashlight_lights_something():
-            level += 0.5
+            carried.append(flashlight_light(point, (math.cos(p.angle), math.sin(p.angle), 0.0), 1.0, self.anim_t))
+        if p.lighter_on:
+            carried.append(lighter_light(point, S.LIGHTER_LIGHT_RADIUS, S.LIGHTER_LIGHT_COLOR,
+                                         bearer_reveal=S.LIGHTER_LIGHT_LEVEL_BONUS))
+        lights = gameplay_lights(self.props, point, self.anim_t, self._moon_strength())
+        level, lit_for_sanity, room = player_light_levels(
+            point, lights, self.spec.get("ambient_level", 0.0), self._light_occluded, carried)
+        p.is_lit = lit_for_sanity > self._IS_LIT_THRESHOLD
         p.light_level = level
-        p.is_lit = level > self._IS_LIT_THRESHOLD
+        p.room_light = room
 
     def _update_scares(self, dt):
-        if self.spec.get("no_threat"):
+        if self.spec.get("no_threat") or self._debug_spectator:
             return
         seconds_dark = 14.0 - 8.0 * self.dread
         seconds_lit = 34.0 - 10.0 * self.dread
@@ -2090,17 +4125,19 @@ class App:
             self._trigger_random_scare()
 
     def _update_hallucinations(self, dt):
-        if self.spec.get("no_threat"):
+        if self.spec.get("no_threat") or self._debug_spectator:
+            self.hallu_intensity = 0.0
             return
         self._tick_active_hallucinations(dt)
         if self.hallu_cooldown > 0:
             self.hallu_cooldown -= dt
         p = self.player
         sanity_frac = p.sanity / S.SANITY_MAX
+        self.hallu_intensity = max(0.0, (S.HALLUCINATION_SANITY_THRESHOLD - sanity_frac) / S.HALLUCINATION_SANITY_THRESHOLD)
         if sanity_frac >= S.HALLUCINATION_SANITY_THRESHOLD or p.is_hiding or self.monster.state == Monster.HUNT:
             self.hallu_progress = 0.0
             return
-        deficit = (S.HALLUCINATION_SANITY_THRESHOLD - sanity_frac) / S.HALLUCINATION_SANITY_THRESHOLD
+        deficit = self.hallu_intensity
         seconds_to_fill = (S.HALLUCINATION_SECONDS_MAX
                             - (S.HALLUCINATION_SECONDS_MAX - S.HALLUCINATION_SECONDS_MIN) * deficit)
         self.hallu_progress += dt / max(0.1, seconds_to_fill)
@@ -2113,6 +4150,10 @@ class App:
     def _tick_active_hallucinations(self, dt):
         still = []
         for h in self.hallu_active:
+            if h["kind"] == "eyes":
+                if self._tick_hallu_eyes(h, dt):
+                    still.append(h)
+                continue
             h["remaining"] -= dt
             if h["remaining"] <= 0:
                 continue
@@ -2126,15 +4167,157 @@ class App:
             still.append(h)
         self.hallu_active = still
 
+    def _tick_hallu_eyes(self, h, dt):
+        h["spawn_t"] = h.get("spawn_t", 0.0) + dt
+        ex, ey, _ = h["pos"]
+        if not h.get("despawning"):
+            lit = (self._light_level_at(ex, ey) >= S.HALLUCINATION_EYES_LIGHT_THRESHOLD
+                   or self._flashlight_lights_point(ex, ey))
+            p = self.player
+            ang = math.atan2(ey - p.y, ex - p.x)
+            rel = (ang - p.angle + math.pi) % (2 * math.pi) - math.pi
+            gazing = abs(rel) < S.HALLUCINATION_EYES_GAZE_FOV and self.maze.has_line_of_sight(p.x, p.y, ex, ey)
+            h["gaze_t"] = h.get("gaze_t", 0.0) + dt if gazing else 0.0
+            if lit or h["gaze_t"] >= S.HALLUCINATION_EYES_GAZE_SECONDS:
+                h["despawning"] = True
+        if h.get("despawning"):
+            h["fade_out_t"] = h.get("fade_out_t", 0.0) + dt / S.HALLUCINATION_EYES_FADE_SECONDS
+            if h["fade_out_t"] >= 1.0:
+                return False
+        return True
+
     def _trigger_random_hallucination(self):
         roll = random.random()
-        if roll < 0.40:
+        if roll < 0.30:
             self._start_hallu_pulse()
-        elif roll < 0.70:
+        elif roll < 0.55:
             self.sounds.play_hallu_alert()
             self.fx_shake.add(0.10)
-        else:
+        elif roll < 0.75:
             self._start_hallu_door_break()
+        else:
+            self._start_hallu_eyes()
+
+    def _start_hallu_eyes(self):
+        p = self.player
+        for _ in range(12):
+            dist = random.uniform(3.0, S.HALLUCINATION_EYES_MAX_DIST)
+            ang = p.angle + random.uniform(-0.9, 0.9)
+            ex, ey = p.x + math.cos(ang) * dist, p.y + math.sin(ang) * dist
+            if self.maze.is_wall(ex, ey):
+                continue
+            if not self.maze.has_line_of_sight(p.x, p.y, ex, ey):
+                continue
+            if self._light_level_at(ex, ey) >= S.HALLUCINATION_EYES_LIGHT_THRESHOLD:
+                continue
+            if self._flashlight_lights_point(ex, ey):
+                continue
+            self.hallu_active.append({
+                "kind": "eyes", "pos": (ex, ey, S.HALLUCINATION_EYES_HEIGHT),
+                "spawn_t": 0.0, "gaze_t": 0.0, "fade_out_t": 0.0, "despawning": False,
+            })
+            return
+
+    def _draw_angel_overlay(self, t, reveal):
+        surf = self.angel_canvas
+        surf.fill((0, 0, 0, 0))
+        if reveal <= 0.0:
+            return
+        cx = cy = S.ANGEL_CANVAS_SIZE / 2.0
+        base_r = 140.0 * reveal
+
+        ray_n = 26
+        for i in range(ray_n):
+            ang = math.tau * i / ray_n + t * 0.10
+            flick = 0.55 + 0.45 * math.sin(t * 3.1 + i * 1.7)
+            length = base_r * (2.8 + 0.7 * flick)
+            x2 = cx + math.cos(ang) * length
+            y2 = cy + math.sin(ang) * length
+            a = int(90 * reveal * flick)
+            if a > 0:
+                pygame.draw.line(surf, (255, 240, 205, a), (cx, cy), (x2, y2), 3 if i % 3 == 0 else 1)
+
+        glow = self.angel_glow_surf
+        gscale = (0.75 + 0.12 * math.sin(t * 1.3)) * reveal
+        gw, gh = max(2, int(glow.get_width() * gscale)), max(2, int(glow.get_height() * gscale))
+        scaled = pygame.transform.smoothscale(glow, (gw, gh))
+        scaled.set_alpha(int(245 * reveal))
+        surf.blit(scaled, (cx - gw // 2, cy - gh // 2))
+
+        def feather_poly(ang, length, width):
+            dx, dy = math.cos(ang), math.sin(ang)
+            px, py = -dy, dx
+            tip = (cx + dx * length, cy + dy * length)
+            mid = (cx + dx * length * 0.58, cy + dy * length * 0.58)
+            left = (mid[0] + px * width * 0.5, mid[1] + py * width * 0.5)
+            right = (mid[0] - px * width * 0.5, mid[1] - py * width * 0.5)
+            base_l = (cx + px * width * 0.14, cy + py * width * 0.14)
+            base_r2 = (cx - px * width * 0.14, cy - py * width * 0.14)
+            return [base_l, left, tip, right, base_r2]
+
+        wing_alpha = int(220 * reveal)
+        for base_ang, length, flap_phase, flap_rate, n_feathers, layer_offset in self._angel_wing_specs:
+            flap = 0.5 + 0.5 * math.sin(t * flap_rate + flap_phase)
+            wing_len = base_r * 1.9 * length
+            spread = 0.62 * (0.55 + 0.45 * flap)
+            for layer, layer_ang in ((0, 0.0), (1, layer_offset)):
+                n = n_feathers if layer == 0 else max(3, n_feathers - 3)
+                for k in range(n):
+                    f = k / max(1, n - 1)
+                    fang = base_ang + layer_ang + (f - 0.5) * spread
+                    flen = wing_len * (0.42 + 0.58 * math.sin(f * math.pi) ** 0.7) * (0.9 + 0.1 * layer)
+                    fwidth = wing_len * (0.16 - 0.05 * abs(f - 0.5))
+                    pts = feather_poly(fang, flen, fwidth)
+                    shade = 235 - int(70 * f) - layer * 25
+                    pygame.draw.polygon(surf, (shade, shade - 8, shade - 18, wing_alpha), pts)
+                    pygame.draw.lines(surf, (60, 48, 46, int(wing_alpha * 0.7)), False, pts[1:4], 1)
+
+        for ang, rad, phase, rate, size, jitter_phase in self._angel_eye_specs:
+            blink = 0.5 + 0.5 * math.sin(t * rate + phase)
+            if blink < 0.08:
+                continue
+            jitter = 1.0 + 0.05 * math.sin(t * 1.6 + jitter_phase)
+            r = base_r * rad * jitter
+            ex = cx + math.cos(ang) * r
+            ey = cy + math.sin(ang) * r
+            ew, eh = 8 * size, 5 * size
+            a = int(235 * reveal * blink)
+            pygame.draw.ellipse(surf, (225, 195, 190, a), (ex - ew / 2, ey - eh / 2, ew, eh))
+            pygame.draw.ellipse(surf, (150, 20, 20, int(a * 0.55)), (ex - ew / 2, ey - eh / 2, ew, eh), 1)
+            pygame.draw.ellipse(surf, (35, 8, 8, a), (ex - ew * 0.22, ey - eh * 0.35, ew * 0.44, eh * 0.7))
+
+        mass_r = base_r * 0.62
+        a_full = int(255 * reveal)
+        for ang, len_frac, jitter_phase in self._angel_vein_specs:
+            wob = 0.85 + 0.15 * math.sin(t * 2.2 + jitter_phase)
+            vx = cx + math.cos(ang) * mass_r * 1.15 * len_frac * wob
+            vy = cy + math.sin(ang) * mass_r * 1.15 * len_frac * wob
+            pygame.draw.line(surf, (165, 15, 15, int(a_full * 0.5)), (cx, cy), (vx, vy), 1)
+        for ang, rad, size, phase, rate in self._angel_center_eye_specs:
+            ex = cx + math.cos(ang) * rad * mass_r
+            ey = cy + math.sin(ang) * rad * mass_r
+            blink = 0.5 + 0.5 * math.sin(t * rate + phase)
+            eye_r = mass_r * (0.30 + 0.10 * size) * (0.35 + 0.65 * max(0.15, blink))
+            pygame.draw.circle(surf, (232, 208, 202, a_full), (int(ex), int(ey)), int(eye_r))
+            iris_r = eye_r * 0.46
+            pygame.draw.circle(surf, (92, 24, 20, a_full), (int(ex), int(ey)), int(iris_r))
+            pupil_r = iris_r * 0.42
+            pygame.draw.circle(surf, (8, 4, 4, a_full), (int(ex), int(ey)), int(pupil_r))
+            hl_r = max(1, int(pupil_r * 0.32))
+            pygame.draw.circle(surf, (255, 250, 240, int(200 * reveal)),
+                                (int(ex - pupil_r * 0.3), int(ey - pupil_r * 0.3)), hl_r)
+
+    def _sync_hallu_eyes(self):
+        out = []
+        for h in self.hallu_active:
+            if h["kind"] != "eyes":
+                continue
+            fade = (min(1.0, h.get("spawn_t", 1.0) / 0.3)
+                    * (1.0 - min(1.0, h.get("fade_out_t", 0.0))))
+            if fade <= 0.0:
+                continue
+            out.append({"pos": h["pos"], "fade": fade, "age": h.get("spawn_t", 0.0)})
+        self.renderer.hallu_eyes = out
 
     def _start_hallu_pulse(self):
         duration = random.uniform(S.HALLUCINATION_PULSE_MIN_LEN, S.HALLUCINATION_PULSE_MAX_LEN)
@@ -2203,11 +4386,35 @@ class App:
         self.sounds.play_stinger()
         self.fx_shake.add(1.0)
         self._release_mouse()
+        p, m = self.player, self.monster
+        self.catch_cam = {
+            "sx": p.x, "sy": p.y, "sa": p.angle, "sp": p.pitch,
+            "mx": m.x, "my": m.y,
+        }
+        p.map_open = False
+
+    def _catch_camera_override(self):
+        cc = getattr(self, "catch_cam", None)
+        if cc is None:
+            return None
+        f = min(1.0, self.catch_timer / S.CATCH_TURN_SECONDS)
+        f = f * f * (3.0 - 2.0 * f)
+        to_m = math.atan2(cc["my"] - cc["sy"], cc["mx"] - cc["sx"])
+        yaw = cc["sa"] + _wrap_angle(to_m - cc["sa"]) * f
+        pitch = cc["sp"] + (S.CATCH_EYE_RISE - cc["sp"]) * f
+        bx, by = -math.cos(to_m), -math.sin(to_m)
+        back = S.CATCH_BACK_OFF * f
+        while back > 0.05 and self.maze.circle_hits_wall(cc["sx"] + bx * back,
+                                                         cc["sy"] + by * back, 0.18):
+            back -= 0.1
+        back = max(0.0, back)
+        eye = (cc["sx"] + bx * back, cc["sy"] + by * back, EYE_HEIGHT)
+        return (eye, yaw, pitch, FOV_DEGREES)
 
     def _update_catch(self, dt):
         self.catch_timer += dt
         self.fx_shake.add(dt * 2.6)
-        if self.catch_timer > 0.7:
+        if self.catch_timer > S.CATCH_SECONDS:
             self.state = "dead_caught"
 
     def _start_sanity_death(self):
@@ -2224,32 +4431,18 @@ class App:
         if self.catch_timer > 2.6:
             self.state = "dead_sanity"
 
-    def _start_transition(self):
-        self.state = "transition"
-        self.transition_timer = 0.0
-        self.sounds.play_unlock()
-        self.sounds.set_growl(False)
-        self._release_mouse()
-
-    def _update_transition(self, dt):
-        self.transition_timer += dt
-        if self.transition_timer > 2.8:
-            if self._in_debug_preview():
-                self._start_debug_level()
-            else:
-                self._load_floor(self.floor_i + 1)
-                self._begin_playing()
-
     def _start_win_sequence(self):
+        self._ensure_forest_run_scene()
         self.state = "win_seq"
         self.catch_timer = 0.0
         self.sounds.set_growl(False)
-        self.sounds.play_win()
+        self.sounds.play_escape_end()
         self._release_mouse()
 
     def _update_win_seq(self, dt):
         self.catch_timer += dt
-        if self.catch_timer > 3.0:
+        self._update_forest_run_motion(dt)
+        if self.catch_timer > S.WIN_FADE_SECONDS:
             self.state = "win"
 
     def handle_events(self):
@@ -2257,7 +4450,22 @@ class App:
             if event.type == pygame.QUIT:
                 self.running = False
             elif event.type == pygame.KEYDOWN:
+                if self.console.handle_key(event, self):
+                    continue
+                if (event.key == pygame.K_BACKQUOTE and self.state == "playing"
+                        and self.settings.get("debug_hud_console")):
+                    self.console.toggle(self)
+                    continue
                 self._handle_keydown(event.key)
+            elif event.type == pygame.MOUSEBUTTONDOWN and self.awaiting_bind is not None:
+                self._resolve_bind(("mouse", event.button))
+            elif (event.type == pygame.MOUSEBUTTONDOWN and self.state == "playing"
+                  and self.settings["bindings"]["map_mode"] == ("mouse", event.button)):
+                self._toggle_map_mode()
+            elif (event.type == pygame.MOUSEBUTTONDOWN and self.state == "note"
+                  and event.button == 3):
+                self._note_settling = True
+                self.sounds.play_ui()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 self._handle_click(self._logical_mouse_pos(event.pos))
             elif event.type == pygame.MOUSEMOTION:
@@ -2266,11 +4474,21 @@ class App:
                     rect = layout["sliders"].get(self.dragging_slider)
                     if rect is not None:
                         self._apply_slider(self.dragging_slider, rect, self._logical_mouse_pos(event.pos)[0])
+                elif self.dragging_slider == "gamma" and self.state == "gamma_calibration":
+                    self._apply_slider("gamma", self._gamma_layout()["slider"],
+                                       self._logical_mouse_pos(event.pos)[0])
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 self.dragging_slider = None
+                self._flush_pending_settings_save()
             elif event.type == pygame.MOUSEWHEEL and self.state == "menu" and self._show_changelog:
                 self._changelog_scroll_px = max(
                     0, min(self._changelog_max_scroll, self._changelog_scroll_px - event.y * 40))
+            elif event.type == pygame.MOUSEWHEEL and self.state == "playing" and self.player.map_open:
+                self._flip_map_page(-event.y)
+            elif (event.type == pygame.MOUSEWHEEL and self.state == "settings"
+                    and self.settings_page == "controls"):
+                self._controls_scroll_px = max(
+                    0, min(self._controls_max_scroll, self._controls_scroll_px - event.y * 46))
             elif event.type == pygame.MOUSEWHEEL and self.state == "credits":
                 self._community_scroll_px = max(
                     0, min(self._community_max_scroll, self._community_scroll_px - event.y * 40))
@@ -2290,6 +4508,13 @@ class App:
             self._handle_button_click(self._pause_buttons(), pos)
         elif self.state == "settings":
             self._handle_settings_click(pos)
+        elif self.state == "gamma_calibration":
+            layout = self._gamma_layout()
+            if layout["slider"].inflate(0, 24).collidepoint(pos):
+                self._apply_slider("gamma", layout["slider"], pos[0])
+                self.dragging_slider = "gamma"
+            else:
+                self._handle_button_click(layout["buttons"], pos)
         elif self.state == "credits":
             self._handle_button_click(self._credits_buttons(), pos)
         elif self.state == "warning":
@@ -2298,13 +4523,12 @@ class App:
             self._handle_button_click(self._confirm_quit_buttons(), pos)
         elif self.state == "update_prompt":
             self._handle_button_click(self._update_prompt_buttons(), pos)
-        elif self.state in ("dead_caught", "dead_sanity", "win"):
-            self._handle_button_click(self._end_buttons(
-                S.SCREEN_H // 2 + (85 if self.state == "win" else 105)), pos)
+        elif self.state in ("dead_caught", "dead_sanity", "win", "angel_end"):
+            self._handle_button_click(self._end_buttons(self.END_BUTTON_Y), pos)
 
     def _handle_keydown(self, key):
         if self.awaiting_bind is not None:
-            self._resolve_bind(key)
+            self._resolve_bind(("key", key))
             return
         if self.state == "splash":
             self._finish_splash()
@@ -2314,6 +4538,10 @@ class App:
         elif self.state == "menu":
             if key == pygame.K_F9:
                 self._start_debug_level()
+            elif key == pygame.K_F10:
+                self._start_transition_test_level()
+            elif key == pygame.K_F11:
+                self._start_spectator_level()
         elif self.state == "credits":
             if key == pygame.K_ESCAPE:
                 self.state = "menu"
@@ -2327,29 +4555,60 @@ class App:
             if key == pygame.K_ESCAPE:
                 self.state = "paused"
                 self._release_mouse()
-            elif key == self.settings["bindings"]["flashlight"]:
-                if self.is_peeking:
+            elif self._binding_matches_keydown("flashlight", key):
+                if self.is_peeking or self.hide_transition is not None:
                     self.sounds.play_denied()
                 elif not self.player.toggle_flashlight():
                     self.sounds.play_denied()
                 else:
                     self.sounds.play_ui()
-            elif key == self.settings["bindings"]["interact"]:
+            elif self._binding_matches_keydown("interact", key):
                 self.interact()
+            elif self._binding_matches_keydown("alt_interact", key):
+                self.interact_alt()
+            elif self._binding_matches_keydown("map", key):
+                if self.is_peeking or self.hide_transition is not None or not self.player.toggle_map():
+                    self.sounds.play_denied()
+                else:
+                    self.sounds.play_ui()
+                    if self.player.map_open and not self._map_help_shown:
+                        self._map_help_shown = True
+                        self.hint_text = i18n.Text(
+                            "hint.map_keys", mode=self._binding_label("map_mode"),
+                            pencil=self._binding_label("map_pencil"))
+                        self.hint_timer = 6.0
+            elif self._binding_matches_keydown("map_mode", key):
+                self._toggle_map_mode()
+        elif self.state == "note":
+            if key == pygame.K_ESCAPE or self._binding_matches_keydown("interact", key):
+                self._close_note()
+                self.sounds.play_ui()
         elif self.state == "paused":
             if key == pygame.K_ESCAPE:
                 self._begin_playing()
         elif self.state == "settings":
             if key == pygame.K_ESCAPE:
                 self._close_settings()
+        elif self.state == "gamma_calibration":
+            if key == pygame.K_ESCAPE:
+                self._close_gamma_calibration()
 
     def draw(self):
         self.hud_surf.fill((0, 0, 0, 0))
 
-        if self.state in ("menu", "playing", "paused", "settings",
-                           "catch_sanity", "win_seq", "credits", "warning", "confirm_quit",
+        if self.state == "note":
+            self._draw_note_scene()
+            return
+
+        if self.state in ("menu", "playing", "paused", "settings", "elevator_ride", "hatch_climb",
+                           "fence_escape", "angel_seq", "catch", "catch_sanity", "win_seq", "win",
+                           "dead_caught", "dead_sanity", "credits", "warning", "confirm_quit",
                            "update_prompt", "update_downloading"):
-            shake_yaw, shake_pitch = self.fx_shake.offset(max_px=0.045)
+            if self.state in ("fence_escape", "win_seq", "win"):
+                shake_yaw = math.sin(self.anim_t * 11.3) * 0.018 + math.sin(self.anim_t * 23.7) * 0.008
+                shake_pitch = math.cos(self.anim_t * 13.1) * 0.014 + math.sin(self.anim_t * 7.4) * 0.006
+            else:
+                shake_yaw, shake_pitch = self.fx_shake.offset(max_px=0.045)
             hide_locker, hide_swing = None, 0.0
             if self.hide_transition is not None:
                 hide_locker = self.hide_transition["locker"]
@@ -2363,19 +4622,105 @@ class App:
                     close_frac = dm.closing_timer / S.MONSTER_LOCKER_CLOSE_SECONDS
                     key = id(dm.closing_locker)
                     demo_door_swings[key] = max(demo_door_swings.get(key, 0.0), close_frac)
+            self._sync_wall_holes()
+            ambient_level = self.spec.get("ambient_level", 0.06)
+            moon_strength = self._moon_strength()
+            fe_light = self.fence_escape
+            if fe_light is not None:
+                b = min(1.0, fe_light["t"] / (S.FENCE_ESCAPE_SECONDS * 0.8))
+                b = b * b * (3.0 - 2.0 * b)
+                a0, m0, f0, c0 = fe_light["light0"]
+                ambient_level = a0 + (ambient_level - a0) * b
+                moon_strength = m0 + (moon_strength - m0) * b
+            if self.hatch_climb is not None:
+                moon_strength = max(moon_strength, self.hatch_climb["moon"])
+            fog_color = self.spec.get("fog_color", S.COL_FOG)
+            fog_dist = self.spec.get("fog_dist", 12.5)
+            if fe_light is not None:
+                fog_dist = f0 + (fog_dist - f0) * b
+                fog_color = tuple(c0[i] + (fog_color[i] - c0[i]) * b for i in range(3))
+            world_flood = 0.0
+            angel_billboard = None
+            burn = None
+            self._god_ray = None
+            if self.angel_seq is not None:
+                flood_t = self.angel_seq["flood_t"]
+                ambient_level += (S.ANGEL_FLOOD_AMBIENT - ambient_level) * flood_t
+                moon_strength += (S.ANGEL_FLOOD_MOON - moon_strength) * flood_t
+                fog_color = tuple(
+                    fog_color[i] + (S.ANGEL_FLOOD_FOG_COLOR[i] - fog_color[i]) * flood_t for i in range(3))
+                fog_dist += (S.ANGEL_FLOOD_FOG_DIST - fog_dist) * flood_t
+                angel_reveal = flood_t
+                world_flood = flood_t * 0.22
+                if self.angel_seq["burn"] > 0.0:
+                    burn = (self.angel_seq["pos"], self.angel_seq["burn"], S.ANGEL_BURN_WIDTH)
+                if self.angel_seq["phase"] == "whiteout":
+                    wo_frac = min(1.0, self.angel_seq["t"] / S.ANGEL_WHITEOUT_SECONDS)
+                    world_flood = 0.22 + 0.78 * wo_frac
+                    angel_reveal = 1.0
+                self._draw_angel_overlay(self.anim_t, angel_reveal)
+                angel_billboard = (
+                    pygame.image.tostring(self.angel_canvas, "RGBA"), S.ANGEL_CANVAS_SIZE,
+                    self.angel_seq["pos"], S.ANGEL_WORLD_SIZE,
+                )
+            self._upload_map_sheet()
+            self._upload_note_sheet()
+            self._sync_hallu_eyes()
             self.renderer.render(
                 self.maze, self.player, self.monster, self.props + self.doors, self.dread, self.anim_t,
                 shake_yaw, shake_pitch,
-                fog_color=self.spec.get("fog_color", S.COL_FOG), fog_dist=self.spec.get("fog_dist", 12.5),
-                ambient=self.spec.get("ambient_level", 0.06),
-                moon_strength=self.spec.get("moon_strength", 0.0),
+                fog_color=fog_color, fog_dist=fog_dist,
+                ambient=ambient_level,
+                moon_strength=moon_strength,
+                world_flood=world_flood, burn=burn,
+                haze=(self.spec.get("ground_haze", 0.0), self.spec.get("haze_height", 1.0),
+                      self.spec.get("haze_color", S.HAZE_COLOR)),
                 view_distance_mult=self.settings.get("view_distance", 1.0),
                 hide_locker=hide_locker, hide_swing=hide_swing,
-                camera_override=self._peek_camera_override(),
+                camera_override=self._active_camera_override(),
                 extra_door_swings=demo_door_swings,
+                hallu_intensity=self.hallu_intensity,
+                hide_monster=self._debug_transition_test or self.state in ("fence_escape", "win_seq", "win"),
+                angel_billboard=angel_billboard,
+                trip_intensity=self.trip_intensity,
+                debug_vision_cone=(self.state in ("playing", "paused")
+                                    and (self.settings.get("debug_hud_monster")
+                                          or self._debug_spectator)),
+                look_yaw=self._trip_cam_yaw, look_pitch=self._trip_cam_pitch,
             )
+            if self.angel_seq is not None and self.angel_seq["ray"] > 0.0:
+                cam = self.renderer.last_camera
+                at = self.renderer.project_to_screen(self.angel_seq["pos"], cam[0], cam[1], cam[2],
+                                                     cam[3], cam[4])
+                if at is not None:
+                    self._god_ray = (at[0] / S.SCREEN_W, 1.0 - at[1] / S.SCREEN_H,
+                                     self.angel_seq["ray"])
+            if self.exit_prop is not None and self.exit_prop.kind == "elevator":
+                self.renderer._draw_elevator_call_lights(
+                    (self.exit_prop.x, self.exit_prop.y), self.exit_prop.facing,
+                    self._elevator_active_light_index(), S.ELEVATOR_ARRIVE_LIGHT_COUNT, self.anim_t)
+            for arrived in self.props:
+                if arrived.kind == "elevator_arrival":
+                    eye = self.renderer.last_camera[0] if self.renderer.last_camera else None
+                    self.renderer._draw_elevator_call_lights(
+                        (arrived.x, arrived.y), arrived.facing, S.ELEVATOR_ARRIVE_LIGHT_COUNT - 1,
+                        S.ELEVATOR_ARRIVE_LIGHT_COUNT, self.anim_t)
+                    if self.renderer.eye_inside_cabin(arrived, eye):
+                        self.renderer._draw_elevator_call_lights(
+                            (arrived.x, arrived.y), arrived.facing, S.ELEVATOR_ARRIVE_LIGHT_COUNT - 1,
+                            S.ELEVATOR_ARRIVE_LIGHT_COUNT, self.anim_t, inside=True)
+            ride = self.elevator_ride
+            if ride is not None and ride.get("cabin") is not None and ride["phase"] in ("closing", "ride", "opening"):
+                frac = min(1.0, ride["t"] / S.ELEVATOR_DESCEND_HOLD_SECONDS) if ride["phase"] == "ride" else (
+                    0.0 if ride["phase"] == "closing" else 1.0)
+                n = S.ELEVATOR_ARRIVE_LIGHT_COUNT
+                self.renderer._draw_elevator_call_lights(
+                    (ride["cabin"].x, ride["cabin"].y), ride["cabin"].facing,
+                    min(n - 1, int(frac * n)), n, self.anim_t, inside=True)
             for dm in self.debug_demo_monsters:
                 self.renderer._draw_monster(dm, 0.0, check_frac=self.renderer.compute_check_frac(dm))
+            if self.debug_door_monster is not None:
+                self.renderer._draw_monster(self.debug_door_monster, 0.0)
             if self.player.is_hiding or self.hide_vignette_t > 0.0:
                 self._draw_hide_frame()
 
@@ -2402,20 +4747,34 @@ class App:
             self._draw_hud()
             self._draw_peek_mask()
             self._draw_pause()
+        elif self.state == "elevator_ride":
+            if self._status_held():
+                self._draw_hud()
+        elif self.state == "hatch_climb":
+            if self._status_held():
+                self._draw_hud()
+        elif self.state == "fence_escape":
+            fe = self.fence_escape
+            pass
+        elif self.state == "angel_seq":
+            a = self.angel_seq
+            if a["phase"] == "whiteout":
+                frac = min(1.0, a["t"] / S.ANGEL_WHITEOUT_SECONDS)
+                fx.draw_flash(self.hud_surf, (255, 252, 240), 255 * frac)
+        elif self.state == "angel_end":
+            frac = min(1.0, self.catch_timer / S.ANGEL_END_FADE_SECONDS)
+            self._draw_angel_end(alpha_mult=frac)
         elif self.state == "catch":
-            progress = min(1.0, self.catch_timer / 0.7)
+            progress = min(1.0, self.catch_timer / S.CATCH_SECONDS)
             fx.draw_jumpscare_face(self.hud_surf, progress)
         elif self.state == "catch_sanity":
             t = self.catch_timer / 2.6
             white = max(0, 255 * (1 - abs(t - 0.3) / 0.3)) if t < 0.6 else 0
             fx.draw_flash(self.hud_surf, (255, 255, 255), white)
-            black = 255 * max(0.0, (t - 0.55) / 0.45)
-            fx.draw_flash(self.hud_surf, (0, 0, 0), black)
+            fx.draw_flash(self.hud_surf, (0, 0, 0), 190 * max(0.0, (t - 0.55) / 0.45))
         elif self.state == "win_seq":
-            t = self.catch_timer / 3.0
-            fx.draw_flash(self.hud_surf, (255, 255, 245), 255 * min(1.0, t * 1.2))
-        elif self.state == "transition":
-            self._draw_transition()
+            frac = min(1.0, self.catch_timer / S.WIN_FADE_SECONDS)
+            self._draw_win(alpha_mult=frac)
         elif self.state == "dead_caught":
             self._draw_gameover(i18n.t("gameover.caught_title"), (150, 20, 20), i18n.t("gameover.caught_subtitle"))
         elif self.state == "dead_sanity":
@@ -2424,6 +4783,8 @@ class App:
             self._draw_win()
         elif self.state == "settings":
             self._draw_settings()
+        elif self.state == "gamma_calibration":
+            self._draw_gamma_calibration()
         elif self.state == "confirm_quit":
             if self.confirm_return == "menu":
                 self._draw_menu()
@@ -2431,21 +4792,55 @@ class App:
                 self._draw_hud()
             self._draw_confirm_quit()
 
-        if self.state not in ("catch", "catch_sanity", "win_seq", "transition"):
+        if self.state not in ("catch", "catch_sanity", "win_seq", "elevator_ride", "hatch_climb",
+                               "fence_escape", "angel_seq"):
             self._draw_wip_label()
 
         self._draw_debug_overlay()
+        self._draw_console()
 
         self._sync_window_size()
-        hud_bytes = pygame.image.tostring(self.hud_surf, "RGBA", True)
-        self.renderer.composite(hud_bytes, (S.SCREEN_W, S.SCREEN_H), self.window_size)
+        self.renderer.composite(None, (S.SCREEN_W, S.SCREEN_H), self.window_size,
+                                 trip_intensity=self.trip_intensity, t=self.anim_t,
+                                 comedown_intensity=self.comedown_intensity, hud_surface=self.hud_surf,
+                                 god_ray=getattr(self, "_god_ray", None))
         pygame.display.flip()
 
     def _draw_wip_label(self):
-        text = "Work in progress..."
+        text = i18n.t("hud.wip")
         w = self.font_sm.size(text)[0]
         self._text(self.font_sm, text, S.COL_UI_DIM,
                    topleft=(S.SCREEN_W - w - 14, S.SCREEN_H - 26), shadow=False)
+
+    def _draw_console(self):
+        con = self.console
+        if not con.open:
+            return
+        pad = 12
+        rect = pygame.Rect(pad, pad, S.SCREEN_W - pad * 2, int(S.SCREEN_H * 0.56))
+        self._draw_panel(rect, fill=(6, 6, 8, 232), border=(120, 108, 96),
+                         accent=(150, 55, 50), corner=18)
+        font = self.font_sm
+        lh = font.get_height() + 2
+        input_y = rect.bottom - pad - lh
+        pygame.draw.line(self.hud_surf, (70, 64, 58),
+                         (rect.x + pad, input_y - 6), (rect.right - pad, input_y - 6), 1)
+        room = max(1, (input_y - 10 - (rect.y + pad)) // lh)
+        end = len(con.lines) - con.scroll
+        shown = con.lines[max(0, end - room):max(0, end)]
+        colours = {"in": (205, 196, 178), "out": (150, 146, 136), "err": (208, 96, 84)}
+        y = rect.y + pad
+        for text, kind in shown:
+            self._text(font, text, colours.get(kind, colours["out"]),
+                       topleft=(rect.x + pad, y), shadow=False)
+            y += lh
+        caret = "_" if (con.caret_t % 1.0) < 0.55 else " "
+        self._text(font, debug_console.PROMPT + con.line + caret, (225, 216, 198),
+                   topleft=(rect.x + pad, input_y), shadow=False)
+        if con.scroll:
+            tag = "^ %d" % con.scroll
+            self._text(font, tag, (150, 146, 136),
+                       topleft=(rect.right - pad - font.size(tag)[0], rect.y + pad), shadow=False)
 
     def _draw_debug_overlay(self):
         lines = []
@@ -2457,20 +4852,31 @@ class App:
         gameplay = self.state in ("playing", "paused")
         if gameplay and self.settings.get("debug_hud_coords"):
             p = self.player
-            lines.append(f"XY: {p.x:.2f}, {p.y:.2f}  cell: {p.cell}  ang: {math.degrees(p.angle) % 360:.0f} deg")
-        if gameplay and self.settings.get("debug_hud_monster"):
+            lines.append(i18n.t("debug_hud.line_coords", x=f"{p.x:.2f}", y=f"{p.y:.2f}", cell=p.cell,
+                                ang=f"{math.degrees(p.angle) % 360:.0f}"))
+        if gameplay and (self.settings.get("debug_hud_monster") or self._debug_spectator):
             m, p = self.monster, self.player
             dist = math.hypot(m.x - p.x, m.y - p.y)
-            lines.append(f"Monster: {i18n.t(f'debug_hud.state_{m.state}')}  dist: {dist:.1f}  alert: {m.alert_level:.2f}")
+            lines.append(i18n.t("debug_hud.line_monster", state=i18n.t(f"debug_hud.state_{m.state}"),
+                                dist=f"{dist:.1f}", alert=f"{m.alert_level:.2f}"))
+            sight = monster_vision_base(p.light_level, m.vision_light_norm) * m.vision_mult
+            lines.append(i18n.t("debug_hud.line_light", light=f"{p.light_level:.2f}",
+                                lit=f"{monster_lit_frac(p.light_level, m.vision_light_norm):.2f}",
+                                sight=f"{sight:.1f}", sanity=i18n.t("debug_hud.yes" if p.is_lit else "debug_hud.no")))
         if gameplay and self.settings.get("debug_hud_seed"):
-            lines.append(f"Seed: {self.floor_seed}")
+            stage = getattr(self, "anomaly_stage", S.ANOMALY_DEFAULT_STAGE)
+            lines.append(i18n.t("debug_hud.line_seed", seed=self.floor_seed,
+                                roll=getattr(self, "anomaly_roll", "-"), stage=stage,
+                                name=S.anomaly_of(stage)["key"],
+                                load="%.0f" % getattr(self, "floor_load_ms", 0.0)))
         if gameplay and self.settings.get("debug_hud_scares"):
-            lines.append(f"Dread: {self.dread*100:.0f}%  (time {self._dread_time_frac*100:.0f}% "
-                          f"+ progress {self._dread_progress_frac*100:.0f}%)")
+            lines.append(i18n.t("debug_hud.line_dread", dread=f"{self.dread * 100:.0f}",
+                                time=f"{self._dread_time_frac * 100:.0f}",
+                                progress=f"{self._dread_progress_frac * 100:.0f}"))
             fill_pct = self.scare_progress / self.scare_target * 100.0 if self.scare_target else 0.0
             rate = 100.0 / max(1.0, self._scare_seconds_to_fill)
-            lit_tag = "lit" if self._scare_lit else "dark"
-            lines.append(f"Scare fill: {fill_pct:.0f}%  rate: {rate:.1f}%/s  ({lit_tag})")
+            lines.append(i18n.t("debug_hud.line_scare", fill=f"{fill_pct:.0f}", rate=f"{rate:.1f}",
+                                tag=i18n.t("debug_hud.tag_lit" if self._scare_lit else "debug_hud.tag_dark")))
         if not lines:
             return
         font = self.font_sm
@@ -2513,10 +4919,22 @@ class App:
         ])
         self.hud_surf.blit(overlay, (0, 0))
 
+    _TEXT_CACHE_LIMIT = 1024
+
+    def _rendered_text(self, font, text, color):
+        key = (font, text, tuple(color))
+        cache = self._text_cache
+        surf = cache.get(key)
+        if surf is None:
+            if len(cache) >= self._TEXT_CACHE_LIMIT:
+                cache.clear()
+            surf = cache[key] = font.render(text, True, color)
+        return surf
+
     def _text(self, font, text, color, center=None, topleft=None, shadow=True):
-        surf = font.render(text, True, color)
+        surf = self._rendered_text(font, text, color)
         if shadow:
-            sh = font.render(text, True, (0, 0, 0))
+            sh = self._rendered_text(font, text, (0, 0, 0))
             r = surf.get_rect()
             if center:
                 r.center = (center[0] + 2, center[1] + 2)
@@ -2595,24 +5013,58 @@ class App:
     def _draw_splash(self):
         self.hud_surf.fill((0, 0, 0, 255))
         cx, cy = S.SCREEN_W // 2, S.SCREEN_H // 2
+        page_a = 1.0 - self._smooth01((self._splash_t - SPLASH_HOLD_END) / SPLASH_FADE_OUT_DUR)
+        if page_a <= 0.003:
+            return
+        self._blit_static()
+
+        flicker = 0.88 + 0.12 * math.sin(self.anim_t * 1.3)
+        if random.random() < 0.0015:
+            flicker *= 0.55
 
         title_a = self._splash_group_alpha(*SPLASH_TITLE_FADE)
         if title_a > 0.003:
             drift = (1.0 - self._smooth01((self._splash_t - SPLASH_TITLE_FADE[0]) / SPLASH_TITLE_FADE[1])) * 14
-            surf = self.font_title.render("WARD No. 9", True, S.COL_TEXT)
+            frame = pygame.Rect(0, 0, 620, 252)
+            frame.center = (cx, cy - 52 + int(drift * 0.5))
+            card = pygame.Surface(frame.size, pygame.SRCALPHA)
+            self._draw_panel(pygame.Rect(0, 0, frame.w, frame.h), fill=(8, 6, 6, 120),
+                             corner=26, target=card)
+            card.set_alpha(int(210 * title_a))
+            self.hud_surf.blit(card, frame.topleft)
+
+            ty = frame.top + 74 + drift
+            for spread, a in ((4, 26), (2, 55)):
+                glow = self.font_title.render(S.TITLE, True, (200, 30, 30))
+                glow.set_alpha(int(a * flicker * title_a))
+                r = glow.get_rect(center=(cx, ty))
+                for ox, oy in ((-spread, 0), (spread, 0), (0, -spread), (0, spread)):
+                    self.hud_surf.blit(glow, (r.x + ox, r.y + oy))
+            surf = self.font_title.render(
+                S.TITLE, True, (int(215 * flicker), int(40 * flicker), int(38 * flicker)))
             surf.set_alpha(int(255 * title_a))
-            self.hud_surf.blit(surf, surf.get_rect(center=(cx, cy - 70 + drift)))
+            self.hud_surf.blit(surf, surf.get_rect(center=(cx, ty)))
+
+            ry = frame.top + 132 + drift
+            rule = pygame.Surface((300, 1), pygame.SRCALPHA)
+            rule.fill((70, 62, 58, 255))
+            rule.set_alpha(int(255 * title_a))
+            self.hud_surf.blit(rule, rule.get_rect(center=(cx, ry)))
+
+            surf = self.font_sm.render("WARD No. 9", True, S.COL_UI_DIM)
+            surf.set_alpha(int(200 * title_a))
+            self.hud_surf.blit(surf, surf.get_rect(center=(cx, ry + 24)))
 
         sub_a = self._splash_group_alpha(*SPLASH_SUBTITLE_FADE)
         if sub_a > 0.003:
             drift = (1.0 - self._smooth01((self._splash_t - SPLASH_SUBTITLE_FADE[0]) / SPLASH_SUBTITLE_FADE[1])) * 10
-            surf = self.font_md.render("by Lonewolf239", True, S.COL_UI_DIM)
-            surf.set_alpha(int(255 * sub_a))
-            self.hud_surf.blit(surf, surf.get_rect(center=(cx, cy - 14 + drift)))
+            surf = self.font_md.render("by Lonewolf239", True, S.COL_TEXT)
+            surf.set_alpha(int(190 * sub_a))
+            self.hud_surf.blit(surf, surf.get_rect(center=(cx, cy + 22 + drift)))
 
         hp_a = self._splash_group_alpha(*SPLASH_HEADPHONES_FADE)
         if hp_a > 0.003:
-            self._draw_headphones_hint(cx, cy + 60, hp_a)
+            self._draw_headphones_hint(cx, cy + 150, hp_a)
 
         skip_a = self._splash_group_alpha(*SPLASH_SKIP_HINT_FADE)
         if skip_a > 0.003:
@@ -2738,6 +5190,8 @@ class App:
         pygame.draw.polygon(self.hud_surf, (95, 88, 82), shape, width=2)
         if not (self.settings.get("mic_enabled") and self.mic.available):
             hint = i18n.t("settings.mic_test_disabled")
+        elif self.mic.busy:
+            hint = None
         elif not self.mic.active:
             hint = i18n.t("settings.mic_test_error")
         else:
@@ -2774,22 +5228,27 @@ class App:
             "master_volume": (i18n.t("settings.volume"), f"{int(self.settings['master_volume'] * 100)}%"),
             "sfx_volume": (i18n.t("settings.sfx_volume"), f"{int(self.settings['sfx_volume'] * 100)}%"),
             "music_volume": (i18n.t("settings.music_volume"), f"{int(self.settings['music_volume'] * 100)}%"),
-            "mouse_sensitivity": (i18n.t("settings.mouse_sens_x"), f"{self.settings['mouse_sensitivity']:.1f}x"),
-            "mouse_sensitivity_y": (i18n.t("settings.mouse_sens_y"), f"{self.settings['mouse_sensitivity_y']:.1f}x"),
+            "mouse_sensitivity": (i18n.t("settings.mouse_sens"), f"{self.settings['mouse_sensitivity']:.1f}x"),
             "view_distance": (i18n.t("settings.view_distance"), f"{int(self.settings['view_distance'] * 100)}%"),
             "mic_sensitivity": (i18n.t("settings.mic_sensitivity"), f"{self.settings['mic_sensitivity']:.1f}"),
         }
-        for key, rect in layout["sliders"].items():
-            if key in STEPPED_SLIDERS:
-                continue
-            label, value_text = slider_specs[key]
-            self._draw_slider(rect, slider_frac(key), label, value_text, dragging=(self.dragging_slider == key))
+        def draw_plain_sliders():
+            for key, rect in layout["sliders"].items():
+                if key in STEPPED_SLIDERS:
+                    continue
+                label, value_text = slider_specs[key]
+                self._draw_slider(rect, slider_frac(key), label, value_text,
+                                  dragging=(self.dragging_slider == key))
+
+        if page != "controls":
+            draw_plain_sliders()
 
         if page == "graphics":
-            fs_btn, aa_btn, vs_btn = layout["buttons"]
+            fs_btn, aa_btn, vs_btn, gamma_btn = layout["buttons"]
             self._draw_toggle(fs_btn, self.settings["fullscreen"])
             self._draw_toggle(aa_btn, self.settings["upscale_smoothing"])
             self._draw_toggle(vs_btn, self.settings["vsync"])
+            self._draw_value_row(gamma_btn, f"{self.settings['gamma']:.2f}  >")
             fps_options = STEPPED_SLIDERS["fps_limit"]
             fps_idx = fps_options.index(self.settings["fps_limit"]) if self.settings["fps_limit"] in fps_options else 0
             self._draw_stepped_slider(layout["sliders"]["fps_limit"], fps_idx, len(fps_options),
@@ -2802,6 +5261,14 @@ class App:
                                       i18n.t("settings.quality_preset_label"),
                                       i18n.t(f"settings.quality_{self.settings['quality_preset']}"),
                                       dragging=(self.dragging_slider == "quality_preset"))
+            for key in GFX_SLIDER_KEYS:
+                options = S.GFX_SETTING_OPTIONS[key]
+                current = self.settings.get(key, options[0])
+                idx = options.index(current) if current in options else 0
+                value_text = i18n.t(f"settings.{key}_{current}")
+                self._draw_stepped_slider(layout["sliders"][key], idx, len(options),
+                                          i18n.t(f"settings.{key}_label"), value_text,
+                                          dragging=(self.dragging_slider == key))
         elif page == "sound":
             mic_btn, = layout["buttons"]
             self._draw_toggle(mic_btn, self.settings["mic_enabled"])
@@ -2817,6 +5284,10 @@ class App:
             self._draw_combo("mic_device", layout["combos"]["mic_device"])
         elif page == "controls":
             mouse = self._logical_mouse_pos()
+            viewport = layout["viewport"]
+            hud = self.hud_surf
+            self.hud_surf = self._scroll_layer(viewport)
+            draw_plain_sliders()
             for action, rect in layout["rows"]:
                 waiting = self.awaiting_bind == action
                 hovered = waiting or rect.collidepoint(mouse)
@@ -2827,7 +5298,7 @@ class App:
                 pygame.draw.rect(self.hud_surf, (215, 80, 80) if hovered else (95, 88, 82), rect, width=2)
                 self._text(self.font_sm, i18n.t(f"binding.{action}"), S.COL_TEXT,
                           topleft=(rect.x + 14, rect.y + rect.h // 2 - self.font_sm.get_height() // 2), shadow=False)
-                key_label = "..." if waiting else pygame.key.name(self.settings["bindings"][action]).upper()
+                key_label = "..." if waiting else self._binding_label(action)
                 key_w = self.font_sm.size(key_label)[0]
                 self._text(self.font_sm, key_label, (225, 200, 120) if waiting else (200, 190, 180),
                           topleft=(rect.right - 12 - key_w, rect.y + rect.h // 2 - self.font_sm.get_height() // 2),
@@ -2835,13 +5306,27 @@ class App:
             for btn in layout["buttons"]:
                 self._draw_button(btn)
             if self.controls_msg_timer > 0 and self.controls_msg:
-                self._text(self.font_sm, self.controls_msg, (225, 150, 90), center=(cx, layout["msg_y"]))
+                self._text(self.font_sm, str(self.controls_msg), (225, 150, 90), center=(cx, layout["msg_y"]))
             elif self.awaiting_bind:
                 self._text(self.font_sm, i18n.t("controls.press_key"), S.COL_UI_DIM, center=(cx, layout["msg_y"]))
-        elif page == "language":
+            layer, self.hud_surf = self.hud_surf, hud
+            self._blit_scroll_layer(layer, viewport, self._controls_scroll_px,
+                                    self._controls_max_scroll)
+            self._draw_scrollbar(viewport, self._controls_scroll_px,
+                                 self._controls_max_scroll)
+        elif page == "interface":
+            hud_rect = layout["combos"]["hud_style"]["rect"]
+            self._text(self.font_sm, i18n.t("hud.style"), S.COL_UI_DIM,
+                      topleft=(hud_rect.x, hud_rect.y - 22), shadow=False)
+            style = self.settings.get("hud_style", S.HUD_STYLES[0])
+            self._text(self.font_sm,
+                      i18n.t("hud.style_about_" + style, bind=self._binding_label("status")),
+                      S.COL_UI_DIM, topleft=(hud_rect.x, layout["blurb_y"]), shadow=False)
+            self._draw_toggle(layout["buttons"][0], self.settings.get("compass", True))
             lang_rect = layout["combos"]["language"]["rect"]
             self._text(self.font_sm, i18n.t("settings.language_label"), S.COL_UI_DIM,
                       topleft=(lang_rect.x, lang_rect.y - 22), shadow=False)
+            self._draw_combo("hud_style", layout["combos"]["hud_style"])
             self._draw_combo("language", layout["combos"]["language"])
         elif page == "debug":
             for opt, btn in zip(DEBUG_HUD_OPTIONS, layout["buttons"]):
@@ -2851,63 +5336,6 @@ class App:
                 for line in self._wrap_text(i18n.t("settings.debug_menu_only"), self.font_sm, content.w):
                     self._text(self.font_sm, line, S.COL_UI_DIM, topleft=(content.x, hint_y), shadow=False)
                     hint_y += 20
-
-    def _draw_transition(self):
-        dur = 2.8
-        t = self.transition_timer
-        frac = max(0.0, min(1.0, t / dur))
-        cx, cy = S.SCREEN_W // 2, S.SCREEN_H // 2
-
-        flicker = random.random() < 0.05
-        base = (10, 3, 3) if flicker else (2, 2, 3)
-        self.hud_surf.fill(base)
-
-        jx = math.sin(t * 37.0) * 2.0
-        jy = math.sin(t * 23.0 + 1.7) * 1.4
-
-        alpha_in = min(1.0, t / 0.5)
-        alpha_out = min(1.0, max(0.0, (dur - t) / 0.5))
-        alpha = min(alpha_in, alpha_out)
-
-        txt = self._spec_t("descend_text") or "..."
-        surf = self.font_lg.render(txt, True, S.COL_TEXT)
-        surf.set_alpha(int(255 * alpha))
-        self.hud_surf.blit(surf, surf.get_rect(center=(cx + jx, cy - 70 + jy)))
-
-        next_spec = S.FLOOR_SPECS[min(self.floor_i + 1, len(S.FLOOR_SPECS) - 1)]
-        sub = self.font_sm.render(i18n.t(next_spec["title"]), True, S.COL_UI_DIM)
-        sub.set_alpha(int(255 * alpha))
-        self.hud_surf.blit(sub, sub.get_rect(center=(cx + jx * 0.5, cy - 20 + jy * 0.5)))
-
-        shaft_top, shaft_bot = cy + 40, cy + 190
-        pygame.draw.line(self.hud_surf, (70, 62, 58), (cx, shaft_top), (cx, shaft_bot), 3)
-        marker_y = shaft_top + (shaft_bot - shaft_top) * frac
-        glow = pygame.Surface((26, 26), pygame.SRCALPHA)
-        pygame.draw.circle(glow, (200, 60, 50, 90), (13, 13), 13)
-        self.hud_surf.blit(glow, (cx - 13, int(marker_y) - 13))
-        pygame.draw.circle(self.hud_surf, (215, 90, 70), (cx, int(marker_y)), 6)
-
-    def _draw_compass(self):
-        cx = S.SCREEN_W // 2
-        top, w, h = 14, 280, 24
-        rect = pygame.Rect(cx - w // 2, top, w, h)
-        self._draw_panel(rect, fill=(10, 9, 8, 130), corner=8)
-
-        deg_per_px = 140.0 / w
-        ang_deg = math.degrees(self.player.angle)
-        labels = {0: i18n.t("compass.n"), 90: i18n.t("compass.e"), 180: i18n.t("compass.s"), 270: i18n.t("compass.w")}
-        for mark_deg in range(0, 360, 15):
-            rel = ((mark_deg - ang_deg + 180) % 360) - 180
-            if abs(rel) > 70:
-                continue
-            x = cx + rel / deg_per_px
-            major = mark_deg % 90 == 0
-            tick_h = 10 if major else 5
-            col = (200, 190, 180) if major else (110, 105, 100)
-            pygame.draw.line(self.hud_surf, col, (x, top + h - tick_h), (x, top + h), 2 if major else 1)
-            if major:
-                self._text(self.font_sm, labels[mark_deg], (215, 205, 190), center=(x, top + 8), shadow=False)
-        pygame.draw.polygon(self.hud_surf, (210, 70, 70), [(cx - 5, top - 2), (cx + 5, top - 2), (cx, top + 6)])
 
     @staticmethod
     def _vu_color(level):
@@ -2920,92 +5348,586 @@ class App:
                 return tuple(int(c0[i] + (c1[i] - c0[i]) * t) for i in range(3))
         return stops[-1][1]
 
-    def _draw_mic_vu(self, x, y, h):
-        w = 16
-        level = self.mic_vu_level
-        pygame.draw.rect(self.hud_surf, (32, 29, 27), (x, y, w, h), border_radius=3)
-        fill_h = int(h * max(0.0, min(1.0, level)))
-        if fill_h > 0:
-            col = self._vu_color(level)
-            fill_rect = pygame.Rect(x, y + h - fill_h, w, fill_h)
-            pygame.draw.rect(self.hud_surf, col, fill_rect, border_radius=3)
-        pygame.draw.rect(self.hud_surf, (95, 88, 82), (x, y, w, h), width=1, border_radius=3)
-        for frac in (0.45, 0.72):
-            ty = y + h - int(h * frac)
-            pygame.draw.line(self.hud_surf, (60, 55, 52), (x, ty), (x + w, ty), 1)
+    def _condition_state(self):
+        frac = self.player.sanity / S.SANITY_MAX
+        if frac >= S.CONDITION_OK:
+            return "ok", i18n.t("hud.cond_ok"), (150, 190, 150)
+        if frac >= S.CONDITION_BAD:
+            return "bad", i18n.t("hud.cond_bad"), (210, 185, 110)
+        return "worst", i18n.t("hud.cond_worst"), (205, 90, 80)
+
+    def _sheet_damage(self):
+        frac = self.player.sanity / S.SANITY_MAX
+        d = max(0.0, min(1.0, (S.CONDITION_CLEAN - frac) / max(1e-6, S.CONDITION_CLEAN)))
+        return d, int(d * 24 + 0.5)
+
+    def _sheet_marks(self, n):
+        marks = self.__dict__.get("_sheet_mark_list")
+        if marks is None:
+            rng = random.Random(getattr(self, "_sheet_seed", 0) ^ 0x5A17)
+            marks = [(rng.uniform(0.08, 0.92), rng.uniform(0.17, 0.94),
+                      rng.uniform(12.0, 34.0), rng.randrange(1 << 30))
+                     for _ in range(S.CONDITION_MARKS_MAX)]
+            self._sheet_mark_list = marks
+        return marks[:max(0, n)]
+
+    def _pocket_lines(self):
+        p = self.player
+        out = []
+        label = self._spec_t("collectible_label").capitalize()
+        out.append(i18n.t("hud.carried", label=label, n=p.carried))
+        out.append(i18n.t("item.battery", n=int(p.battery)))
+        if p.has_lighter:
+            out.append(i18n.t("item.lighter"))
+        if p.has_cutters:
+            out.append(i18n.t("item.cutters_broken" if p.cutters_broken else "item.cutters"))
+        if p.has_map:
+            out.append(i18n.t("item.map"))
+            out.append(i18n.t("item.pencils", n=f"{p.pencil_ink / S.PENCIL_SHEETS:.1f}"))
+            out.append(i18n.t("item.sheets", n=len(self.map_sheets)))
+        return out
+
+    def _task_lines(self):
+        p = self.player
+        out = []
+        if self.panel_prop is not None:
+            powered_word = self._spec_t("panel_powered_text", "hud.powered")
+            status = powered_word if self.panel_prop.powered else i18n.t(
+                "hud.installed_count", n=self.panel_prop.installed, total=self.spec["n_collectible"])
+            out.append(i18n.t("hud.panel_status",
+                              label=self._spec_t("panel_label").capitalize(), status=status))
+        exit_req = self.spec.get("exit_requires_item")
+        if exit_req:
+            have = self._player_has_exit_item(exit_req)
+            label = self._spec_t("exit_requires_item_label") or exit_req.capitalize()
+            out.append(i18n.t("hud.exit_req", label=label,
+                              status=i18n.t("hud.have" if have else "hud.dont_have")))
+        return out
+
+    def _sheet_caption(self, surf, text, y, max_w, col, max_lines=2):
+        for line in self._wrap_text(text, self.font_note, max_w)[:max_lines]:
+            self._text_on(surf, self.font_note, line, col, (18, y))
+            y += self.font_note.get_height() - 6
+        return y
+
+    def _stamina_showing(self):
+        p = self.player
+        if p.stamina_locked or p.is_sprinting or p.stamina < S.STAMINA_MAX - 0.5:
+            self._stamina_seen_t = S.HUD_STAMINA_LINGER
+        return self._stamina_seen_t > 0.0
 
     def _draw_hud(self):
+        style = self.settings.get("hud_style", S.HUD_STYLES[0])
+        if style == "clipboard":
+            self._draw_hud_clipboard()
+        elif style == "chart":
+            self._draw_hud_chart()
+        else:
+            self._draw_hud_minimal()
+        self._draw_hud_common()
+
+    @staticmethod
+    def _wobble(rng, amount):
+        return rng.uniform(-amount, amount), rng.uniform(-amount, amount)
+
+    def _sketch_line(self, surf, p0, p1, col, rng, jitter, width=2, passes=2):
+        for _ in range(passes):
+            ax, ay = p0[0] + rng.uniform(-jitter, jitter), p0[1] + rng.uniform(-jitter, jitter)
+            bx, by = p1[0] + rng.uniform(-jitter, jitter), p1[1] + rng.uniform(-jitter, jitter)
+            mx, my = (ax + bx) / 2 + rng.uniform(-jitter, jitter), (ay + by) / 2 + rng.uniform(-jitter, jitter)
+            pygame.draw.lines(surf, col, False, [(ax, ay), (mx, my), (bx, by)], width)
+
+    def _sketch_rect(self, surf, rect, col, rng, jitter, width=2):
+        x, y, w, h = rect
+        pts = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        for i in range(4):
+            self._sketch_line(surf, pts[i], pts[(i + 1) % 4], col, rng, jitter, width, passes=1)
+
+    def _sketch_fill(self, surf, rect, col, rng, jitter, frac):
+        x, y, w, h = rect
+        n = max(1, int(w / 5))
+        for i in range(int(n * max(0.0, min(1.0, frac)))):
+            px = x + 3 + i * 5
+            self._sketch_line(surf, (px, y + 3), (px - h * 0.25, y + h - 3), col, rng,
+                              jitter, 1, passes=1)
+
+    def _sketch_circle_dot(self, surf, cx, cy, col, rng, jitter):
+        pygame.draw.circle(surf, col, (int(cx + rng.uniform(-jitter, jitter)),
+                                       int(cy + rng.uniform(-jitter, jitter))), 3, 2)
+
+    def _sketch_scribble(self, surf, cx, cy, r, col, rng, jitter):
+        pts = []
+        for _ in range(rng.randint(6, 11)):
+            a = rng.uniform(0, math.tau)
+            d = rng.uniform(r * 0.2, r)
+            pts.append((cx + math.cos(a) * d, cy + math.sin(a) * d))
+        pygame.draw.lines(surf, col, False, pts, 2)
+
+    def _clipboard_sheet(self):
         p = self.player
-        pad = 22
-        row_h = 36
-        bar_w, bar_h = 196, 14
+        damage, damage_step = self._sheet_damage()
+        key = (int(p.battery / 4), p.carried, p.has_lighter, p.has_cutters, p.cutters_broken,
+               p.has_map, int(p.pencil_ink / (S.PENCIL_SHEETS * 0.5)), len(self.map_sheets),
+               self.panel_prop.installed if self.panel_prop is not None else -1,
+               bool(self.panel_prop.powered) if self.panel_prop is not None else False,
+               damage_step, self.floor_i, i18n.get_language())
+        if getattr(self, "_clip_key", None) == key and self._clip_surf is not None:
+            return self._clip_surf
+        jitter = 0.9 + damage * 3.1
+        marks = self._sheet_marks(int(damage * S.CONDITION_MARKS_MAX + 0.001))
+        rng = random.Random(hash(key) & 0xFFFF)
+        w, h = 300, 400
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        paper = (214, 205, 180)
+        surf.fill(paper)
+        ink = (58, 54, 50)
+        faint = (150, 142, 122)
+        for i in range(1, 12):
+            gy = i * 32
+            pygame.draw.line(surf, (198, 189, 165), (12, gy), (w - 12, gy))
+        pygame.draw.rect(surf, (150, 142, 120), (0, 0, w, h), width=2)
 
-        fl_label = i18n.t("hud.flashlight")
-        st_label = i18n.t("hud.stamina")
-        sanity_label = i18n.t("hud.sanity")
-        label_x_offset = pad + 16 - (pad - 12)
-        max_label_w = max(self.font_sm.size(t)[0] for t in (fl_label, st_label, sanity_label))
-        panel_w = max(bar_w + 44, max_label_w + label_x_offset + 10)
-        panel_h = row_h * 3 + 18
-        panel_x, panel_y = pad - 12, S.SCREEN_H - pad - panel_h
-        self._draw_panel(pygame.Rect(panel_x, panel_y, panel_w, panel_h),
-                          fill=(10, 9, 8, 150), corner=12)
+        y = 8
+        title = self._spec_t("title")
+        for dash in ("\u2014", "\u2013", " - "):
+            if dash in title:
+                title = title.split(dash)[-1]
+                break
+        self._text_on(surf, self.font_note,
+                      self._ellipsize(title.strip(), self.font_note, w - 32), ink, (16, y))
+        y += 34
+        self._sketch_line(surf, (14, y), (w - 14, y), faint, rng, jitter, 1, passes=1)
+        y += 6
 
-        def bar(row, frac, color, icon_color, label):
-            bx = pad
-            top = panel_y + 12 + row * row_h
-            icon_r = pygame.Rect(bx, top + 1, 10, 10)
-            pygame.draw.rect(self.hud_surf, icon_color, icon_r, border_radius=2)
-            self._text(self.font_sm, label, S.COL_UI_DIM, topleft=(bx + 16, top - 4), shadow=False)
-            by = top + 17
-            pygame.draw.rect(self.hud_surf, (32, 29, 27), (bx, by, bar_w, bar_h), border_radius=3)
-            pygame.draw.rect(self.hud_surf, color, (bx, by, int(bar_w * max(0.0, min(1.0, frac))), bar_h), border_radius=3)
-            pygame.draw.rect(self.hud_surf, (95, 88, 82), (bx, by, bar_w, bar_h), width=1, border_radius=3)
+        cell = pygame.Rect(18, y, 134, 36)
+        self._sketch_rect(surf, cell, ink, rng, jitter)
+        self._sketch_rect(surf, (cell.right, y + 11, 9, 15), ink, rng, jitter, 1)
+        self._sketch_fill(surf, cell, ink, rng, jitter, p.battery / 100.0)
+        y += 38
 
-        fl_col = (60, 200, 90) if p.battery > S.FLASHLIGHT_LOW else (210, 70, 40)
-        bar(0, p.battery / 100.0, fl_col, fl_col, fl_label)
-        st_col = (150, 60, 60) if p.stamina_locked else ((110, 170, 205) if p.is_crouching else (205, 175, 60))
-        bar(1, p.stamina / 100.0, st_col, st_col, st_label)
-        bar(2, p.sanity / 100.0, (150, 130, 205), (150, 130, 205), sanity_label)
-        self._draw_compass()
+        if self.panel_prop is not None:
+            y = self._sheet_caption(surf, self._spec_t("panel_label").capitalize() + ":",
+                                    y, w - 36, ink) + 4
+            total = max(1, int(self.spec.get("n_collectible", 1)))
+            done = int(self.panel_prop.installed)
+            for i in range(min(8, total)):
+                bx = 18 + i * 34
+                self._sketch_rect(surf, (bx, y, 26, 26), ink, rng, jitter, 2)
+                if i < done:
+                    self._sketch_line(surf, (bx + 4, y + 13), (bx + 11, y + 22), ink, rng, jitter, 2, 1)
+                    self._sketch_line(surf, (bx + 11, y + 22), (bx + 23, y + 3), ink, rng, jitter, 2, 1)
+            y += 32
+            for i in range(min(10, p.carried)):
+                tx = 20 + i * 11
+                self._sketch_line(surf, (tx, y), (tx + 4, y + 22), ink, rng, jitter, 2, 1)
+            y += 38
 
-        if self.settings.get("mic_enabled") and self.mic.available:
-            self._draw_mic_vu(panel_x + panel_w + 16, panel_y, panel_h)
+        exit_req = self.spec.get("exit_requires_item")
+        if exit_req:
+            label = self._spec_t("exit_requires_item_label") or exit_req.capitalize()
+            y = self._sheet_caption(surf, label.capitalize() + ":", y, w - 36, ink) + 6
+            dr = pygame.Rect(18, y, 34, 52)
+            self._sketch_rect(surf, dr, ink, rng, jitter, 2)
+            self._sketch_circle_dot(surf, dr.right - 8, dr.centery, ink, rng, jitter)
+            have = self._player_has_exit_item(exit_req)
+            ax = dr.right + 20
+            if have:
+                self._sketch_line(surf, (ax, y + 28), (ax + 10, y + 40), ink, rng, jitter, 3, 1)
+                self._sketch_line(surf, (ax + 10, y + 40), (ax + 30, y + 10), ink, rng, jitter, 3, 1)
+            else:
+                self._sketch_line(surf, (ax, y + 12), (ax + 28, y + 40), ink, rng, jitter, 3, 1)
+                self._sketch_line(surf, (ax + 28, y + 12), (ax, y + 40), ink, rng, jitter, 3, 1)
+            y += 66
+        y = max(y, 288)
+        self._sketch_line(surf, (14, y - 12), (w - 14, y - 12), faint, rng, jitter, 1, passes=1)
 
+        gx, gy = 22, y
+        def slot():
+            nonlocal gx, gy
+            r = (gx, gy)
+            gx += 74
+            if gx > w - 56:
+                gx, gy = 22, gy + 58
+            return r
+        if p.has_lighter:
+            ox, oy = slot()
+            self._sketch_rect(surf, (ox, oy + 14, 22, 30), ink, rng, jitter, 2)
+            self._sketch_line(surf, (ox + 11, oy + 14), (ox + 16, oy), ink, rng, jitter, 2, 1)
+            self._sketch_line(surf, (ox + 16, oy), (ox + 6, oy + 5), ink, rng, jitter, 2, 1)
+        if p.has_cutters:
+            ox, oy = slot()
+            col = (150, 60, 55) if p.cutters_broken else ink
+            self._sketch_line(surf, (ox, oy), (ox + 36, oy + 40), col, rng, jitter, 3, 1)
+            self._sketch_line(surf, (ox + 36, oy), (ox, oy + 40), col, rng, jitter, 3, 1)
+            if p.cutters_broken:
+                self._sketch_line(surf, (ox + 2, oy + 20), (ox + 34, oy + 20), col, rng, jitter + 2, 2, 1)
+        if p.has_map:
+            ox, oy = slot()
+            self._sketch_rect(surf, (ox, oy, 30, 40), ink, rng, jitter, 2)
+            self._sketch_line(surf, (ox + 6, oy + 26), (ox + 24, oy + 12), ink, rng, jitter, 1, 1)
+            n = int(p.pencil_ink / S.PENCIL_SHEETS + 0.5)
+            for i in range(min(5, n)):
+                px = ox + 40 + i * 8
+                self._sketch_line(surf, (px, oy + 4), (px, oy + 34), ink, rng, jitter, 2, 1)
+
+        for mx, my, mr, mseed in marks:
+            self._sketch_scribble(surf, 24 + mx * (w - 48), 70 + my * (h - 94),
+                                  mr, ink, random.Random(mseed), jitter)
+
+        self._paper_wear(surf, hash(key) & 0xFFFF)
+        self._clip_key = key
+        self._clip_surf = surf
+        self._clip_shade = None
+        return surf
+
+    def _paper_wear(self, surf, seed, floor=0.55, grain=7.0, power=0.55):
+        px = pygame.surfarray.pixels3d(surf)
+        w, h = surf.get_size()
+        noise = np.random.default_rng(seed & 0xFFFFFFFF).normal(0.0, grain, (w, h))
+        edge_x = np.minimum(np.arange(w), w - 1 - np.arange(w))[:, None] / (w * 0.5)
+        edge_y = np.minimum(np.arange(h), h - 1 - np.arange(h))[None, :] / (h * 0.5)
+        dirt = np.clip(np.minimum(edge_x, edge_y), 0.0, 1.0) ** power
+        shade = (floor + (1.0 - floor) * dirt) + noise / 255.0
+        px[:] = np.clip(px.astype(np.float32) * shade[:, :, None], 0, 255).astype(np.uint8)
+        del px
+
+    def _text_on(self, surf, font, text, col, topleft):
+        surf.blit(font.render(str(text), True, col), topleft)
+
+    _STATUS_STATES = ("playing", "elevator_ride", "hatch_climb")
+
+    def _status_held(self):
+        return (self._binding_down("status") and self.state in self._STATUS_STATES
+                and not self.player.map_open)
+
+    def _draw_mic_corner(self):
+        if not (self.settings.get("mic_enabled") and self.mic.available):
+            return
+        w, h = 140, 5
+        x = S.SCREEN_W - w - 14
+        y = S.SCREEN_H - 52
+        level = max(0.0, min(1.0, self.mic_vu_level))
+        loud = level > S.MIC_NOISE_GATE
+        self._text(self.font_sm, i18n.t("hud.mic"), S.COL_UI_DIM,
+                   topleft=(x, y - 22), shadow=False)
+        pygame.draw.rect(self.hud_surf, (26, 24, 22), (x, y, w, h))
+        if level > 0.0:
+            col = (190, 70, 60) if loud else (120, 112, 100)
+            pygame.draw.rect(self.hud_surf, col, (x, y, max(1, int(w * level)), h))
+        gate_x = x + int(w * S.MIC_NOISE_GATE)
+        pygame.draw.line(self.hud_surf, (150, 55, 50), (gate_x, y - 3), (gate_x, y + h + 2), 1)
+        if not self.mic.active and not self.mic.busy:
+            self._text(self.font_sm, i18n.t("settings.mic_test_error"), (170, 95, 88),
+                       topleft=(x, y + h + 6), shadow=False)
+
+    def _draw_stamina_strip(self, y=None):
+        if not self._stamina_showing():
+            return
+        p = self.player
+        frac = max(0.0, min(1.0, p.stamina / 100.0))
+        col = (150, 60, 60) if p.stamina_locked else (198, 172, 92)
+        w, h = 120, 4
+        x = (S.SCREEN_W - w) // 2
+        y = S.SCREEN_H - 44 if y is None else y
+        pygame.draw.rect(self.hud_surf, (26, 24, 22), (x, y, w, h))
+        pygame.draw.rect(self.hud_surf, col, (x, y, int(w * frac), h))
+
+    def _draw_compass_strip(self, alpha=150):
+        if not self.settings.get("compass", True):
+            return
+        cx = S.SCREEN_W // 2
+        top, w = 18, 240
+        deg_per_px = 150.0 / w
+        ang_deg = math.degrees(self.player.angle)
+        labels = {0: i18n.t("compass.n"), 90: i18n.t("compass.e"),
+                  180: i18n.t("compass.s"), 270: i18n.t("compass.w")}
+        for mark_deg in range(0, 360, 15):
+            rel = ((mark_deg - ang_deg + 180) % 360) - 180
+            if abs(rel) > 72:
+                continue
+            x = cx + rel / deg_per_px
+            fade = 1.0 - min(1.0, abs(rel) / 72.0)
+            major = mark_deg % 90 == 0
+            v = int((210 if major else 130) * fade)
+            col = (max(0, v), max(0, v - 10), max(0, v - 18))
+            if major:
+                self._text(self.font_sm, labels[mark_deg], col, center=(x, top), shadow=False)
+            else:
+                pygame.draw.line(self.hud_surf, col, (x, top + 6), (x, top + 11), 1)
+
+    def _draw_hud_minimal(self):
+        p = self.player
+        pad = 26
+        y = S.SCREEN_H - pad - 18
+        if p.battery / 100.0 < S.HUD_BATTERY_WARN:
+            frac = max(0.0, min(1.0, p.battery / 100.0))
+            col = (210, 70, 40) if frac < 0.15 else (205, 175, 60)
+            self._text(self.font_sm, i18n.t("item.battery", n=int(p.battery)), col,
+                       topleft=(pad, y), shadow=False)
+            y -= 24
+        state, word, col = self._condition_state()
+        if state != "ok":
+            self._text(self.font_sm, word, col, topleft=(pad, y), shadow=False)
+        self._draw_stamina_strip()
+        self._draw_compass_strip()
+        self._draw_mic_corner()
+        if self._status_held():
+            ly = S.SCREEN_H - 120
+            for line in self._task_lines():
+                self._text(self.font_sm, line, S.COL_TEXT, center=(S.SCREEN_W // 2, ly), shadow=True)
+                ly += 24
+            for line in self._pocket_lines()[:3]:
+                self._text(self.font_sm, line, S.COL_UI_DIM, center=(S.SCREEN_W // 2, ly), shadow=True)
+                ly += 22
+
+    def _paper_shaded(self, sheet, color):
+        tints = self.__dict__.setdefault("_paper_tints", {})
+        size = sheet.get_size()
+        tint = tints.get(size)
+        if tint is None:
+            tint = tints[size] = pygame.Surface(size, pygame.SRCALPHA)
+        tint.fill(color)
+        shaded = sheet.copy()
+        shaded.blit(tint, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        return shaded
+
+    def _draw_clipboard(self, rest_frac):
+        t = self._clip_raise
+        ease = t * t * (3.0 - 2.0 * t)
+        shown = rest_frac + (1.0 - rest_frac) * ease
+        if shown <= 0.01:
+            return False
+        sheet = self._clipboard_sheet()
+        lit = 0.30 + 0.70 * max(0.0, min(1.0, self.player.room_light * 1.6))
+        if abs(lit - getattr(self, "_clip_lit", -1.0)) > 0.04 or self._clip_shade is None:
+            self._clip_lit = lit
+            self._clip_shade = self._paper_shaded(
+                sheet, (int(255 * lit), int(252 * lit), int(246 * lit), 255))
+        sheet = self._clip_shade
+        tilt = -6.0 + 4.0 * ease
+        if getattr(self, "_clip_turned_src", None) is not sheet or self._clip_turned_tilt != tilt:
+            self._clip_turned_src = sheet
+            self._clip_turned_tilt = tilt
+            self._clip_turned = pygame.transform.rotate(sheet, tilt)
+        turned = self._clip_turned
+        y = int(S.SCREEN_H - 18 - turned.get_height() * shown)
+        self.hud_surf.blit(turned, (26, y))
+        return True
+
+    def _draw_hud_clipboard(self):
+        self._draw_stamina_strip()
+        self._draw_compass_strip()
+        self._draw_mic_corner()
+        self._draw_clipboard(S.HUD_CLIPBOARD_REST)
+
+    def _form_watch(self):
+        p = self.player
+        state, _, _ = self._condition_state()
+        return {
+            "carried": p.carried,
+            "installed": self.panel_prop.installed if self.panel_prop is not None else 0,
+            "powered": bool(self.panel_prop.powered) if self.panel_prop is not None else False,
+            "lighter": p.has_lighter, "cutters": p.has_cutters, "broken": p.cutters_broken,
+            "map": p.has_map, "sheets": len(self.map_sheets),
+            "low": p.battery / 100.0 < S.HUD_BATTERY_WARN,
+            "cond": state,
+        }
+
+    def _form_note(self, snap):
+        was = self._form_seen
+        self._form_seen = snap
+        if was is None:
+            return None
+        if snap["installed"] != was["installed"] or snap["powered"] != was["powered"]:
+            return self._task_lines()[0] if self._task_lines() else None
+        if snap["cond"] != was["cond"]:
+            return i18n.t("hud.condition") + ": " + self._condition_state()[1]
+        if snap["low"] and not was["low"]:
+            return i18n.t("item.battery", n=int(self.player.battery))
+        if snap["broken"] and not was["broken"]:
+            return i18n.t("item.cutters_broken")
+        for k, key in (("carried", None), ("lighter", "item.lighter"), ("cutters", "item.cutters"),
+                       ("map", "item.map")):
+            if snap[k] != was[k] and key:
+                return i18n.t(key)
+        if snap["carried"] != was["carried"]:
+            return i18n.t("hud.carried", label=self._spec_t("collectible_label").capitalize(),
+                          n=snap["carried"])
+        if snap["sheets"] != was["sheets"]:
+            return i18n.t("item.sheets", n=snap["sheets"])
+        return None
+
+    _FORM_PAPER = (184, 182, 186)
+    _FORM_INK = (78, 70, 122)
+    _FORM_DIM = (124, 118, 156)
+    _FORM_RULE = (164, 160, 184)
+    _FORM_W = 400
+    _FORM_FOLD = 176
+    _FORM_CONTENT = 336
+    _FORM_H = 400
+    _FORM_LABEL_X = 26
+    _FORM_VALUE_X = 172
+    _FORM_TEAR_SEED = 0x9E17
+
+    def _typed(self, surf, text, pos, col, font, smear=1, keep=None):
+        if smear:
+            ghost = font.render(text, True, col)
+            ghost.set_alpha(74)
+            surf.blit(ghost, (pos[0] + smear, pos[1] + smear))
+        surf.blit(font.render(text, True, col), pos)
+        if keep is not None and text:
+            keep.append((text, font, pos))
+
+    def _form_field(self, surf, y, label, value, smear, val_col=None, keep=None):
+        x0, x1 = self._FORM_LABEL_X, self._FORM_VALUE_X
+        self._typed(surf, label, (x0, y + 4), self._FORM_DIM, self.font_type_s, smear, keep)
+        value = self._ellipsize(value, self.font_type, self._FORM_W - x1 - 30)
+        self._typed(surf, value, (x1, y), val_col or self._FORM_INK, self.font_type, smear, keep)
+        pygame.draw.line(surf, self._FORM_RULE, (x0, y + 24), (self._FORM_W - 30, y + 24))
+
+    def _form_row(self, surf, y, label, value, smear, keep=None, charge=None):
+        x0, x1 = self._FORM_LABEL_X + 8, self._FORM_VALUE_X
+        label = self._ellipsize(label, self.font_type_s, x1 - x0 - 22)
+        self._typed(surf, label, (x0, y), self._FORM_INK, self.font_type_s, smear, keep)
+        lw = self.font_type_s.size(label)[0]
+        for dx in range(x0 + lw + 9, x1 - 9, 7):
+            pygame.draw.line(surf, self._FORM_DIM, (dx, y + 11), (dx + 1, y + 11))
+        if charge is not None:
+            self._form_battery(surf, x1, y - 1, charge)
+        else:
+            value = self._ellipsize(value, self.font_type_s, self._FORM_W - x1 - 30)
+            self._typed(surf, value, (x1, y), self._FORM_INK, self.font_type_s, smear, keep)
+
+    def _form_battery(self, surf, x, y, frac, w=92, h=20):
+        col = self._FORM_INK
+        pygame.draw.rect(surf, col, (x, y, w, h), width=2)
+        pygame.draw.rect(surf, col, (x + w, y + 6, 5, h - 12), width=2)
+        for i in range(int((w - 8) / 5 * max(0.0, min(1.0, frac)))):
+            gx = x + 4 + i * 5
+            pygame.draw.line(surf, col, (gx, y + 4), (gx - 3, y + h - 4))
+
+    def _form_sheet(self):
+        p = self.player
+        state, cond_word, _ = self._condition_state()
+        damage, damage_step = self._sheet_damage()
+        total = int(self.spec.get("n_collectible", 0))
+        installed = self.panel_prop.installed if self.panel_prop is not None else -1
+        exit_req = self.spec.get("exit_requires_item")
+        key = (int(p.battery / 4), p.carried, installed,
+               bool(self.panel_prop.powered) if self.panel_prop is not None else False,
+               p.has_lighter, p.has_cutters, p.cutters_broken, p.has_map,
+               len(self.map_sheets), int(p.pencil_ink / (S.PENCIL_SHEETS * 0.5)),
+               bool(exit_req) and self._player_has_exit_item(exit_req),
+               state, damage_step, self.floor_i, i18n.get_language())
+        if self._form_key == key and self._form_surf is not None:
+            return self._form_surf
+        smear = 1 + int(damage * 2.99)
+        rng = random.Random(hash(key) & 0xFFFF)
+        struck = []
+        w, h = self._FORM_W, self._FORM_H
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        surf.fill(self._FORM_PAPER)
+        tear = random.Random(self._FORM_TEAR_SEED)
+        ragged = [(w, 0)] + [(w - tear.randint(0, 9), y) for y in range(0, h + 10, 10)] + [(w, h)]
+        pygame.draw.polygon(surf, (0, 0, 0, 0), ragged)
+
+        self._typed(surf, i18n.t("form.title"), (26, 12), self._FORM_INK, self.font_type, smear, struck)
+        pygame.draw.line(surf, (150, 146, 172), (26, 38), (w - 30, 38))
+        copy_txt = i18n.t("form.copy")
+        self._typed(surf, copy_txt, (w - 30 - self.font_type_s.size(copy_txt)[0], 44),
+                    self._FORM_DIM, self.font_type_s, smear, struck)
+
+        title = self._spec_t("title")
+        for dash in ("\u2014", "\u2013", " - "):
+            if dash in title:
+                title = title.split(dash)[-1]
+                break
+        y = 72
+        self._form_field(surf, y, i18n.t("form.ward"), title.strip().upper(), smear, keep=struck)
+        y += 34
+        self._form_field(surf, y, i18n.t("form.state"), cond_word.upper(), smear,
+                         val_col=(122, 62, 112) if state == "worst" else None, keep=struck)
+        y += 34
+        if self.panel_prop is not None:
+            label = self._spec_t("panel_label").upper()
+            done = i18n.t("form.done") if self.panel_prop.powered else "%d / %d" % (installed, total)
+            self._form_field(surf, y, i18n.t("form.assigned"),
+                             "%s  %s" % (self._ellipsize(label, self.font_type, 128), done),
+                             smear, keep=struck)
+
+        fold = self._FORM_FOLD
+        pygame.draw.line(surf, (222, 220, 222), (0, fold - 1), (w, fold - 1))
+        pygame.draw.line(surf, (156, 152, 156), (0, fold), (w, fold))
+
+        y = fold + 14
+        self._typed(surf, i18n.t("form.issued"), (self._FORM_LABEL_X, y),
+                    self._FORM_DIM, self.font_type_s, smear, struck)
+        y += 26
+        rows = [(i18n.t("hud.flashlight"), None, p.battery / 100.0)]
+        if p.has_lighter:
+            rows.append((i18n.t("item.lighter"), i18n.t("hud.have"), None))
+        if p.has_cutters:
+            rows.append((i18n.t("item.cutters"),
+                         i18n.t("form.broken") if p.cutters_broken else i18n.t("hud.have"), None))
+        if p.has_map:
+            rows.append((i18n.t("item.map"), "%s %d   %s %d" % (
+                i18n.t("form.sheets"), len(self.map_sheets),
+                i18n.t("form.pencils"), int(p.pencil_ink / S.PENCIL_SHEETS)), None))
+        if exit_req:
+            req = (self._spec_t("exit_requires_item_label") or exit_req)
+            if req.upper() not in [r[0].upper() for r in rows]:
+                rows.append((req, i18n.t("hud.have" if self._player_has_exit_item(exit_req)
+                                          else "hud.dont_have"), None))
+        for label, value, charge in rows:
+            self._form_row(surf, y, label.upper(), (value or "").upper(), smear,
+                           keep=struck, charge=charge)
+            y += 23
+
+        for _ in range({"ok": 0, "bad": 1, "worst": 4}[state]):
+            if not struck:
+                break
+            text, font, (ox, oy) = struck[rng.randrange(len(struck))]
+            ghost = font.render(text, True, (104, 94, 146))
+            at = (max(14, min(w - ghost.get_width() - 14, ox + rng.randint(-30, 90))),
+                  max(12, min(h - ghost.get_height() - 16, oy + rng.randint(-46, 46))))
+            ghost.set_alpha(150)
+            surf.blit(ghost, at)
+            surf.blit(ghost, (at[0] + smear + 1, at[1] + smear + 1))
+
+        self._paper_wear(surf, hash(key) & 0xFFFF, floor=0.80, grain=6.0, power=0.5)
+
+        self._form_key = key
+        self._form_surf = surf
+        self._form_shade = None
+        return surf
+
+    def _draw_hud_chart(self):
+        self._draw_stamina_strip()
+        self._draw_compass_strip()
+        self._draw_mic_corner()
+        sheet = self._form_sheet()
+        lit = 0.34 + 0.54 * max(0.0, min(1.0, self.player.room_light * 1.6))
+        if abs(lit - self._form_lit) > 0.04 or self._form_shade is None:
+            self._form_lit = lit
+            self._form_shade = self._paper_shaded(
+                sheet, (int(255 * lit), int(252 * lit), int(255 * lit), 255))
+        sheet = self._form_shade
+        t = self._clip_raise
+        ease = t * t * (3.0 - 2.0 * t)
+        show = self._FORM_FOLD + (self._FORM_CONTENT - self._FORM_FOLD) * ease
+        if getattr(self, "_form_turned_src", None) is not sheet:
+            self._form_turned_src = sheet
+            self._form_turned = pygame.transform.rotate(sheet, 1.2)
+        self.hud_surf.blit(self._form_turned, (22, int(S.SCREEN_H - show)))
+
+    def _draw_hud_common(self):
+        p = self.player
         san_frac = p.sanity / S.SANITY_MAX
         if san_frac < 0.35:
             pulse = 0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.006)
             intensity = min(1.0, (1 - san_frac) * pulse)
             self.sanity_vignette.set_alpha(int(255 * intensity))
             self.hud_surf.blit(self.sanity_vignette, (0, 0))
-
-        exit_req = self.spec.get("exit_requires_item")
-        info_w = 350
-        info_h = 58 + (22 if exit_req else 0)
-        info_x, info_y = S.SCREEN_W - pad - info_w, pad - 10
-        self._draw_panel(pygame.Rect(info_x, info_y, info_w, info_h),
-                          fill=(10, 9, 8, 150), corner=12)
-        text_max_w = info_w - 28
-        carried_txt = i18n.t("hud.carried", label=self._spec_t("collectible_label").capitalize(), n=p.carried)
-        carried_txt = self._ellipsize(carried_txt, self.font_sm, text_max_w)
-        self._text(self.font_sm, carried_txt, S.COL_TEXT, topleft=(info_x + 14, info_y + 10), shadow=False)
-        if self.panel_prop is not None:
-            powered_word = self._spec_t("panel_powered_text", "hud.powered")
-            status = powered_word if self.panel_prop.powered else i18n.t(
-                "hud.installed_count", n=self.panel_prop.installed, total=self.spec["n_collectible"])
-            panel_txt = i18n.t("hud.panel_status", label=self._spec_t("panel_label").capitalize(), status=status)
-            panel_txt = self._ellipsize(panel_txt, self.font_sm, text_max_w)
-            self._text(self.font_sm, panel_txt,
-                       S.COL_UI_DIM, topleft=(info_x + 14, info_y + 32), shadow=False)
-        if exit_req:
-            have = getattr(p, f"has_{exit_req}", False)
-            label = self._spec_t("exit_requires_item_label") or exit_req.capitalize()
-            col = (110, 200, 130) if have else S.COL_UI_DIM
-            status = i18n.t("hud.have") if have else i18n.t("hud.dont_have")
-            exit_txt = self._ellipsize(i18n.t("hud.exit_req", label=label, status=status), self.font_sm, text_max_w)
-            self._text(self.font_sm, exit_txt, col,
-                       topleft=(info_x + 14, info_y + 54), shadow=False)
-
         if self.scare_flash_timer > 0:
             fx.draw_flash(self.hud_surf, (5, 0, 0), 235 * min(1.0, self.scare_flash_timer / 0.14))
 
@@ -3026,15 +5948,32 @@ class App:
             frac = min(1.0, self.install_hold_t / S.INSTALL_HOLD_SECONDS)
             self._draw_action_bar(cx, cy + 34, frac, i18n.t("hud.installing"), (205, 175, 60))
 
-        prompt = None if self.hide_transition is not None or self.peek_t > 0.0 else self.prompt_text(self.find_interactable())
+        if self.hatch_turning:
+            frac = min(1.0, self.hatch_turn_progress)
+            self._draw_action_bar(cx, cy + 34, frac, i18n.t("hud.hatch_turning"), (150, 190, 200))
+
+        if self.fence_cutting:
+            frac = min(1.0, self.fence_cut_progress)
+            self._draw_action_bar(cx, cy + 34, frac, i18n.t("hud.fence_cutting"), (205, 130, 70))
+
+        if self.cutters_repair_target is not None and self.cutters_repair_t > 0:
+            frac = min(1.0, self.cutters_repair_t / S.CUTTERS_REPAIR_SECONDS)
+            self._draw_action_bar(cx, cy + 34, frac, i18n.t("hud.repairing_cutters"), (205, 175, 60))
+
+        if self.hide_transition is not None or self.peek_t > 0.0:
+            prompt, alt_prompt = None, None
+        else:
+            res = self.find_interactable()
+            prompt, alt_prompt = self.prompt_text(res), self.alt_prompt_text(res)
         if prompt:
             self._text(self.font_md, prompt, (225, 220, 205), center=(cx, S.SCREEN_H - 150))
-
-        if self.note_timer > 0 and self.note_text and self.peek_t <= 0.0:
-            self._draw_note_box(cx)
+        if alt_prompt:
+            self._text(self.font_md, alt_prompt, (190, 185, 170), center=(cx, S.SCREEN_H - 120))
 
         if self.hint_timer > 0 and self.hint_text and self.peek_t <= 0.0:
-            lines = self.hint_text.split("\n")
+            lines = []
+            for para in str(self.hint_text).split("\n"):
+                lines.extend(self._wrap_text(para, self.font_md, S.SCREEN_W - 260) or [""])
             yy = S.SCREEN_H - 190 - (len(lines) - 1) * 13
             for line in lines:
                 self._text(self.font_md, line, (210, 170, 90), center=(cx, yy))
@@ -3042,41 +5981,162 @@ class App:
 
         if self.floor_banner_timer > 0:
             alpha = 255 if self.floor_banner_timer > 1.0 else int(255 * self.floor_banner_timer)
-            surf = self.font_lg.render(self.floor_banner, True, S.COL_TEXT)
+            surf = self.font_lg.render(str(self.floor_banner), True, S.COL_TEXT)
             surf.set_alpha(alpha)
             r = surf.get_rect(center=(cx, 70))
             self.hud_surf.blit(surf, r)
 
-    def _draw_note_box(self, cx):
-        title = i18n.t("note.title")
-        pad_x, pad_top, pad_bottom = 20, 34, 16
-        line_h = self.font_note.get_linesize()
-        max_box_w = min(820, S.SCREEN_W - 220)
-        lines = self._wrap_text(self.note_text, self.font_note, max_box_w - pad_x * 2)
+    NOTE_TEX = (768, 992)
 
-        content_w = max([self.font_note.size(line)[0] for line in lines] +
-                         [self.font_md.size(title)[0]])
-        box_w = min(max_box_w, max(380, content_w + pad_x * 2))
-        box_h = pad_top + line_h * len(lines) + pad_bottom
-        box_x = cx - box_w // 2
-        box_bottom = S.SCREEN_H - 175
-        box_y = box_bottom - box_h
+    def _open_note(self, text, back_text=None, back_kind=None):
+        self.note_text = text
+        self.note_back_text = back_text
+        self.note_back_kind = back_kind
+        self.note_spin = [0.0, 0.0]
+        self.renderer.note_spin = (0.0, 0.0)
+        self._note_settling = False
+        self._note_dirty = True
+        self.note_return_state = self.state
+        self._note_fade = 0.0
+        self._note_closing = False
+        self.state = "note"
 
-        t_elapsed = S.NOTE_DISPLAY_SECONDS - self.note_timer
-        alpha = max(0.0, min(1.0, t_elapsed / 0.3, self.note_timer / 0.6))
-        if alpha <= 0.0:
+    def _close_note(self):
+        if self.state != "note" or self._note_closing:
+            return False
+        self._note_closing = True
+        return True
+
+    def _finish_close_note(self):
+        self.state = self.note_return_state or "playing"
+        self._lean_prev_left = self._binding_down("lean_left")
+        self._lean_prev_right = self._binding_down("lean_right")
+        self._lean_active_dir = 0
+        self.note_text = None
+        self.note_back_text = None
+        self.note_back_kind = None
+        self._note_closing = False
+
+    NOTE_BACK_KINDS = ("blank", "form", "scrap")
+
+    @staticmethod
+    def _note_written_text(text):
+        out = str(text).strip()
+        if len(out) > 1 and out[0] == "\u00ab" and out[-1] == "\u00bb":
+            out = out[1:-1].strip()
+        return out
+
+    def _note_write_hand(self, surf, written, rng, pad_x, pad_top, ink=(54, 48, 44)):
+        if not written:
             return
+        w = surf.get_width()
+        font = self.font_note_big
+        line_h = font.get_linesize()
+        lines = self._wrap_text(self._note_written_text(written), font, w - pad_x * 2 - 30)
+        drift = rng.uniform(-0.016, 0.016)
+        y = pad_top + rng.uniform(-10, 10)
+        for i, line in enumerate(lines):
+            shade = rng.randint(-14, 10)
+            glyphs = font.render(line, True, (ink[0] + shade, ink[1] + shade, ink[2] + shade))
+            glyphs = pygame.transform.rotate(glyphs, rng.uniform(-1.1, 1.1))
+            x = pad_x + rng.uniform(-6, 14) + i * drift * line_h
+            surf.blit(glyphs, (int(x), int(y + rng.uniform(-5, 5))))
+            y += line_h * rng.uniform(0.94, 1.07)
 
-        note_surf = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
-        self._draw_panel(pygame.Rect(0, 0, box_w, box_h), fill=(10, 9, 8, 215), corner=14, target=note_surf)
-        pygame.draw.line(note_surf, (150, 55, 50), (pad_x, 30), (box_w - pad_x, 30), 1)
-        note_surf.blit(self.font_md.render(title, True, (225, 205, 150)), (pad_x, 9))
-        yy = pad_top
+    def _note_back_face(self, kind, written, seed):
+        w, h = self.NOTE_TEX
+        rng = random.Random(seed)
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+
+        if kind == "form":
+            surf.fill((214, 208, 190))
+            ink = (96, 92, 108)
+            title = self.font_form.render(i18n.t("note.back.form_title"), True, ink)
+            surf.blit(title, (84, 92))
+            pygame.draw.line(surf, ink, (84, 150), (w - 84, 150), 3)
+            y = 210
+            for field in ("dept", "patient", "date", "sign"):
+                label = self.font_form_s.render(i18n.t("note.back.form_" + field), True, ink)
+                surf.blit(label, (84, y))
+                lx = 84 + label.get_width() + 24
+                pygame.draw.line(surf, (168, 162, 180), (lx, y + label.get_height() - 4),
+                                 (w - 84, y + label.get_height() - 4), 2)
+                y += 108
+            stamp = self.font_form_s.render(i18n.t("note.back.form_foot"), True, (150, 146, 162))
+            surf.blit(stamp, (w - 84 - stamp.get_width(), h - 150))
+            self._paper_wear(surf, seed, floor=0.72, grain=5.0)
+        elif kind == "scrap":
+            surf.fill((188, 176, 148))
+            for _ in range(rng.randint(4, 7)):
+                r = rng.randint(50, 190)
+                blot = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+                pygame.draw.circle(blot, (120, 104, 74, rng.randint(26, 52)), (r, r), r)
+                surf.blit(blot, (rng.randint(-r, w - r), rng.randint(-r, h - r)))
+            for _ in range(rng.randint(2, 4)):
+                x0, y0 = rng.randint(60, w - 60), rng.randint(80, h - 80)
+                pygame.draw.lines(surf, (128, 116, 92), False,
+                                  [(x0 + rng.randint(-90, 90), y0 + rng.randint(-40, 40))
+                                   for _ in range(4)], rng.randint(2, 4))
+            self._paper_wear(surf, seed, floor=0.50, grain=11.0, power=0.38)
+        else:
+            surf.fill((216, 207, 182))
+            self._paper_wear(surf, seed, floor=0.66, grain=6.0)
+
+        if written:
+            top = 640 if kind == "form" else 104
+            self._note_write_hand(surf, written, random.Random(seed ^ 0x77), 78, top)
+        return surf
+
+    def _note_faces(self, text, back_text=None, back_kind=None):
+        key = (str(text), str(back_text or ""), back_kind, i18n.get_language())
+        if self._note_key == key and self._note_surf is not None:
+            return self._note_surf
+        w, h = self.NOTE_TEX
+        seed = hash(key) & 0xFFFF
+        if back_kind not in self.NOTE_BACK_KINDS:
+            back_kind = self.NOTE_BACK_KINDS[seed % len(self.NOTE_BACK_KINDS)]
+
+        front = pygame.Surface((w, h), pygame.SRCALPHA)
+        front.fill((216, 207, 182))
+        self._note_write_hand(front, text, random.Random(seed), 78, 104)
+        self._paper_wear(front, seed, floor=0.66, grain=6.0)
+
+        self._note_key = key
+        self._note_surf = (front, self._note_back_face(back_kind, back_text, seed ^ 0x51))
+        return self._note_surf
+
+    def _upload_note_sheet(self):
+        if not self._note_dirty or self.note_text is None:
+            return
+        front, back = self._note_faces(self.note_text, self.note_back_text, self.note_back_kind)
+        self.renderer.set_note_sheet(
+            pygame.image.tostring(front, "RGBA", True),
+            pygame.image.tostring(pygame.transform.flip(back, True, False), "RGBA", True),
+            self.NOTE_TEX)
+        self._note_dirty = False
+
+    def _draw_note_scene(self):
+        self._upload_note_sheet()
+        self._sync_window_size()
+        fade = self._note_fade
+        eased = fade * fade * (3.0 - 2.0 * fade)
+        self.renderer.draw_note_examine(tuple(self.note_spin), self.window_size, fade=eased)
+        lines = [i18n.t("hint.note_turn", turn=self._binding_label("map_pencil")),
+                 i18n.t("hint.note_reset"),
+                 i18n.t("hint.note_close", close=self._binding_label("interact"))]
+        col = tuple(int(c * eased) for c in (186, 178, 162))
+        y = S.SCREEN_H - 34 - (len(lines) - 1) * 26
         for line in lines:
-            note_surf.blit(self.font_note.render(line, True, (215, 205, 185)), (pad_x, yy))
-            yy += line_h
-        note_surf.set_alpha(int(255 * alpha))
-        self.hud_surf.blit(note_surf, (box_x, box_y))
+            self._text(self.font_sm, line, col, topleft=(34, y), shadow=False)
+            y += 26
+        self.renderer.composite(None, (S.SCREEN_W, S.SCREEN_H), self.window_size,
+                                 hud_surface=self.hud_surf, keep_color=True)
+        pygame.display.flip()
+
+    def _turn_note(self, mouse_dx, mouse_dy):
+        self.note_spin[0] += mouse_dx * S.NOTE_TURN_SPEED
+        self.note_spin[1] += mouse_dy * S.NOTE_TURN_SPEED
+        self.renderer.note_spin = (self.note_spin[0], self.note_spin[1])
 
     def _draw_action_bar(self, cx, y, frac, label, color):
         w, h = 220, 12
@@ -3087,6 +6147,13 @@ class App:
         pygame.draw.rect(self.hud_surf, color, fill, border_radius=4)
         pygame.draw.rect(self.hud_surf, (95, 88, 82), rect, width=1, border_radius=4)
 
+    def _elevator_active_light_index(self):
+        if self.exit_prop is None or not self.exit_prop.powered:
+            return -1
+        n = S.ELEVATOR_ARRIVE_LIGHT_COUNT
+        frac = min(1.0, self.elevator_call_t / S.ELEVATOR_ARRIVE_SECONDS)
+        return max(0, min(n - 1, int(frac * n)))
+
     def _restart_from_end(self):
         if self._in_debug_preview():
             self._start_debug_level()
@@ -3094,8 +6161,11 @@ class App:
             self.new_game()
             self._start_playing()
 
-    def _end_buttons(self, y0):
+    END_BUTTON_Y = S.SCREEN_H // 2 + 182
+
+    def _end_buttons(self, y0=None):
         cx = S.SCREEN_W // 2
+        y0 = self.END_BUTTON_Y if y0 is None else y0
         w, h, gap = 230, 52, 18
         return [
             self._button((cx - w - gap // 2, y0, w, h), i18n.t("end.restart"), self._restart_from_end),
@@ -3106,33 +6176,75 @@ class App:
         return i18n.t("end.stats_extra", notes=self.stats["notes"], batteries=self.stats["batteries"],
                       scares=self.stats["scares"])
 
-    def _draw_gameover(self, title, color, subtitle):
-        overlay = pygame.Surface((S.SCREEN_W, S.SCREEN_H), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 235))
-        self.hud_surf.blit(overlay, (0, 0))
-        cx = S.SCREEN_W // 2
-        self._text(self.font_title, title, color, center=(cx, S.SCREEN_H // 2 - 70))
-        self._text(self.font_md, subtitle, S.COL_UI_DIM, center=(cx, S.SCREEN_H // 2 - 10))
-        mins, secs = divmod(int(self.elapsed), 60)
-        stats = i18n.t("end.survived", time=f"{mins:02d}:{secs:02d}", floor=self.floor_i + 1, total=len(S.FLOOR_SPECS))
-        self._text(self.font_sm, stats, S.COL_UI_DIM, center=(cx, S.SCREEN_H // 2 + 40))
-        self._text(self.font_sm, self._stats_extra_text(), S.COL_UI_DIM, center=(cx, S.SCREEN_H // 2 + 65))
-        for btn in self._end_buttons(S.SCREEN_H // 2 + 105):
-            self._draw_button(btn)
+    def _end_veil(self, dim):
+        cache = getattr(self, "_end_veil_cache", None)
+        if cache is None:
+            cache = self._end_veil_cache = {}
+        surf = cache.get(dim)
+        if surf is not None:
+            return surf
+        h = S.SCREEN_H
+        yy = np.arange(h, dtype=np.float32) / max(1, h - 1)
+        band = np.clip((yy - 0.34) / 0.22, 0.0, 1.0) * np.clip((1.02 - yy) / 0.18, 0.0, 1.0)
+        alpha = (band * band * (3.0 - 2.0 * band) * dim).astype(np.uint8)
+        surf = pygame.Surface((S.SCREEN_W, h), pygame.SRCALPHA)
+        view = pygame.surfarray.pixels_alpha(surf)
+        view[:, :] = alpha[None, :]
+        del view
+        px = pygame.surfarray.pixels3d(surf)
+        px[:, :, 0] = 4
+        px[:, :, 1] = 6
+        px[:, :, 2] = 6
+        del px
+        cache[dim] = surf
+        return surf
 
-    def _draw_win(self):
-        overlay = pygame.Surface((S.SCREEN_W, S.SCREEN_H), pygame.SRCALPHA)
-        overlay.fill((6, 8, 6, 225))
-        self.hud_surf.blit(overlay, (0, 0))
-        cx = S.SCREEN_W // 2
-        self._text(self.font_title, i18n.t("win.title"), (90, 200, 140), center=(cx, S.SCREEN_H // 2 - 90))
-        self._text(self.font_md, i18n.t("win.subtitle"), S.COL_UI_DIM,
-                   center=(cx, S.SCREEN_H // 2 - 30))
-        mins, secs = divmod(int(self.elapsed), 60)
-        self._text(self.font_sm, i18n.t("win.time", time=f"{mins:02d}:{secs:02d}"), S.COL_UI_DIM, center=(cx, S.SCREEN_H // 2 + 20))
-        self._text(self.font_sm, self._stats_extra_text(), S.COL_UI_DIM, center=(cx, S.SCREEN_H // 2 + 50))
-        for btn in self._end_buttons(S.SCREEN_H // 2 + 85):
+    def _draw_end_screen(self, title, title_color, subtitle, lines, alpha_mult=1.0,
+                         dim=150, text_color=None, dim_color=None):
+        real_surf = self.hud_surf
+        fading = alpha_mult < 1.0
+        if fading:
+            self.hud_surf = pygame.Surface((S.SCREEN_W, S.SCREEN_H), pygame.SRCALPHA)
+        cx, cy = S.SCREEN_W // 2, S.SCREEN_H // 2
+        self.hud_surf.blit(self._end_veil(dim), (0, 0))
+        self._text(self.font_title, title, title_color, center=(cx, cy - 8), shadow=True)
+        self._text(self.font_md, subtitle, text_color or S.COL_TEXT, center=(cx, cy + 48), shadow=True)
+        y = cy + 92
+        for line in lines:
+            self._text(self.font_sm, line, dim_color or S.COL_UI_DIM, center=(cx, y), shadow=True)
+            y += 26
+        for btn in self._end_buttons():
             self._draw_button(btn)
+        if fading:
+            temp = self.hud_surf
+            self.hud_surf = real_surf
+            temp.set_alpha(int(255 * max(0.0, min(1.0, alpha_mult))))
+            self.hud_surf.blit(temp, (0, 0))
+
+    def _end_stat_lines(self, with_floor=True):
+        mins, secs = divmod(int(self.elapsed), 60)
+        if with_floor:
+            first = i18n.t("end.survived", time=f"{mins:02d}:{secs:02d}",
+                           floor=self.floor_i + 1, total=len(S.FLOOR_SPECS))
+        else:
+            first = i18n.t("win.time", time=f"{mins:02d}:{secs:02d}")
+        return [first, self._stats_extra_text(),
+                i18n.t("end.seed", seed=self.floor_seed)]
+
+    def _draw_gameover(self, title, color, subtitle):
+        self._draw_end_screen(title, color, subtitle, self._end_stat_lines())
+
+    def _draw_win(self, alpha_mult=1.0):
+        self._draw_end_screen(i18n.t("win.title"), (90, 200, 140), i18n.t("win.subtitle"),
+                              self._end_stat_lines(with_floor=False), alpha_mult=alpha_mult)
+
+    def _draw_angel_end(self, alpha_mult=1.0):
+        overlay = pygame.Surface((S.SCREEN_W, S.SCREEN_H), pygame.SRCALPHA)
+        overlay.fill((255, 252, 240, 255))
+        self.hud_surf.blit(overlay, (0, 0))
+        self._draw_end_screen(i18n.t("angel.title"), (40, 34, 28), i18n.t("angel.subtitle"),
+                              self._end_stat_lines(with_floor=False), alpha_mult=alpha_mult,
+                              dim=0, text_color=(70, 62, 54), dim_color=(96, 86, 76))
 
     def run(self):
         while self.running:
@@ -3140,7 +6252,7 @@ class App:
             self.handle_events()
             self.update(dt)
             self.draw()
-        self.mic.stop()
+        self.mic.shutdown()
         pygame.quit()
         if self._next_mode == "editor":
             return "editor"

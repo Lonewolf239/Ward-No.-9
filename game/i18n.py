@@ -33,4 +33,20 @@ def t(key, **kwargs):
     s = table.get(key)
     if s is None:
         s = LOCALES["en"].get(key, key)
+    if not isinstance(s, str):
+        s = str(key)
     return s.format(**kwargs) if kwargs else s
+
+
+class Text:
+    __slots__ = ("key", "kwargs", "capitalize")
+
+    def __init__(self, key, capitalize=False, **kwargs):
+        self.key = key
+        self.kwargs = kwargs
+        self.capitalize = capitalize
+
+    def __str__(self):
+        args = {k: str(v) if isinstance(v, Text) else v for k, v in self.kwargs.items()}
+        s = t(self.key, **args)
+        return s.capitalize() if self.capitalize else s
