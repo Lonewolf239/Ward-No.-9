@@ -5,6 +5,8 @@ import pygame
 from game import settings as S
 from game import gl_math as gm
 from game.app import App
+from tools.sandbox_settings import redirect as _sandbox_settings
+_sandbox_settings()
 from game.props import PROP_DEFS, Prop, make_prop, _wall_cells_around, _wall_mount_position, Door
 from game.renderer3d import EYE_HEIGHT
 
@@ -75,11 +77,13 @@ def draw_scale_ruler(renderer, x, y):
 
 
 def main():
-    kinds = sorted(PROP_DEFS.keys()) + ["locker", "door", "door_broken", "tree"]
+    variant_kinds = {f"{k}_v{i}": (k, i) for k in sorted(PROP_DEFS) for i in range(PROP_DEFS[k].get("variants", 1))
+                     if PROP_DEFS[k].get("variants", 1) > 1}
+    kinds = sorted(PROP_DEFS.keys()) + ["locker", "door", "door_broken"] + list(variant_kinds)
     for kind in kinds:
         if kind == "door_broken":
             prop = Door(FLOOR_CELL[0] + 0.5, FLOOR_CELL[1] + 0.5, 0.0)
-            prop.break_open()
+            prop.break_open(animate=False)
             wall_mounted = False
         elif kind == "door":
             candidates = _wall_cells_around(maze, WALL_CELL)
@@ -92,8 +96,10 @@ def main():
             x, y = _wall_mount_position(boundary, facing, PROP_DEFS["locker"]["hd"])
             prop = Prop("locker", x, y, facing=facing)
             wall_mounted = True
-        elif kind == "tree":
-            prop = make_prop("tree", FLOOR_CELL, facing=0.0)
+        elif kind in variant_kinds:
+            base, index = variant_kinds[kind]
+            prop = make_prop(base, FLOOR_CELL, facing=0.0)
+            prop.variant = index
             wall_mounted = False
         else:
             prop = build_scene(kind)
@@ -101,6 +107,7 @@ def main():
 
         cx, cy, look = camera_for(prop, wall_mounted)
         app.player.x, app.player.y = cx, cy
+        app.player.peek_x, app.player.peek_y = cx, cy
         app.player.angle = look
         app.player.pitch = -0.10 if wall_mounted else -0.24
 
