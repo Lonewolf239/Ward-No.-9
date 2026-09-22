@@ -1,5 +1,6 @@
 import os
 import random
+import threading
 
 import numpy as np
 import pygame
@@ -191,7 +192,9 @@ class SoundBank:
         self._dual_loops = {}
         self._dual_last_vol = {}
         self._music_muffled_cache = {}
+        self._music_muffled_arrays = {}
         self._music_path = None
+        self._prepare_music_async(FLOOR_MUSIC_PATHS)
 
     def _make_footstep_tile(self, rng, hard=False):
         dur = 0.10 if hard else 0.12
@@ -619,13 +622,46 @@ class SoundBank:
         out.set_volume(volume)
         return out
 
+    def _muffled_music_array(self, path):
+        snd = pygame.mixer.Sound(path)
+        return self._muffle_array(pygame.sndarray.array(snd), window=26)
+
+    def _prepare_music_async(self, paths):
+        stop = self._music_stop = threading.Event()
+
+        def work():
+            for path in paths:
+                if stop.is_set():
+                    return
+                if path in self._music_muffled_arrays or path in self._music_muffled_cache:
+                    continue
+                try:
+                    snd = pygame.mixer.Sound(path)
+                    if stop.is_set():
+                        return
+                    arr = pygame.sndarray.array(snd)
+                    self._music_muffled_arrays[path] = self._muffle_array(arr, window=26)
+                except (pygame.error, OSError, ValueError):
+                    return
+        self._music_worker = threading.Thread(target=work, name="music-muffle", daemon=True)
+        self._music_worker.start()
+        pygame.register_quit(self.shutdown)
+
+    def shutdown(self, timeout=2.0):
+        stop = getattr(self, "_music_stop", None)
+        if stop is not None:
+            stop.set()
+        worker = getattr(self, "_music_worker", None)
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout)
+
     def _muffled_music_sound(self, path):
         cached = self._music_muffled_cache.get(path)
         if cached is not None:
             return cached
-        snd = pygame.mixer.Sound(path)
-        arr = pygame.sndarray.array(snd)
-        filtered = self._muffle_array(arr, window=26)
+        filtered = self._music_muffled_arrays.pop(path, None)
+        if filtered is None:
+            filtered = self._muffled_music_array(path)
         wet = pygame.sndarray.make_sound(filtered)
         self._music_muffled_cache[path] = wet
         return wet

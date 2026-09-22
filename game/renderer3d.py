@@ -4194,9 +4194,9 @@ DEPTH_CHUNK_CELLS = 8
 _WALL_VERTEX_FLOATS = 11
 
 
-def build_depth_wall_chunks(maze, chunk_cells=DEPTH_CHUNK_CELLS):
+def build_depth_wall_chunks(maze, chunk_cells=DEPTH_CHUNK_CELLS, walls=None):
     grouped = {}
-    for tile_type, data in build_maze_walls_by_type(maze).items():
+    for tile_type, data in (walls if walls is not None else build_maze_walls_by_type(maze)).items():
         if not wall_material(tile_type).casts_shadow:
             continue
         tris = data.reshape(-1, 3, _WALL_VERTEX_FLOATS)
@@ -6256,8 +6256,9 @@ class Renderer3D:
             self.ceil_vao = None
 
         self._build_wall_grid(maze)
+        walls = build_maze_walls_by_type(maze)
         self.depth_wall_chunks = []
-        for data, bounds in build_depth_wall_chunks(maze):
+        for data, bounds in build_depth_wall_chunks(maze, walls=walls):
             vbo = self.ctx.buffer(data.tobytes())
             vao = self.ctx.vertex_array(
                 self.prog, [(vbo, "3f 3f 2f 3f", "in_pos", "in_normal", "in_uv", "in_color")]
@@ -6265,7 +6266,7 @@ class Renderer3D:
             self.depth_wall_chunks.append((vao, vbo, bounds))
 
         self.wall_parts = []
-        for tile_type, data in build_maze_walls_by_type(maze).items():
+        for tile_type, data in walls.items():
             vbo = self.ctx.buffer(data.tobytes())
             vao = self.ctx.vertex_array(
                 self.prog, [(vbo, "3f 3f 2f 3f", "in_pos", "in_normal", "in_uv", "in_color")]

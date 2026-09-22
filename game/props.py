@@ -2,6 +2,7 @@ import math
 import random
 
 from game import settings as S
+from game.lighting import LIGHT_EPOCH
 from game.mesh_tops import MESH_TOP_FRAC
 
 NOTE_POOL = {
@@ -354,6 +355,15 @@ def variant_for_position(x, y, count):
 
 
 class Prop:
+    @property
+    def light_radius(self):
+        return self._light_radius
+
+    @light_radius.setter
+    def light_radius(self, value):
+        self._light_radius = value
+        LIGHT_EPOCH[0] += 1
+
     swing = 0.0
     break_askew = 0.0
     is_broken = False
@@ -1290,13 +1300,18 @@ def _unplug_for_the_monster(maze, props, start_cell, protected_kinds):
         if not cut:
             break
         cut_set = set(cut)
+        by_cell = {}
+        for p in movers:
+            if p.kind in protected_kinds:
+                continue
+            for c in footprint_cells(p, S.MONSTER_RADIUS):
+                by_cell.setdefault(c, []).append(p)
         best = None
         for cell in blocked:
             around = [(cell[0] + dx, cell[1] + dy) for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))]
             if not (any(c in free for c in around) and any(c in cut_set for c in around)):
                 continue
-            here = [p for p in movers if cell in footprint_cells(p, S.MONSTER_RADIUS)
-                    and p.kind not in protected_kinds]
+            here = by_cell.get(cell, [])
             if not here:
                 continue
             rank = (1 if any(p.kind == "locker" for p in here) else 0, len(here))

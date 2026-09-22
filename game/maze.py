@@ -481,42 +481,49 @@ class Maze:
     def bfs_distances(self, sx, sy, blocked=None):
         dist = {(sx, sy): 0}
         q = deque([(sx, sy)])
+        grid, w, h, floor = self.grid, self.w, self.h, S.FLOOR
+        blocked = blocked or ()
+        pop, push = q.popleft, q.append
         while q:
-            cx, cy = q.popleft()
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nx, ny = cx + dx, cy + dy
-                if (nx, ny) in dist:
+            cx, cy = cell = pop()
+            d = dist[cell] + 1
+            for n in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                if n in dist or n in blocked:
                     continue
-                if blocked and (nx, ny) in blocked:
-                    continue
-                if self.is_walkable_cell(nx, ny):
-                    dist[(nx, ny)] = dist[(cx, cy)] + 1
-                    q.append((nx, ny))
+                nx, ny = n
+                if 0 <= nx < w and 0 <= ny < h and grid[ny][nx] == floor:
+                    dist[n] = d
+                    push(n)
         return dist
 
     def bfs_path(self, sx, sy, tx, ty, blocked=None):
         if (sx, sy) == (tx, ty):
             return [(sx, sy)]
+        goal = (tx, ty)
         prev = {(sx, sy): None}
         q = deque([(sx, sy)])
+        grid, w, h, floor = self.grid, self.w, self.h, S.FLOOR
+        blocked = blocked or ()
+        pop, push = q.popleft, q.append
         found = False
         while q:
-            cx, cy = q.popleft()
-            if (cx, cy) == (tx, ty):
+            cell = pop()
+            if cell == goal:
                 found = True
                 break
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nx, ny = cx + dx, cy + dy
-                if (nx, ny) in prev:
+            cx, cy = cell
+            for n in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                if n in prev:
                     continue
-                if blocked and (nx, ny) in blocked and (nx, ny) != (tx, ty):
+                if n in blocked and n != goal:
                     continue
-                if self.is_walkable_cell(nx, ny):
-                    prev[(nx, ny)] = (cx, cy)
-                    q.append((nx, ny))
+                nx, ny = n
+                if 0 <= nx < w and 0 <= ny < h and grid[ny][nx] == floor:
+                    prev[n] = cell
+                    push(n)
         if not found:
             return []
-        path = [(tx, ty)]
+        path = [goal]
         while prev[path[-1]] is not None:
             path.append(prev[path[-1]])
         path.reverse()

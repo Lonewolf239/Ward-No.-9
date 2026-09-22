@@ -127,6 +127,7 @@ BLEND_DEFAULT = ("bush", "rock")
 BLEND_BAND = 2
 BLEND_PER_EDGE = (1, 3)
 BLEND_SPACING = 2
+_BLEND_REACH = range(1 - BLEND_SPACING, BLEND_SPACING)
 
 
 def _blend_zone_edges(rng, grid, zones, n_grid):
@@ -165,8 +166,7 @@ def _blend_zone_edges(rng, grid, zones, n_grid):
         for c in spots:
             if placed >= want:
                 break
-            if any(abs(c[0] - t[0]) < BLEND_SPACING and abs(c[1] - t[1]) < BLEND_SPACING
-                   for t in taken):
+            if any((c[0] + dx, c[1] + dy) in taken for dx in _BLEND_REACH for dy in _BLEND_REACH):
                 continue
             kind = rng.choice(pool)
             target["furniture"].append(

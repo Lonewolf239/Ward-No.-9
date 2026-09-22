@@ -70,15 +70,13 @@ def _merge_door_kind(a, b):
     return "passage"
 
 
-def _rects_touch_or_overlap(a, b):
-    ax0, ay0, ax1, ay1 = a
-    bx0, by0, bx1, by1 = b
-    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
-    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
-    iw, ih = ix1 - ix0, iy1 - iy0
-    if iw <= 0 or ih <= 0:
-        return False
-    return iw > 1 and ih > 1
+def _hits_placed(rect, placed):
+    ax0, ay0, ax1, ay1 = rect
+    for (bx0, by0, bx1, by1), _a, _b in placed:
+        if ((ax1 if ax1 < bx1 else bx1) - (ax0 if ax0 > bx0 else bx0) > 1
+                and (ay1 if ay1 < by1 else by1) - (ay0 if ay0 > by0 else by0) > 1):
+            return True
+    return False
 
 
 def _rect_of(t, ox, oy):
@@ -494,7 +492,7 @@ def _attempt(rng, floor_key, target_rooms, anomaly=None):
                 rect = _rect_of(cand, *new_o)
                 if rect[0] < 2 or rect[1] < 2 or rect[2] > 195 or rect[3] > 195:
                     continue
-                if any(_rects_touch_or_overlap(rect, r) for r, _, _ in placed):
+                if _hits_placed(rect, placed):
                     continue
                 cand_along = cly if opp in ("E", "W") else clx
                 if not _furniture_free(t, _clearance_cells(t, side, t_along)):
@@ -553,7 +551,7 @@ def _attempt(rng, floor_key, target_rooms, anomaly=None):
             rect = _rect_of(cand, *new_o)
             if rect[0] < 2 or rect[1] < 2 or rect[2] > 195 or rect[3] > 195:
                 continue
-            if any(_rects_touch_or_overlap(rect, r) for r, _, _ in placed):
+            if _hits_placed(rect, placed):
                 continue
             cand_along = cly if opp in ("E", "W") else clx
             if not _furniture_free(cand, _clearance_cells(cand, opp, cand_along)):

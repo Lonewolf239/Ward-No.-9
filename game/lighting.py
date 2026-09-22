@@ -169,10 +169,24 @@ def prop_emission(prop, t):
     return 1.0
 
 
+LIGHT_EPOCH = [0]
+_EMITTER_CACHE = {}
+
+
+def _emitters(props):
+    sig = (len(props), sum(map(id, props)), LIGHT_EPOCH[0])
+    found = _EMITTER_CACHE.get(sig)
+    if found is None:
+        if len(_EMITTER_CACHE) >= 4:
+            _EMITTER_CACHE.clear()
+        found = _EMITTER_CACHE[sig] = [p for p in props if getattr(p, "light_radius", None)]
+    return found
+
+
 def select_prop_lights(props, eye, view_dist, t, limit=MAX_OMNI_LIGHTS):
     ex, ey, ez = eye
     picked = []
-    for p in props:
+    for p in _emitters(props):
         radius = getattr(p, "light_radius", None)
         if not radius or p.picked or getattr(p, "broken", False):
             continue
