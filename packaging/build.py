@@ -9,6 +9,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from game import settings as S
+from game import version as V
 
 APP_SLUG = "ward9"
 
@@ -23,7 +24,7 @@ else:
 def _write_windows_version_file(path):
     from PyInstaller.utils.win32 import versioninfo as vi
 
-    filevers = (0, 1, 0, 0)
+    filevers = V.file_version(S.VERSION)
     info = vi.VSVersionInfo(
         ffi=vi.FixedFileInfo(filevers=filevers, prodvers=filevers, mask=0x3F, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
         kids=[

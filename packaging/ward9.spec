@@ -22,10 +22,6 @@ a = Analysis(
         (os.path.join(ROOT, "game", "locale_data"), os.path.join("game", "locale_data")),
     ],
     hiddenimports=[
-        # main.py only imports this lazily (inside the app<->editor mode
-        # dispatcher, App._open_room_editor's "open editor" path) so it can
-        # be reached from the in-game main menu button - spelled out here
-        # since PyInstaller's static import scan can miss deferred imports.
         "tools.room_editor.editor",
         "tools.room_editor.panel",
         "tools.room_editor.grid_view",

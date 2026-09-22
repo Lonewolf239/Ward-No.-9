@@ -6,6 +6,8 @@ on:
     tags:
       - "ALPHA_*"
       - "BETA_*"
+      - "RC_*"
+      - "[0-9]*"
       - "v*"
 
 jobs:
