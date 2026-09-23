@@ -1,3 +1,4 @@
+import collections
 import math
 import random
 
@@ -462,6 +463,8 @@ class Monster:
         self.last_known = None
         self.last_known_age = 0.0
         self._searched = set()
+        self._contact_from = None
+        self._search_mode = "here"
         self._search_t = 0.0
         self._door_memory = {}
         self.haunt = None
@@ -500,6 +503,11 @@ class Monster:
         self._ignored_props = {}
         self._temp_blocked_cells = {}
         self._prop_stuck_time = 0.0
+        self._progress_anchor = (x, y)
+        self._progress_t = 0.0
+        self._progress_fails = 0
+        self._unwedge_to = None
+        self._wedged_t = 0.0
         self._turn_probe_timer = 0.0
         self._turn_probe_dir = 1.0
         self.pending_reaction = None
@@ -625,11 +633,16 @@ class Monster:
     def _note_contact(self, cell):
         if cell != self.last_known:
             self._searched.clear()
+            self._contact_from = (self.x, self.y)
         self.last_known = cell
         self.last_known_age = 0.0
         self._search_t = 0.0
         self.haunt = cell
         self.haunt_age = 0.0
+
+    def _roll_search_mode(self):
+        self._search_mode = ("here" if self.rng.random() < S.MONSTER_SEARCH_HERE_CHANCE
+                             else "ahead")
 
     def _pick_search_cell(self, maze):
         if self.last_known is None:
@@ -641,6 +654,14 @@ class Monster:
         here = maze.bfs_distances(self.cell[0], self.cell[1], blocked=self.blocked_cells)
         rooms = self._room_cell_set(maze)
         inner = reach * 0.4
+        ahead = None
+        if self._contact_from is not None:
+            ax = (self.last_known[0] + 0.5) - self._contact_from[0]
+            ay = (self.last_known[1] + 0.5) - self._contact_from[1]
+            an = math.hypot(ax, ay)
+            if an > 0.5:
+                ahead = (ax / an, ay / an)
+        lean = S.MONSTER_SEARCH_MODE_WEIGHT.get(self._search_mode, 1.0)
         best, best_score = None, None
         for c, d in dists.items():
             if c in self._searched or not (inner <= d <= reach):
@@ -648,7 +669,14 @@ class Monster:
             leg = here.get(c)
             if leg is None or leg < S.MONSTER_SEARCH_MIN_LEG:
                 continue
-            score = leg + self.rng.uniform(0.0, 1.5)
+            score = S.MONSTER_SEARCH_LEG_WEIGHT * leg + self.rng.uniform(0.0, 1.5)
+            if ahead is not None:
+                vx = (c[0] + 0.5) - (self.last_known[0] + 0.5)
+                vy = (c[1] + 0.5) - (self.last_known[1] + 0.5)
+                vn = math.hypot(vx, vy)
+                if vn > 0.5:
+                    align = (vx * ahead[0] + vy * ahead[1]) / vn
+                    score -= S.MONSTER_SEARCH_AHEAD_BONUS * align * lean
             if c in rooms:
                 score -= S.MONSTER_SEARCH_ROOM_BONUS
             if maze.has_line_of_sight(self.x, self.y, c[0] + 0.5, c[1] + 0.5):
@@ -697,6 +725,53 @@ class Monster:
         self.pending_reaction = None
         self._search_hops_left = 3
         self._replan(maze, target_cell)
+
+    def _unstick_from_walls(self, maze):
+        if not maze.circle_hits_wall(self.x, self.y, S.MONSTER_RADIUS):
+            return
+        cx, cy = self.cell
+        tx, ty = cx + 0.5, cy + 0.5
+        home = math.atan2(ty - self.y, tx - self.x) if (abs(tx - self.x) > 1e-6 or abs(ty - self.y) > 1e-6) else 0.0
+        best = None
+        for k in range(12):
+            ang = home + k * (math.tau / 12.0)
+            for step in (0.08, 0.16, 0.26, 0.4, 0.6):
+                nx = self.x + math.cos(ang) * step
+                ny = self.y + math.sin(ang) * step
+                if not maze.circle_hits_wall(nx, ny, S.MONSTER_RADIUS):
+                    if best is None or step < best[0]:
+                        best = (step, nx, ny)
+                    break
+        if best is not None:
+            self.x, self.y = best[1], best[2]
+            return
+        self.x += (tx - self.x) * S.MONSTER_WALL_UNSTICK_PULL
+        self.y += (ty - self.y) * S.MONSTER_WALL_UNSTICK_PULL
+
+    def _free_wedged(self, maze):
+        start = self.cell
+        seen = {start}
+        queue = collections.deque([start])
+        goal = None
+        while queue and goal is None:
+            cell = queue.popleft()
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                n = (cell[0] + dx, cell[1] + dy)
+                if n in seen or not maze.is_walkable_cell(n[0], n[1]):
+                    continue
+                if maze.circle_hits_wall(n[0] + 0.5, n[1] + 0.5, S.MONSTER_RADIUS):
+                    continue
+                seen.add(n)
+                if n not in self.blocked_cells:
+                    goal = n
+                    break
+                queue.append(n)
+            if len(seen) > S.MONSTER_UNWEDGE_SEARCH_CELLS:
+                break
+        if goal is None:
+            return
+        self._unwedge_to = (goal[0] + 0.5, goal[1] + 0.5)
+        self.path = []
 
     def _abandon_target_and_patrol(self):
         if self.locker_target is not None:
@@ -1240,8 +1315,10 @@ class Monster:
             else:
                 self.state = Monster.INVESTIGATE
                 self.pending_reaction = None
-                self._search_hops_left = 3
-                self.target_cell = maze.room_center_near((int(lk.x), int(lk.y)))
+                self._search_hops_left = S.MONSTER_SEARCH_HOPS // 3
+                self._roll_search_mode()
+                nxt = self._pick_search_cell(maze) if self._search_mode != "here" else None
+                self.target_cell = nxt or maze.room_center_near((int(lk.x), int(lk.y)))
                 self._replan(maze, self.target_cell)
 
         if (not grace and not blind and player.is_hiding and player.flashlight_on and player.hidden_in is not None
@@ -1272,6 +1349,7 @@ class Monster:
             self.chase_cooldown = S.MONSTER_CHASE_COOLDOWN
             self.chase_t = 0.0
             self.blind_t = 0.0
+            self._roll_search_mode()
             self._search_hops_left = S.MONSTER_SEARCH_HOPS
             self.lose_interest_timer = 0.0
         if self.chase_cooldown > 0.0 and not seen_now:
@@ -1324,6 +1402,7 @@ class Monster:
                 self.lose_interest_timer -= dt
                 if self.lose_interest_timer <= 0:
                     self.state = Monster.INVESTIGATE
+                    self._roll_search_mode()
                     self._search_hops_left = S.MONSTER_SEARCH_HOPS
             elif hearing_hit:
                 target = pcell
@@ -1566,6 +1645,15 @@ class Monster:
                 if self.target_cell:
                     self._replan(maze, self.target_cell)
             moved = False
+        elif self._unwedge_to is not None:
+            self._walk_toward(maze, dt, speed, self._unwedge_to[0], self._unwedge_to[1], blocked_props=())
+            if (self.cell not in self.blocked_cells
+                    or math.hypot(self._unwedge_to[0] - self.x, self._unwedge_to[1] - self.y) < 0.25):
+                self._unwedge_to = None
+                self._wedged_t = 0.0
+                if self.target_cell:
+                    self._replan(maze, self.target_cell)
+            moved = True
         elif self._turn_probe_timer > 0.0:
             self._turn_probe_timer -= dt
             probe_facing = (self.facing + self._turn_probe_dir * S.MONSTER_TURN_PROBE_RATE * dt) % (2 * math.pi)
@@ -1592,6 +1680,7 @@ class Monster:
         else:
             moved = self._advance(dt, speed, maze, local_props)
         self.x, self.y = _push_out_of_props(self.x, self.y, local_props)
+        self._unstick_from_walls(maze)
         if self.breaking_door is not None:
             self.x, self.y = _push_out_of_props(self.x, self.y, [self.breaking_door])
         self._hold_door_side(self.doors)
@@ -1633,6 +1722,44 @@ class Monster:
         if self._nav_stuck_time > S.MONSTER_NAV_STUCK_TIMEOUT:
             self._nav_stuck_time = 0.0
             self._abandon_target_and_patrol()
+
+        if self.cell in self.blocked_cells and self._unwedge_to is None:
+            self._wedged_t += dt
+            if self._wedged_t > S.MONSTER_WEDGED_TIMEOUT:
+                self._wedged_t = 0.0
+                self._free_wedged(maze)
+        elif self.cell not in self.blocked_cells:
+            self._wedged_t = 0.0
+
+        settled = (self.checking_timer > 0.0 or self.breaking_door is not None
+                   or self.glance_phase is not None
+                   or (self.state == Monster.STALK and self.stalk_phase == "wait"))
+        if settled or math.hypot(self.x - self._progress_anchor[0],
+                                 self.y - self._progress_anchor[1]) > S.MONSTER_PROGRESS_DIST:
+            self._progress_anchor = (self.x, self.y)
+            self._progress_t = 0.0
+            if settled:
+                self._progress_fails = 0
+        else:
+            self._progress_t += dt
+        if self._progress_t > S.MONSTER_PROGRESS_TIMEOUT:
+            self._progress_t = 0.0
+            self._progress_anchor = (self.x, self.y)
+            self._progress_fails += 1
+            self._turn_probe_timer = 0.0
+            stuck_near = next((p_ for p_ in blocked_props
+                               if _circle_hits_prop(self.x, self.y, S.MONSTER_RADIUS + 0.35, p_)), None)
+            if stuck_near is not None and stuck_near.kind != "door":
+                self._ignored_props[id(stuck_near)] = S.MONSTER_PROP_IGNORE_DURATION * 3.0
+            if self._progress_fails >= 2:
+                self._progress_fails = 0
+                self._temp_blocked_cells.clear()
+                self._ignored_props.clear()
+                self._free_wedged(maze)
+                self._abandon_target_and_patrol()
+            elif self.target_cell:
+                self._temp_blocked_cells[self.cell] = S.MONSTER_TEMP_BLOCK_DURATION
+                self._replan(maze, self.target_cell, extra_blocked=set(self._temp_blocked_cells))
 
         if touching_prop is not None and self._prop_stuck_time > S.MONSTER_PROP_STUCK_TRIGGER:
             self._prop_stuck_time = 0.0
@@ -1681,6 +1808,9 @@ class Monster:
                          and self._search_t < S.MONSTER_SEARCH_SECONDS)
             if searching:
                 self._search_hops_left -= 1
+                if (self._search_mode == "ahead"
+                        and self.rng.random() < S.MONSTER_SEARCH_TURN_BACK_CHANCE):
+                    self._search_mode = "back"
                 nxt = self._pick_search_cell(maze)
                 if nxt is None:
                     tcx, tcy = self.target_cell
