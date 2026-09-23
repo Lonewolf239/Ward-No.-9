@@ -465,6 +465,8 @@ class Monster:
         self._searched = set()
         self._contact_from = None
         self._search_mode = "here"
+        self._hunt_to_search = False
+        self._patrol_fails = 0
         self._search_t = 0.0
         self._door_memory = {}
         self.haunt = None
@@ -588,6 +590,21 @@ class Monster:
             self._patrol_recent.pop(0)
         self._patrol_from = self.cell
         return best
+
+    def _reachable_patrol_target(self, maze):
+        here = maze.bfs_distances(self.cell[0], self.cell[1], blocked=self.blocked_cells)
+        pool = [c for c, d in here.items() if d >= S.MONSTER_SEARCH_MIN_LEG]
+        if not pool:
+            pool = [c for c in here if c != self.cell]
+        if not pool:
+            return None
+        best, best_w = None, -1.0
+        for _ in range(min(S.MONSTER_PATROL_SAMPLES, len(pool))):
+            c = self.rng.choice(pool)
+            w = self._patrol_weight(maze, c) * self.rng.uniform(0.75, 1.0)
+            if w > best_w:
+                best, best_w = c, w
+        return best or self.rng.choice(pool)
 
     def _pick_guard_target(self, maze):
         if self.exit_cell is None:
@@ -1313,10 +1330,11 @@ class Monster:
                 self.target_cell = self._locker_stalk_cell(maze, lk)
                 self._replan(maze, self.target_cell)
             else:
-                self.state = Monster.INVESTIGATE
                 self.pending_reaction = None
                 self._search_hops_left = S.MONSTER_SEARCH_HOPS // 3
                 self._roll_search_mode()
+                self._hunt_to_search = True
+                self.lose_interest_timer = max(self.lose_interest_timer, S.MONSTER_LOSE_INTEREST_TIME)
                 nxt = self._pick_search_cell(maze) if self._search_mode != "here" else None
                 self.target_cell = nxt or maze.room_center_near((int(lk.x), int(lk.y)))
                 self._replan(maze, self.target_cell)
@@ -1346,6 +1364,7 @@ class Monster:
         if (self.state == Monster.HUNT and self.chase_t > S.MONSTER_CHASE_MAX_SECONDS
                 and self.blind_t > S.MONSTER_CHASE_BLIND_GIVE_UP):
             self.state = Monster.INVESTIGATE
+            self._hunt_to_search = False
             self.chase_cooldown = S.MONSTER_CHASE_COOLDOWN
             self.chase_t = 0.0
             self.blind_t = 0.0
@@ -1362,6 +1381,7 @@ class Monster:
         if self.state != Monster.STALK or seen_now:
             if seen_now:
                 self.state = Monster.HUNT
+                self._hunt_to_search = False
                 self.lose_interest_timer = S.MONSTER_LOSE_INTEREST_TIME
                 self._sight_memory_t = S.MONSTER_SIGHT_MEMORY_SECONDS
                 self.target_cell = pcell
@@ -1400,10 +1420,18 @@ class Monster:
                     self.target_cell = pcell
                     self._note_contact(pcell)
                 self.lose_interest_timer -= dt
-                if self.lose_interest_timer <= 0:
-                    self.state = Monster.INVESTIGATE
+                if self.lose_interest_timer <= 0 and not self._hunt_to_search:
+                    self._hunt_to_search = True
                     self._roll_search_mode()
                     self._search_hops_left = S.MONSTER_SEARCH_HOPS
+                    if self._search_mode != "here":
+                        nxt = self._pick_search_cell(maze)
+                        if nxt is not None:
+                            self.target_cell = nxt
+                            self._replan(maze, nxt)
+                elif self.lose_interest_timer <= -S.MONSTER_HUNT_ARRIVE_GRACE:
+                    self.state = Monster.INVESTIGATE
+                    self._hunt_to_search = False
             elif hearing_hit:
                 target = pcell
                 if self.rng.random() < S.MONSTER_INTERCEPT_CHANCE:
@@ -1551,6 +1579,16 @@ class Monster:
                 self.target_cell = (self._pick_guard_target(maze) if self.state == Monster.GUARD
                                      else self._pick_patrol_target(maze))
                 self._replan(maze, self.target_cell)
+                if not self.path and self.target_cell != self.cell:
+                    self._patrol_fails += 1
+                    if self._patrol_fails >= S.MONSTER_PATROL_FAILS_BEFORE_LOCAL:
+                        self._patrol_fails = 0
+                        near = self._reachable_patrol_target(maze)
+                        if near is not None:
+                            self.target_cell = near
+                            self._replan(maze, near)
+                else:
+                    self._patrol_fails = 0
                 self._patrol_wait = self.rng.uniform(1.0, 3.0) if self.path else 0.15
 
         self.replan_timer -= dt
@@ -1802,6 +1840,12 @@ class Monster:
         arrived = (self.state in (Monster.HUNT, Monster.INVESTIGATE) and not self.path
                    and self.locker_target is None and self.cell == self.target_cell
                    and not can_see and not spotted_by_beam)
+        if arrived and self.state == Monster.HUNT and self._hunt_to_search:
+            self.state = Monster.INVESTIGATE
+            self._hunt_to_search = False
+            self._search_t = 0.0
+            if self._search_hops_left <= 0:
+                self._search_hops_left = S.MONSTER_SEARCH_HOPS
         if arrived:
             self._mark_searched(maze, self.cell)
             searching = (self._search_hops_left > 0 and self.target_cell is not None
