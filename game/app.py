@@ -589,6 +589,7 @@ class App:
         self.floor_banner_timer = 4.0
         self.scare_progress = 0.0
         self.scare_target = random.uniform(0.85, 1.15)
+        self.scare_cooldown = 0.0
         self.scare_source = None
         self.hallu_progress = 0.0
         self.hallu_target = random.uniform(0.85, 1.15)
@@ -724,6 +725,7 @@ class App:
             monster_cell[0] + 0.5, monster_cell[1] + 0.5, self.maze,
             rng=random.Random(seed ^ 0xB0B0),
             speed_mult=spec["speed_mult"], vision_mult=spec["vision_mult"],
+            hearing_mult=spec.get("hearing_mult", 1.0),
             vision_light_norm=spec.get("vision_light_norm", S.MONSTER_VISION_LIGHT_NORM),
             blocked_cells=monster_blocked,
             lockers=lockers,
@@ -846,6 +848,12 @@ class App:
             self._build_floor_scene(spec)
         self._door_break_sfx_timer = 0.0
         self.floor_elapsed = 0.0
+        self.dread = 0.0
+        self._dread_time_frac = 0.0
+        self._dread_progress_frac = 0.0
+        self.scare_progress = 0.0
+        self.scare_cooldown = S.SCARE_MIN_GAP
+        self.hallu_progress = 0.0
         self.floor_banner = self._spec_text("title")
         self.floor_banner_timer = 4.0
         self.hint_text = self._spec_text("intro")
@@ -3840,7 +3848,7 @@ class App:
 
         self.elapsed += dt
         self.floor_elapsed += dt
-        time_frac = min(1.0, self.elapsed / S.DREAD_RAMP_SECONDS)
+        time_frac = min(1.0, self.floor_elapsed / S.DREAD_RAMP_SECONDS)
         progress_frac = 0.0
         if self.panel_prop is not None and self.spec["n_collectible"] > 0:
             progress_frac = min(1.0, self.panel_prop.installed / self.spec["n_collectible"])
@@ -3953,7 +3961,7 @@ class App:
         vision *= self.maze.sight_transmission(m.x, m.y, p.x, p.y)
         covered = dist < vision and p.is_crouching and line_blocked_by_cover(self.props, m.x, m.y, p.x, p.y)
         visible = (not p.is_hiding) and dist < vision and not covered
-        near_range = S.SANITY_NEAR_RANGE
+        near_range = max(S.SANITY_NEAR_RANGE, vision * S.SANITY_TERROR_VISION_MULT)
         proximity_dread = 0.0 if p.is_hiding else max(0.0, 1.0 - dist / near_range)
         in_dark_drain = False
         if visible:
@@ -3971,7 +3979,7 @@ class App:
         else:
             boosted = self.sanity_boost_timer > 0.0
             if boosted or p.is_lit:
-                if dist > S.SANITY_SAFE_RANGE:
+                if dist > max(S.SANITY_SAFE_RANGE, near_range):
                     regen_rate = S.SANITY_REGEN * (S.SANITY_PILL_REGEN_MULT if boosted else 1.0)
                     p.apply_sanity(regen_rate * dt)
             elif dist > S.SANITY_DARK_RANGE:
@@ -4165,15 +4173,19 @@ class App:
     def _update_scares(self, dt):
         if self.spec.get("no_threat") or self._debug_spectator:
             return
-        seconds_dark = 14.0 - 8.0 * self.dread
-        seconds_lit = 34.0 - 10.0 * self.dread
+        seconds_dark = S.SCARE_SECONDS_DARK - S.SCARE_SECONDS_DARK_DREAD * self.dread
+        seconds_lit = S.SCARE_SECONDS_LIT - S.SCARE_SECONDS_LIT_DREAD * self.dread
         self._scare_lit = self.player.is_lit
         seconds_to_fill = seconds_lit if self._scare_lit else seconds_dark
         self._scare_seconds_to_fill = seconds_to_fill
+        if self.scare_cooldown > 0.0:
+            self.scare_cooldown -= dt
+            return
         self.scare_progress += dt / max(1.0, seconds_to_fill)
         if self.scare_progress >= self.scare_target:
             self.scare_progress = 0.0
             self.scare_target = random.uniform(0.85, 1.15)
+            self.scare_cooldown = S.SCARE_MIN_GAP
             self._trigger_random_scare()
 
     def _update_hallucinations(self, dt):

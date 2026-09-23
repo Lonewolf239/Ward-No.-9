@@ -417,13 +417,17 @@ class Monster:
 
     def __init__(self, x, y, maze, rng=None, speed_mult=1.0, vision_mult=1.0, blocked_cells=None, lockers=None,
                  doors=None, blocked_prop_candidates=None, dead_end_lockers=None, exit_cell=None,
-                 vision_light_norm=S.MONSTER_VISION_LIGHT_NORM):
+                 vision_light_norm=S.MONSTER_VISION_LIGHT_NORM, hearing_mult=1.0):
         self.x = x
         self.y = y
         self.state = Monster.PATROL
         self.rng = rng or random.Random()
         self.speed_mult = speed_mult
         self.vision_mult = vision_mult
+        self.hearing_mult = hearing_mult
+        self.chase_t = 0.0
+        self.blind_t = 0.0
+        self.chase_cooldown = 0.0
         self.vision_light_norm = vision_light_norm
         self.path = []
         self.target_cell = None
@@ -1097,7 +1101,7 @@ class Monster:
             lit_frac = monster_lit_frac(player.light_level, self.vision_light_norm)
             vision = (monster_vision_base(player.light_level, self.vision_light_norm)
                       * self.vision_mult * (1.0 + dread * 0.35))
-            hearing = player.noise_radius * (1.0 + dread * 0.2)
+            hearing = player.noise_radius * self.hearing_mult * (1.0 + dread * 0.2)
             near_enough = dist < vision * 1.6
             transmission = maze.sight_transmission(self.x, self.y, player.x, player.y) if near_enough else 0.0
             has_los = near_enough and transmission > 0.0 and not line_blocked_by_cover(
@@ -1253,13 +1257,32 @@ class Monster:
                 self.pending_reaction = None
                 self._replan(maze, self.target_cell)
 
+        seen_now = can_see or spotted_by_beam or peek_spotted or glow_hunt
+        if self.state == Monster.HUNT:
+            self.chase_t += dt
+            self.blind_t = 0.0 if seen_now else self.blind_t + dt
+        else:
+            self.chase_t = 0.0
+            self.blind_t = 0.0
+        if self.chase_cooldown > 0.0:
+            self.chase_cooldown = max(0.0, self.chase_cooldown - dt)
+        if (self.state == Monster.HUNT and self.chase_t > S.MONSTER_CHASE_MAX_SECONDS
+                and self.blind_t > S.MONSTER_CHASE_BLIND_GIVE_UP):
+            self.state = Monster.INVESTIGATE
+            self.chase_cooldown = S.MONSTER_CHASE_COOLDOWN
+            self.chase_t = 0.0
+            self.blind_t = 0.0
+            self._search_hops_left = S.MONSTER_SEARCH_HOPS
+            self.lose_interest_timer = 0.0
+        if self.chase_cooldown > 0.0 and not seen_now:
+            loud_and_close = False
+
         self.just_noticed = False
-        if (can_see or spotted_by_beam or peek_spotted or glow_hunt
-                or loud_and_close) and self.state != Monster.HUNT:
+        if (seen_now or loud_and_close) and self.state != Monster.HUNT:
             self.just_noticed = True
 
-        if self.state != Monster.STALK or can_see or spotted_by_beam or peek_spotted or glow_hunt:
-            if can_see or spotted_by_beam or peek_spotted or glow_hunt:
+        if self.state != Monster.STALK or seen_now:
+            if seen_now:
                 self.state = Monster.HUNT
                 self.lose_interest_timer = S.MONSTER_LOSE_INTEREST_TIME
                 self._sight_memory_t = S.MONSTER_SIGHT_MEMORY_SECONDS
@@ -1284,7 +1307,7 @@ class Monster:
                 self.locker_target = None
                 self.stalk_origin = False
                 self._note_contact(pcell)
-            elif tracking:
+            elif tracking and self.chase_cooldown <= 0.0:
                 self.target_cell = pcell
                 self.lose_interest_timer = S.MONSTER_LOSE_INTEREST_TIME
                 self._sight_memory_t = S.MONSTER_SIGHT_MEMORY_SECONDS
@@ -1512,6 +1535,9 @@ class Monster:
                     self.trailing_door = None
 
         base = S.MONSTER_HUNT_SPEED if self.state == Monster.HUNT else S.MONSTER_BASE_SPEED
+        if self.state == Monster.HUNT and self.chase_t > S.MONSTER_CHASE_TIRE_START:
+            worn = (self.chase_t - S.MONSTER_CHASE_TIRE_START) * S.MONSTER_CHASE_TIRE_RATE
+            base *= max(S.MONSTER_CHASE_TIRE_FLOOR, 1.0 - worn)
         speed = base * self.speed_mult * (1.0 + dread * 0.25)
         speed = min(speed, S.SPRINT_SPEED * S.MONSTER_HUNT_SPEED_CAP_RATIO)
         if glance_holding:
