@@ -272,9 +272,10 @@ def surface_top_frac(kind, variant=0):
 
 
 def _surface_top_z0(surf, rng=None):
+    base = getattr(surf, "z0", 0.0)
     if surf.kind == "shelf" and rng is not None:
-        return surf.height * rng.choice(SHELF_LEVEL_FRACS)
-    return surf.height * surface_top_frac(surf.kind, getattr(surf, "variant", 0))
+        return base + surf.height * rng.choice(SHELF_LEVEL_FRACS)
+    return base + surf.height * surface_top_frac(surf.kind, getattr(surf, "variant", 0))
 
 HAND_FURNITURE_KINDS = {
     "bed", "desk", "table", "shelf", "gurney", "crate", "barrel", "pipes",
@@ -1091,23 +1092,84 @@ def _spread_pick(cells, n, used, rng, min_gap=3, cell_to_group=None, group_weigh
     return chosen
 
 
-def _pick_surface_spot(surf, item_hw, rng, occupied, tries=16):
+PICKUP_SURFACE_MAX_Z0 = 0.02
+SURFACE_EDGE_PULL = 0.45
+
+
+def mark_surface_open_side(surf, dist):
+    cell = getattr(surf, "interact_cell", None)
+    if cell is None:
+        return
+    cx, cy = cell
+    free = [(dx, dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+            if (dx or dy) and (cx + dx, cy + dy) in dist]
+    if not free:
+        return
+    ax = sum(dx for dx, dy in free) / len(free)
+    ay = sum(dy for dx, dy in free) / len(free)
+    n = math.hypot(ax, ay)
+    if n > 1e-6:
+        surf.open_side = (ax / n, ay / n)
+
+
+def _spot_openness(x, y, blockers, z, item_hw):
+    if not blockers:
+        return 1.0
+    free = 0
+    for k in range(8):
+        a = k * math.pi / 4.0
+        dx, dy = math.cos(a), math.sin(a)
+        clear = True
+        for step in (item_hw + 0.10, item_hw + 0.26):
+            sx, sy = x + dx * step, y + dy * step
+            for q in blockers:
+                if q.height <= 0.1 or not (q.z0 <= z + 0.06 <= q.z0 + q.height):
+                    continue
+                fx, fy = math.cos(q.collide_facing), math.sin(q.collide_facing)
+                rx, ry = -fy, fx
+                lx, ly = sx - q.collide_x, sy - q.collide_y
+                if abs(lx * fx + ly * fy) <= q.hd and abs(lx * rx + ly * ry) <= q.hw:
+                    clear = False
+                    break
+            if not clear:
+                break
+        free += clear
+    return free / 8.0
+
+
+def _pick_surface_spot(surf, item_hw, rng, occupied, tries=16, blockers=None, item_z=None):
     keep = SURFACE_SPOT_FRAC.get(surf.kind, 1.0)
     keep_x, keep_y = keep if isinstance(keep, tuple) else (keep, keep)
     span_x = max(0.02, (surf.hd - item_hw) * keep_x)
     span_y = max(0.02, (surf.hw - item_hw) * keep_y)
     fx, fy = math.cos(surf.facing), math.sin(surf.facing)
     rx, ry = -fy, fx
+    open_side = getattr(surf, "open_side", None)
+    open_f = open_side[0] * fx + open_side[1] * fy if open_side else 0.0
+    open_r = open_side[0] * rx + open_side[1] * ry if open_side else 0.0
     key = getattr(surf, "interact_cell", None)
     existing = occupied.get(key, ()) if key is not None else ()
     best_xy, best_score = None, float("-inf")
     for _ in range(tries):
         along_forward = rng.uniform(-span_x, span_x)
         along_right = rng.uniform(-span_y, span_y)
+        if open_side is not None:
+            if abs(open_f) > 0.3:
+                along_forward = math.copysign(
+                    span_x * (SURFACE_EDGE_PULL + (1.0 - SURFACE_EDGE_PULL) * rng.random()), open_f)
+            if abs(open_r) > 0.3:
+                along_right = math.copysign(
+                    span_y * (SURFACE_EDGE_PULL + (1.0 - SURFACE_EDGE_PULL) * rng.random()), open_r)
         x = surf.x + fx * along_forward + rx * along_right
         y = surf.y + fy * along_forward + ry * along_right
         score = min((math.hypot(x - ox, y - oy) - r - item_hw for ox, oy, r in existing), default=999.0)
-        if score >= 0:
+        if blockers is not None and item_z is not None:
+            open_frac = _spot_openness(x, y, blockers, item_z, item_hw)
+            score = min(score, 0.0) + open_frac
+            if open_frac >= 0.75 and score >= 0.75:
+                best_xy = (x, y)
+                break
+        elif score >= 0:
             best_xy = (x, y)
             break
         if score > best_score:
@@ -1122,22 +1184,31 @@ PICKUP_SURFACE_REACH = 2.3
 
 
 def _place_pickup(kind, cell, surfaces_by_room, cell_to_room, rng, surface_occupied,
-                  on_surface_chance=0.45, reach=None, prefer=()):
+                  on_surface_chance=0.45, reach=None, prefer=(), allow=None, blockers=None):
     room = cell_to_room(cell) if cell_to_room else None
     room_surfaces = surfaces_by_room.get(room) if surfaces_by_room else None
     if room_surfaces and rng.random() < on_surface_chance:
         cx, cy = cell[0] + 0.5, cell[1] + 0.5
         limit = PICKUP_SURFACE_REACH if reach is None else reach
-        near = [s for s in room_surfaces if math.hypot(s.x - cx, s.y - cy) <= limit]
+        near = [s for s in room_surfaces
+                if math.hypot(s.x - cx, s.y - cy) <= limit
+                and getattr(s, "z0", 0.0) <= PICKUP_SURFACE_MAX_Z0
+                and (allow is None or allow(s))]
         if near:
             good = [s for s in near if s.kind in prefer]
             near = good or near
             surf = min(near, key=lambda s: math.hypot(s.x - cx, s.y - cy))
             room_surfaces.remove(surf)
             item_hw = PROP_DEFS[kind]["hw"]
-            x, y = _pick_surface_spot(surf, item_hw, rng, surface_occupied)
+            z = _surface_top_z0(surf, rng)
+            near_props = None
+            if blockers is not None:
+                near_props = [q for q in blockers
+                              if q is not surf and abs(q.x - surf.x) < 2.0 and abs(q.y - surf.y) < 2.0]
+            x, y = _pick_surface_spot(surf, item_hw, rng, surface_occupied,
+                                      blockers=near_props, item_z=z)
             prop = Prop(kind, x, y, facing=rng.uniform(0, math.tau))
-            prop.z0 = _surface_top_z0(surf, rng)
+            prop.z0 = z
             return prop
     return make_prop(kind, cell)
 
@@ -1205,6 +1276,8 @@ def _scatter_clutter(maze, rooms, props, rng, surface_occupied, used, dist, corr
             n = max(n, 1)
         n = min(n, CLUTTER_MAX_PER_ROOM)
         surfaces = [s for c in cells for s in surfaces_by_cell.get(c, ()) if _reachable_surface(s, dist)]
+        for s_ in surfaces:
+            mark_surface_open_side(s_, dist)
         floor_spots = [c for c in cells
                        if c in dist and c not in used and _wall_cells_around(maze, c, opaque=True)]
         rng.shuffle(surfaces)
@@ -1679,6 +1752,8 @@ def populate_level(maze, spec, rng, stage=None):
     dist = maze.bfs_distances(sx, sy, blocked=blocked_solid)
     for rid in surfaces_by_room:
         surfaces_by_room[rid] = [s for s in surfaces_by_room[rid] if _reachable_surface(s, dist)]
+        for s_ in surfaces_by_room[rid]:
+            mark_surface_open_side(s_, dist)
 
     reachable_room_cells = [c for c in room_cells_all if c in dist]
 
@@ -1787,7 +1862,7 @@ def populate_level(maze, spec, rng, stage=None):
     for cell in collectible_cells:
         used.add(cell)
         props.append(_place_pickup(spec["collectible"], cell, surfaces_by_room, cell_to_room.get, rng,
-                                    surface_occupied, on_surface_chance=0.82))
+                                    surface_occupied, blockers=props, on_surface_chance=0.82))
 
     battery_cells = _spread_pick(open_cells, spec.get("n_batteries", S.TOTAL_BATTERIES), used, rng, min_gap=3,
                                   cell_to_group=_pickup_group, group_weight=weight_for("battery"),
@@ -1796,7 +1871,7 @@ def populate_level(maze, spec, rng, stage=None):
     for cell in battery_cells:
         used.add(cell)
         props.append(_place_pickup("battery", cell, surfaces_by_room, cell_to_room.get, rng,
-                                    surface_occupied, on_surface_chance=0.82))
+                                    surface_occupied, blockers=props, on_surface_chance=0.82))
 
     lighter_cells = _spread_pick(open_cells, spec.get("n_lighters", 0), used, rng, min_gap=6,
                                   cell_to_group=_pickup_group, group_weight=weight_for("lighter"),
@@ -1805,7 +1880,7 @@ def populate_level(maze, spec, rng, stage=None):
     for cell in lighter_cells:
         used.add(cell)
         props.append(_place_pickup("lighter", cell, surfaces_by_room, cell_to_room.get, rng,
-                                    surface_occupied, on_surface_chance=0.7))
+                                    surface_occupied, blockers=props, on_surface_chance=0.7))
 
     for kind, count, gap in (("paper_map", spec.get("n_maps", 0), 6), ("pencil", spec.get("n_pencils", 0), 4),
                              ("map_sheet", spec.get("n_sheets", 0), 7)):
@@ -1816,7 +1891,7 @@ def populate_level(maze, spec, rng, stage=None):
         for cell in cells:
             used.add(cell)
             props.append(_place_pickup(kind, cell, surfaces_by_room, cell_to_room.get, rng,
-                                        surface_occupied, on_surface_chance=0.75))
+                                        surface_occupied, blockers=props, on_surface_chance=0.75))
 
     pill_cells = _spread_pick(open_cells, spec.get("n_sanity_pills", 0), used, rng, min_gap=6,
                                cell_to_group=_pickup_group, group_weight=weight_for("sanity_pill"),
@@ -1825,7 +1900,7 @@ def populate_level(maze, spec, rng, stage=None):
     for cell in pill_cells:
         used.add(cell)
         props.append(_place_pickup("sanity_pill", cell, surfaces_by_room, cell_to_room.get, rng,
-                                    surface_occupied, on_surface_chance=0.6))
+                                    surface_occupied, blockers=props, on_surface_chance=0.6))
 
     note_cells = _spread_pick(open_cells, spec.get("n_notes", S.TOTAL_NOTES), used, rng, min_gap=3,
                                cell_to_group=_pickup_group, group_weight=weight_for("note_flat"),
@@ -1837,7 +1912,7 @@ def populate_level(maze, spec, rng, stage=None):
     for i, cell in enumerate(note_cells):
         used.add(cell)
         flat = _place_pickup("note_flat", cell, surfaces_by_room, cell_to_room.get, rng,
-                              surface_occupied, on_surface_chance=0.82)
+                              surface_occupied, blockers=props, on_surface_chance=0.82)
         flat.note_text = note_texts[i]
         props.append(flat)
 
@@ -2101,6 +2176,8 @@ def populate_yard(maze, spec, rng, stage=None):
     dist = maze.bfs_distances(sx, sy, blocked=blocked_solid)
     for zid in surfaces_by_zone:
         surfaces_by_zone[zid] = [s for s in surfaces_by_zone[zid] if _reachable_surface(s, dist)]
+        for s_ in surfaces_by_zone[zid]:
+            mark_surface_open_side(s_, dist)
 
     shed_interior = _walled_interior_cells(maze, shed_zone["rect"], door_cell)
     workbench = next((p for p in props if p.kind == "workbench" and p.interact_cell in shed_interior), None)
@@ -2175,14 +2252,23 @@ def populate_yard(maze, spec, rng, stage=None):
     open_yard = yard_spots(lambda c: dist.get(c, 0) >= 2)
     pickup_cells_taken = []
     pickup_zone_counts = {}
-    key_cells = _spread_pick(open_yard, spec["n_collectible"], used, rng, min_gap=5, cell_to_group=cell_to_zone.get,
+    house_cells = [c for c in yard_cells
+                   if c in indoor and c not in used and dist.get(c, 0) >= 2 and in_a_zone(c)]
+    house_zones = {cell_to_zone.get(c) for c in house_cells}
+    key_pool = house_cells if len(house_cells) >= spec["n_collectible"] * 3 else open_yard
+    key_caps = ({gid: 1 for gid in house_zones}
+                if key_pool is house_cells and len(house_zones) >= spec["n_collectible"] else None)
+    key_cells = _spread_pick(key_pool, spec["n_collectible"], used, rng, min_gap=5, cell_to_group=cell_to_zone.get,
                                  group_weight=zone_weight_for('key'), cell_rank=indoor_rank('key'),
+                             group_caps=key_caps,
                              taken=pickup_cells_taken, taken_gap=4, group_counts=pickup_zone_counts)
     for cell in key_cells:
         used.add(cell)
         props.append(_place_pickup(spec["collectible"], cell, surfaces_by_zone, cell_to_zone.get, rng,
-                                    surface_occupied, on_surface_chance=1.0,
-                                    reach=YARD_KEY_SURFACE_REACH, prefer=YARD_KEY_SURFACES))
+                                    surface_occupied, blockers=props, on_surface_chance=1.0,
+                                    reach=YARD_KEY_SURFACE_REACH, prefer=YARD_KEY_SURFACES,
+                                    allow=(lambda s: (int(s.x), int(s.y)) in indoor)
+                                    if key_pool is house_cells else None))
 
     exits = _place_fence_gaps(maze, spec.get("n_fence_gaps", S.YARD_FENCE_GAPS), yard_cells, dist, spawn,
                                used, blocked_solid, props, rng)
@@ -2195,7 +2281,7 @@ def populate_yard(maze, spec, rng, stage=None):
     for cell in battery_cells:
         used.add(cell)
         props.append(_place_pickup("battery", cell, surfaces_by_zone, cell_to_zone.get, rng,
-                                    surface_occupied, on_surface_chance=YARD_ON_SURFACE))
+                                    surface_occupied, blockers=props, on_surface_chance=YARD_ON_SURFACE))
 
     pencil_cells = _spread_pick(yard_spots(), spec.get("n_pencils", 0), used, rng,
                                  group_weight=zone_weight_for('pencil'), cell_rank=indoor_rank('pencil'),
@@ -2204,7 +2290,7 @@ def populate_yard(maze, spec, rng, stage=None):
     for cell in pencil_cells:
         used.add(cell)
         props.append(_place_pickup("pencil", cell, surfaces_by_zone, cell_to_zone.get, rng,
-                                    surface_occupied, on_surface_chance=YARD_ON_SURFACE))
+                                    surface_occupied, blockers=props, on_surface_chance=YARD_ON_SURFACE))
 
     note_cells = _spread_pick(yard_spots(), S.TOTAL_NOTES, used, rng, min_gap=3,
                                  group_weight=zone_weight_for('note_flat'), cell_rank=indoor_rank('note_flat'),
@@ -2216,7 +2302,7 @@ def populate_yard(maze, spec, rng, stage=None):
     for i, cell in enumerate(note_cells):
         used.add(cell)
         flat = _place_pickup("note_flat", cell, surfaces_by_zone, cell_to_zone.get, rng,
-                              surface_occupied, on_surface_chance=YARD_ON_SURFACE)
+                              surface_occupied, blockers=props, on_surface_chance=YARD_ON_SURFACE)
         flat.note_text = note_texts[i]
         props.append(flat)
 
