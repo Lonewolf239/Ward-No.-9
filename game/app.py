@@ -6174,10 +6174,13 @@ class App:
 
     NOTE_BACK_KINDS = ("blank", "form", "scrap")
 
+    NOTE_QUOTE_PAIRS = {"\u00ab": "\u00bb", "\u201e": "\u201c", "\u201c": "\u201d", '"': '"'}
+
     @staticmethod
     def _note_written_text(text):
         out = str(text).strip()
-        if len(out) > 1 and out[0] == "\u00ab" and out[-1] == "\u00bb":
+        closer = App.NOTE_QUOTE_PAIRS.get(out[:1])
+        if closer and len(out) > 1 and out[-1] == closer:
             out = out[1:-1].strip()
         return out
 
