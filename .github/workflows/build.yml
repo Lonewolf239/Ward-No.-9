@@ -65,7 +65,9 @@ jobs:
           cd dist
           for d in */; do
             platform="${d%/}"
-            (cd "$platform" && zip -r "../${platform}.zip" .)
+            chmod +x "$platform"/ward9 2>/dev/null || true
+            chmod +x "$platform"/ward9.app/Contents/MacOS/* 2>/dev/null || true
+            (cd "$platform" && zip -r -y "../${platform}.zip" .)
           done
 
       - uses: softprops/action-gh-release@v2
