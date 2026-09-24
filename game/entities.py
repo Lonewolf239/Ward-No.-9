@@ -5,7 +5,8 @@ import random
 from game import settings as S
 from game.held_items import HELD_ITEM_DEFS
 from game.lighting import FLASH_RANGE
-from game.props import line_blocked_by_cover, _circle_hits_prop, props_near_segment
+from game.props import (line_blocked_by_cover, _circle_hits_prop, props_near_segment,
+                        footprint_cells)
 
 
 def monster_lit_frac(light_level, light_norm=S.MONSTER_VISION_LIGHT_NORM):
@@ -505,6 +506,7 @@ class Monster:
         self._ignored_props = {}
         self._temp_blocked_cells = {}
         self._prop_stuck_time = 0.0
+        self._press_t = 0.0
         self._progress_anchor = (x, y)
         self._progress_t = 0.0
         self._progress_fails = 0
@@ -852,13 +854,21 @@ class Monster:
     def _replan(self, maze, target_cell, extra_blocked=None):
         sx, sy = maze.standing_cell(self.x, self.y)
         tx, ty = target_cell
-        blocked = self.blocked_cells | extra_blocked if extra_blocked else self.blocked_cells
+        blocked = self.blocked_cells
+        if self._temp_blocked_cells:
+            blocked = blocked | set(self._temp_blocked_cells)
+        if extra_blocked:
+            blocked = blocked | extra_blocked
+        if (sx, sy) in blocked:
+            blocked = blocked - {(sx, sy)}
         path = maze.bfs_path(sx, sy, tx, ty, blocked=blocked)
         if not path:
             for cx, cy in self._nearby_open_cell(maze, tx, ty)[:6]:
                 path = maze.bfs_path(sx, sy, cx, cy, blocked=blocked)
                 if path:
                     break
+        if not path and blocked is not self.blocked_cells:
+            path = maze.bfs_path(sx, sy, tx, ty, blocked=self.blocked_cells)
         if path and path[0] == (sx, sy):
             path.pop(0)
         self.path = path
@@ -1674,6 +1684,7 @@ class Monster:
             and not self.path and near_locker_target is not None and near_locker_target > 0.06
         )
         prev_x, prev_y = self.x, self.y
+        pressing = False
         if self.breaking_door is not None:
             self.break_timer += dt
             if self.break_timer >= S.DOOR_BREAK_SECONDS:
@@ -1717,6 +1728,19 @@ class Monster:
             moved = True
         else:
             moved = self._advance(dt, speed, maze, local_props)
+            if moved:
+                self._press_t = 0.0
+            elif not grace and self.state in (Monster.HUNT, Monster.INVESTIGATE):
+                aim = None
+                if self.state == Monster.HUNT:
+                    aim = (player.x, player.y)
+                elif self.last_known is not None:
+                    aim = (self.last_known[0] + 0.5, self.last_known[1] + 0.5)
+                if aim is not None:
+                    self._press_t += dt
+                    pressing = True
+                    self._walk_toward(maze, dt, speed, aim[0], aim[1], blocked_props=local_props)
+                    moved = True
         self.x, self.y = _push_out_of_props(self.x, self.y, local_props)
         self._unstick_from_walls(maze)
         if self.breaking_door is not None:
@@ -1753,7 +1777,8 @@ class Monster:
         else:
             self._catch_stuck_time = 0.0
 
-        if self.breaking_door is None and math.hypot(self.x - prev_x, self.y - prev_y) < speed * dt * 0.2:
+        if self.breaking_door is None and (pressing
+                                           or math.hypot(self.x - prev_x, self.y - prev_y) < speed * dt * 0.2):
             self._nav_stuck_time += dt
         else:
             self._nav_stuck_time = 0.0
@@ -1788,7 +1813,9 @@ class Monster:
             stuck_near = next((p_ for p_ in blocked_props
                                if _circle_hits_prop(self.x, self.y, S.MONSTER_RADIUS + 0.35, p_)), None)
             if stuck_near is not None and stuck_near.kind != "door":
-                self._ignored_props[id(stuck_near)] = S.MONSTER_PROP_IGNORE_DURATION * 3.0
+                if (not self._route_around_prop(maze, stuck_near)
+                        and self._may_pass_through(maze, player, stuck_near, dist)):
+                    self._ignored_props[id(stuck_near)] = S.MONSTER_PROP_IGNORE_DURATION * 3.0
             if self._progress_fails >= 2:
                 self._progress_fails = 0
                 self._temp_blocked_cells.clear()
@@ -1810,11 +1837,12 @@ class Monster:
                         touching_prop.toggle()
                         self.just_opened_door = touching_prop
                         self.trailing_door = touching_prop
-            elif dist >= S.MONSTER_STUCK_NEAR_PLAYER_DIST:
-                self._ignored_props[id(touching_prop)] = S.MONSTER_PROP_IGNORE_DURATION
-            else:
-                self._turn_probe_timer = S.MONSTER_TURN_PROBE_DURATION
-                self._turn_probe_dir = self.rng.choice((-1.0, 1.0))
+            elif not self._route_around_prop(maze, touching_prop):
+                if self._may_pass_through(maze, player, touching_prop, dist):
+                    self._ignored_props[id(touching_prop)] = S.MONSTER_PROP_IGNORE_DURATION
+                else:
+                    self._turn_probe_timer = S.MONSTER_TURN_PROBE_DURATION
+                    self._turn_probe_dir = self.rng.choice((-1.0, 1.0))
 
         if (self.locker_target is not None and self.checking_timer <= 0.0 and self.state != Monster.STALK
                 and not self.path and near_locker_target is not None and near_locker_target <= 0.06):
@@ -1874,6 +1902,30 @@ class Monster:
                 self._search_hops_left = S.MONSTER_SEARCH_HOPS
             else:
                 self._enter_patrol()
+
+    def _may_pass_through(self, maze, player, prop, dist):
+        if _circle_hits_prop(self.x, self.y, S.MONSTER_RADIUS, prop):
+            return True
+        if dist < S.MONSTER_STUCK_NEAR_PLAYER_DIST:
+            return False
+        if getattr(player, "is_hiding", False):
+            return True
+        return not maze.has_line_of_sight(player.x, player.y, self.x, self.y)
+
+    def _route_around_prop(self, maze, prop):
+        if self.target_cell is None or prop.kind == "door":
+            return False
+        footprint = footprint_cells(prop, S.MONSTER_RADIUS)
+        ahead = [c for c in (self.path[:1] or []) if c in footprint]
+        if not ahead:
+            ahead = [min(footprint, key=lambda c: (c[0] + 0.5 - self.x) ** 2 + (c[1] + 0.5 - self.y) ** 2)]
+        blocked = [c for c in ahead if c != self.cell and c != self.target_cell]
+        if not blocked:
+            return False
+        for c in blocked:
+            self._temp_blocked_cells[c] = S.MONSTER_PROP_DETOUR_SECONDS
+        self._replan(maze, self.target_cell)
+        return bool(self.path)
 
     def _advance(self, dt, speed, maze, blocked_props=()):
         if not self.path:
